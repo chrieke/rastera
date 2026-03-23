@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import math
 from collections.abc import Awaitable, Callable, Sequence
+from typing import Literal
 
 import numpy as np
 from affine import Affine
@@ -39,6 +40,7 @@ async def merge_cogs(
     target_resolution: float | None = None,
     max_concurrency: int = DEFAULT_CONCURRENCY,
     tile_batch_size: int = DEFAULT_MERGE_BATCH_SIZE,
+    method: Literal["first", "last"] = "first",
 ) -> tuple[np.ndarray, Profile]:
     """
     Merge a bbox that may span multiple GeoTIFFs and return a single stitched array.
@@ -57,6 +59,9 @@ async def merge_cogs(
         target_resolution: Output pixel size in target CRS units.
         max_concurrency: Maximum number of COGs to read concurrently.
             Limits peak memory to ~max_concurrency tile arrays.
+        method: Overlap strategy when multiple COGs cover the same pixel.
+            ``"first"`` keeps the first valid pixel (matching rasterio.merge
+            default). ``"last"`` lets later COGs overwrite earlier ones.
 
     Returns:
         Tuple of numpy array and window metadata
@@ -105,6 +110,7 @@ async def merge_cogs(
             target_resolution=target_resolution,
             max_concurrency=max_concurrency,
             tile_batch_size=tile_batch_size,
+            method=method,
         )
 
     # --- Path A: native merge (existing fast path) ---
@@ -159,6 +165,7 @@ async def merge_cogs(
         fill_value=fill_value,
         read_fn=_read_native_bands,
         max_concurrency=max_concurrency,
+        method=method,
     )
     return out_array, out_profile
 
@@ -175,6 +182,7 @@ async def _merge_reprojected(
     target_resolution: float | None,
     max_concurrency: int = DEFAULT_CONCURRENCY,
     tile_batch_size: int = DEFAULT_MERGE_BATCH_SIZE,
+    method: Literal["first", "last"] = "first",
 ) -> tuple[np.ndarray, Profile]:
     """Path B: merge with reprojection — supports mixed-CRS inputs."""
     base = cogs[0]
@@ -237,6 +245,7 @@ async def _merge_reprojected(
         fill_value=fill_value,
         read_fn=_read_and_unwrap,
         max_concurrency=max_concurrency,
+        method=method,
     )
     return out_array, out_profile
 
@@ -249,6 +258,7 @@ async def _gather_and_paste(
     fill_value: int | float,
     read_fn: Callable[[AsyncGeoTIFF, BBox], Awaitable[tuple[np.ndarray, Profile]]],
     max_concurrency: int = DEFAULT_CONCURRENCY,
+    method: Literal["first", "last"] = "first",
 ) -> np.ndarray:
     """Read contributing COGs concurrently and paste into a single output array.
 
@@ -256,8 +266,9 @@ async def _gather_and_paste(
     Unlike chunked processing, a new read starts as soon as any previous
     read finishes — no waiting for a whole batch to complete.
 
-    Results are pasted in input order (later inputs overwrite earlier ones)
-    using a pending buffer, matching deterministic overlap semantics.
+    Results are pasted in input order. Overlap is resolved by ``method``:
+    ``"first"`` keeps the first valid pixel, ``"last"`` lets later COGs
+    overwrite earlier ones.
     """
     out_array = np.full(
         (n_bands, out_profile.height, out_profile.width),
@@ -267,6 +278,17 @@ async def _gather_and_paste(
 
     if not contributing:
         return out_array
+
+    # For "first" semantics we track which pixels have been filled so
+    # later COGs don't overwrite them.  One bool per pixel — negligible
+    # compared to the output array itself.
+    # TODO: With "first" semantics, we could skip reading COGs whose bbox
+    # is fully covered by already-pasted data.
+    filled = (
+        np.zeros((out_profile.height, out_profile.width), dtype=bool)
+        if method == "first"
+        else None
+    )
 
     sem = asyncio.Semaphore(max_concurrency)
 
@@ -309,12 +331,29 @@ async def _gather_and_paste(
                     valid = ~np.isnan(src_data)
                 else:
                     valid = src_data != nodata
-                valid_any = np.any(valid, axis=0)
-                out_array[:, dst_rows, dst_cols] = np.where(
-                    valid_any, src_data, out_array[:, dst_rows, dst_cols]
-                )
+                src_valid = np.any(valid, axis=0)
             else:
-                out_array[:, dst_rows, dst_cols] = src_data
+                src_valid = None
+
+            if method == "first":
+                assert filled is not None
+                unfilled = ~filled[dst_rows, dst_cols]
+                if src_valid is not None:
+                    paste_mask = unfilled & src_valid
+                else:
+                    paste_mask = unfilled
+                out_array[:, dst_rows, dst_cols] = np.where(
+                    paste_mask, src_data, out_array[:, dst_rows, dst_cols]
+                )
+                filled[dst_rows, dst_cols] |= paste_mask
+            else:
+                # "last" — later COGs overwrite earlier ones
+                if src_valid is not None:
+                    out_array[:, dst_rows, dst_cols] = np.where(
+                        src_valid, src_data, out_array[:, dst_rows, dst_cols]
+                    )
+                else:
+                    out_array[:, dst_rows, dst_cols] = src_data
 
     return out_array
 

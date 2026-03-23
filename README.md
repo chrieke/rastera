@@ -2,10 +2,9 @@
 
 **Async rasterio for COGs**, build on [async-tiff](https://github.com/developmentseed/async-tiff), no GDAL.
 
-- `read` and multi-file, cross-crs `merge` with `target_crs`, `target_resolution`, `bbox`, `window`
-- Parallel everywhere: concurrent file opens, tile downloads, and cross-file merges for maximum throughput
+- `read` and `merge` (multi-file, cross-crs) with `target_crs`, `target_resolution`, `bbox`, `window`
+- Parallel everywhere: concurrent file opens, tile downloads, and optimized cross-file merges for maximum network throughput
 - Built on [async-tiff](https://github.com/developmentseed/async-tiff) handling async tile fetching, batched range requests, and Rust-native decompression
-- In-memory COG header cache (TODO: Between sessions?)
 
 **Note:** Only COGs & tiled GeoTIFFs are supported. Stripped (non-tiled) TIFFs will not work.
 
@@ -62,5 +61,5 @@ but likely unnecessary. Standalone single-COG reads are unbatched and fire all t
 ## TODO maybe
 
 - Bilinear / cubic / lanczos resampling (currently nearest-neighbor only)
-- Persistent COG header cache across sessions (e.g. SQLite/diskcache)
+- Extend current per-session wide persistent COG header cache across sessions (e.g. SQLite/diskcache)
 - Basic raster stats (min, max, mean, histogram)

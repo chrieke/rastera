@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Sequence
-from typing import Any, overload
+from typing import Any, Literal, overload
 
 from async_tiff.store import S3Store
 
@@ -97,6 +97,7 @@ async def merge(
     target_crs: int | None = None,
     target_resolution: float | None = None,
     tile_batch_size: int = 48,
+    method: Literal["first", "last"] = "first",
 ) -> tuple:
     """
     Rasterio-style helper: read a bbox mosaic from multiple already-open sources.
@@ -108,6 +109,12 @@ async def merge(
     different CRS / resolution), each COG is individually reprojected into the
     target grid before merging, allowing cross-CRS merges (e.g. adjacent UTM
     zones).
+
+    Args:
+        method: Overlap strategy when multiple sources cover the same pixel.
+            ``"first"`` (default) keeps the first valid pixel, matching
+            ``rasterio.merge`` behaviour. ``"last"`` lets later sources
+            overwrite earlier ones.
     """
     return await merge_cogs(
         sources,
@@ -118,4 +125,5 @@ async def merge(
         target_crs=target_crs,
         target_resolution=target_resolution,
         tile_batch_size=tile_batch_size,
+        method=method,
     )
