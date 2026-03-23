@@ -6,7 +6,13 @@ from typing import Any, overload
 
 from async_tiff.store import S3Store
 
-from .reader import AsyncGeoTIFF, _build_store, clear_cache, set_cache_size
+from .reader import (
+    AsyncGeoTIFF,
+    _build_store,
+    clear_cache,
+    set_cache_size,
+    set_tile_fetch_batch_size,
+)
 from .merge import merge_cogs
 
 __all__ = [
@@ -14,6 +20,7 @@ __all__ = [
     "S3Store",
     "clear_cache",
     "set_cache_size",
+    "set_tile_fetch_batch_size",
     "open",
     "merge",
 ]

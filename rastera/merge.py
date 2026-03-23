@@ -8,10 +8,18 @@ import numpy as np
 from affine import Affine
 
 from .reader import AsyncGeoTIFF
-from .geo import BBox, _affine_apply, bounds_from_transform, compute_paste_slices, ensure_bbox, normalize_band_indices, transform_bbox
+from .geo import (
+    BBox,
+    _affine_apply,
+    bounds_from_transform,
+    compute_paste_slices,
+    ensure_bbox,
+    normalize_band_indices,
+    transform_bbox,
+)
 from .meta import Profile
 
-DEFAULT_CONCURRENCY = 6
+DEFAULT_CONCURRENCY = 4
 
 
 async def merge_cogs(
@@ -59,7 +67,9 @@ async def merge_cogs(
     n_out_bands = len(normalize_band_indices(band_indices, base.ifd.samples_per_pixel))
 
     # Decide whether we need the reprojected merge path.
-    all_same_crs = all(cog.profile.crs_epsg == base.profile.crs_epsg for cog in cogs[1:])
+    all_same_crs = all(
+        cog.profile.crs_epsg == base.profile.crs_epsg for cog in cogs[1:]
+    )
     all_same_res = all(
         math.isclose(float(cog.profile.transform.a), float(base.profile.transform.a))
         for cog in cogs[1:]
@@ -121,7 +131,9 @@ async def merge_cogs(
         if sub_bbox is not None:
             sub_bboxes.append((cog, sub_bbox))
 
-    async def _read_native_bands(cog: AsyncGeoTIFF, sb: BBox) -> tuple[np.ndarray, Profile]:
+    async def _read_native_bands(
+        cog: AsyncGeoTIFF, sb: BBox
+    ) -> tuple[np.ndarray, Profile]:
         indices = normalize_band_indices(band_indices, cog.ifd.samples_per_pixel)
         return await cog._read_native(bbox=sb, band_indices=indices)
 
@@ -170,23 +182,35 @@ async def _merge_reprojected(
 
     # Build output grid
     out_profile = Profile.for_bbox(
-        target_bbox, res, out_crs,
-        count=n_out_bands, dtype=base.profile.dtype, nodata=base.profile.nodata,
-        tile_width=base.profile.tile_width, tile_height=base.profile.tile_height,
+        target_bbox,
+        res,
+        out_crs,
+        count=n_out_bands,
+        dtype=base.profile.dtype,
+        nodata=base.profile.nodata,
+        tile_width=base.profile.tile_width,
+        tile_height=base.profile.tile_height,
     )
 
     # Find contributing COGs by intersecting their bounds (in target CRS) with output bbox
     contributing: list[tuple[AsyncGeoTIFF, BBox]] = []
     for cog in cogs:
-        cog_bounds_in_target = transform_bbox(cog.profile.bounds, cog.profile.crs_epsg, out_crs)
+        cog_bounds_in_target = transform_bbox(
+            cog.profile.bounds, cog.profile.crs_epsg, out_crs
+        )
         sub_bbox = target_bbox.intersect(cog_bounds_in_target)
         if sub_bbox is not None:
             contributing.append((cog, sub_bbox))
 
-    async def _read_and_unwrap(cog: AsyncGeoTIFF, sb: BBox) -> tuple[np.ndarray, Profile]:
+    async def _read_and_unwrap(
+        cog: AsyncGeoTIFF, sb: BBox
+    ) -> tuple[np.ndarray, Profile]:
         return await cog.read(
-            bbox=sb, bbox_crs=out_crs, target_crs=out_crs,
-            target_resolution=res, band_indices=band_indices,
+            bbox=sb,
+            bbox_crs=out_crs,
+            target_crs=out_crs,
+            target_resolution=res,
+            band_indices=band_indices,
         )
 
     out_array = await _gather_and_paste(
@@ -326,7 +350,8 @@ def _require_compatible_merge_inputs(cogs: Sequence[AsyncGeoTIFF]) -> None:
     scale_y = float(-base_transform.e)
 
     if not math.isclose(float(base_transform.b), 0.0) or not math.isclose(
-        float(base_transform.d), 0.0,
+        float(base_transform.d),
+        0.0,
     ):
         raise NotImplementedError(
             "merge currently requires a north-up (non-rotated) grid"
@@ -342,7 +367,8 @@ def _require_compatible_merge_inputs(cogs: Sequence[AsyncGeoTIFF]) -> None:
         if not math.isclose(float(-cog.profile.transform.e), scale_y):
             raise ValueError("All GeoTIFFs must share the same pixel height")
         if not math.isclose(float(cog.profile.transform.b), 0.0) or not math.isclose(
-            float(cog.profile.transform.d), 0.0,
+            float(cog.profile.transform.d),
+            0.0,
         ):
             raise NotImplementedError(
                 "merge currently requires a north-up (non-rotated) grid"

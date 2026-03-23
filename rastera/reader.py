@@ -35,6 +35,13 @@ _DEFAULT_REGION = (
 _tiff_cache: dict[str, TIFF] = {}
 _cache_max_size: int = 128
 
+# Maximum number of tiles to fetch in a single fetch_tiles() call.
+# Prevents HTTP connection pool exhaustion when reading large bboxes
+# from high-resolution COGs (which can require 100-200+ tiles).
+# Keep DEFAULT_CONCURRENCY (merge.py) × _TILE_FETCH_BATCH_SIZE < 200
+# to stay within safe HTTP connection pool limits (reqwest/async_tiff).
+_TILE_FETCH_BATCH_SIZE: int = 48
+
 
 def clear_cache() -> None:
     """Clear the in-memory TIFF header cache."""
@@ -47,6 +54,16 @@ def set_cache_size(n: int) -> None:
     _cache_max_size = n
     while len(_tiff_cache) > _cache_max_size:
         _tiff_cache.pop(next(iter(_tiff_cache)))
+
+
+def set_tile_fetch_batch_size(n: int) -> None:
+    """Set the maximum number of tiles per fetch_tiles() call.
+
+    Controls the peak number of concurrent HTTP range requests per COG read.
+    Total peak concurrent requests = max_concurrency × batch_size.
+    """
+    global _TILE_FETCH_BATCH_SIZE
+    _TILE_FETCH_BATCH_SIZE = n
 
 
 class AsyncGeoTIFF:
@@ -196,7 +213,11 @@ class AsyncGeoTIFF:
             return data, profile
 
         # Pick the best overview IFD for the target resolution
-        ovr_idx = self._best_ifd_for_resolution(target_resolution) if needs_resample else self.ifd_index
+        ovr_idx = (
+            self._best_ifd_for_resolution(target_resolution)
+            if needs_resample
+            else self.ifd_index
+        )
 
         # Window + resample: read native pixels for the window, then resample
         if window is not None and needs_resample:
@@ -312,8 +333,12 @@ class AsyncGeoTIFF:
             scale_y = self.profile.height / ifd.image_height
             ovr_res = (self.profile.res[0] * scale_x, self.profile.res[1] * scale_y)
             ovr_transform = Affine(
-                ovr_res[0], 0, float(self.profile.transform.c),
-                0, -ovr_res[1], float(self.profile.transform.f),
+                ovr_res[0],
+                0,
+                float(self.profile.transform.c),
+                0,
+                -ovr_res[1],
+                float(self.profile.transform.f),
             )
             ifd_profile = Profile(
                 width=ifd.image_width,
@@ -338,7 +363,12 @@ class AsyncGeoTIFF:
         tile_coords = get_intersecting_image_tiles(
             window, ifd.tile_width, ifd.tile_height
         )
-        tiles = await self.tiff.fetch_tiles(tile_coords, ifd_index)
+        tiles = []
+        for i in range(0, len(tile_coords), _TILE_FETCH_BATCH_SIZE):
+            batch = tile_coords[i : i + _TILE_FETCH_BATCH_SIZE]
+            tiles.extend(
+                await self.tiff.fetch_tiles(batch, ifd_index)
+            )
 
         out_array = np.zeros(
             (len(band_indices), window.win_height, window.win_width),
