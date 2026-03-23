@@ -283,7 +283,10 @@ async def _gather_and_paste(
     # later COGs don't overwrite them.  One bool per pixel — negligible
     # compared to the output array itself.
     # TODO: With "first" semantics, we could skip reading COGs whose bbox
-    # is fully covered by already-pasted data.
+    # is fully covered by already-pasted data. Would require lazy task
+    # launching (instead of all-upfront) so reads aren't already in-flight
+    # when we discover the output is full. Only helps the temporal overlap
+    # case (same tile, many dates); spatial mosaics rarely overlap.
     filled = (
         np.zeros((out_profile.height, out_profile.width), dtype=bool)
         if method == "first"
