@@ -3,7 +3,7 @@
 **Async rasterio for COGs**, built on [async-geotiff](https://github.com/developmentseed/async-geotiff), no GDAL.
 
 - `read` and `merge` (multi-file, cross-crs) with `target_crs`, `target_resolution`, `bbox`, `window`
-- Parallel everywhere: concurrent file opens, tile downloads, and optimized cross-file merges for maximum network throughput
+- Parallel everywhere: concurrent file opens, coalesced tile downloads with Rust-native decoding
 - Built on [async-geotiff](https://github.com/developmentseed/async-geotiff) handling GeoTIFF parsing, async tile fetching, request coalescing, and Rust-native decompression
 
 **Note:** Only COGs & tiled GeoTIFFs are supported. Stripped (non-tiled) TIFFs will not work.
@@ -39,21 +39,27 @@ data, profile = await rastera.merge(sources, bbox=bbox, bbox_crs=32633, target_r
 
 ## Concurrency
 
-When reading a COG, async-geotiff fires all tile HTTP range requests in parallel
-with request coalescing via obspec. Big, high-resolution COGs can have hundreds of tiles.
+When reading a single COG, async-geotiff fires all tile HTTP range requests in
+parallel with request coalescing via obspec (contiguous tile ranges are merged
+into fewer HTTP requests), and decodes tiles on a Rust thread pool.
 
-When mosaicing via `merge`, multiple COGs are read concurrently (`max_concurrency`,
-default 4) so tile fetches for the next COG overlap with the previous COG's
-tile decoding processing, keeping the network busy. Tile fetching within each COG is handled
-entirely by async-geotiff's internal coalescing.
+When mosaicing via `merge`, COGs are read sequentially — one COG is fully read
+and pasted before the next starts. Tile-level parallelism within each COG (via
+async-geotiff's coalesced fetches and Rust-native decoding) keeps the network
+busy.
+
+Reading multiple COGs concurrently would be faster — the next COG's tile fetches
+could overlap with the previous COG's decoding, keeping the network saturated
+instead of idle between COGs. However, async-geotiff coalesces contiguous tile
+ranges into single HTTP requests, and this coalescing only works within a single
+`fetch_tiles()` call. Batching tiles to limit concurrent requests (as needed
+when multiple COGs fire requests simultaneously) would break coalescing at batch
+boundaries, negating the benefit. For now, sequential reads with full coalescing
+per COG is the simpler and more reliable approach.
 
 
 ## TODO maybe
 
-- **Test merge tile throughput under load**: The old manual `tile_batch_size` batching
-  (per-COG tile fetch limiting) was removed — async-geotiff's internal request coalescing
-  now handles it. If merges with many large COGs cause connection exhaustion, reintroduce
-  manual batching via `_geotiff._tiff.fetch_tiles()` in `_gather_and_paste()`.
 - Bilinear / cubic / lanczos resampling (currently nearest-neighbor only)
 - Extend current per-session wide persistent COG header cache across sessions (e.g. SQLite/diskcache)
 - Basic raster stats (min, max, mean, histogram)
