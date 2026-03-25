@@ -310,7 +310,15 @@ def _obstore_key(uri: str) -> str:
     if parsed.scheme in ("s3", "gs", "az"):
         return parsed.path.lstrip("/")
     if parsed.scheme in ("http", "https"):
-        return parsed.path.lstrip("/")
+        host = parsed.netloc
+        path = parsed.path.lstrip("/")
+        # Path-style: https://s3.<region>.amazonaws.com/<bucket>/<key>
+        # The store is rooted at the host, so strip the bucket prefix to
+        # match what _extract_key returns (and what AsyncGeoTIFF.open uses).
+        if ".s3." not in host and ".s3-" not in host:
+            parts = path.split("/", 1)
+            return parts[1] if len(parts) == 2 else ""
+        return path
     return parsed.path or uri
 
 
