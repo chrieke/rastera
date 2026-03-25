@@ -172,6 +172,8 @@ def transform_bbox(bbox: BBox, from_crs: int, to_crs: int, densify_pts: int = 21
     xs_out, ys_out = transformer.transform(xs, ys)
     xs_valid = [x for x in xs_out if np.isfinite(x)]
     ys_valid = [y for y in ys_out if np.isfinite(y)]
+    if not xs_valid or not ys_valid:
+        raise ValueError(f"All coordinates became inf/nan transforming bbox from EPSG:{from_crs} to EPSG:{to_crs}")
     return BBox(min(xs_valid), min(ys_valid), max(xs_valid), max(ys_valid))
 
 

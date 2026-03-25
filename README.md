@@ -37,6 +37,25 @@ sources = await rastera.open(uris)  # concurrent opens, shared connection pool
 data, profile = await rastera.merge(sources, bbox=bbox, bbox_crs=32633, target_resolution=20)
 ```
 
+### COG header cache via geoparquet index
+
+Pre-cache COG headers in a geoparquet file to skip S3 round-trips on open (~5-6x faster).
+Requires additionals dependencies, install via `pip install rastera[index]`
+
+```python
+import rastera
+
+uris = ["s3://bucket/tile_a.tif", "s3://bucket/tile_b.tif", ...]
+
+# Build once, save to disk
+gdf = await rastera.build_index(uris, region="us-west-2")
+gdf.to_parquet("index.parquet")
+
+# Open from index (reusable across sessions, ~5-6x faster opens)
+sources = await rastera.open_from_index("index.parquet", bbox=(minx, miny, maxx, maxy), region="us-west-2")
+data, profile = await rastera.merge(sources, bbox=bbox, bbox_crs=4326)
+```
+
 ## Concurrency
 
 When reading a single COG, async-geotiff fires all tile HTTP range requests in
@@ -58,8 +77,9 @@ boundaries, negating the benefit. For now, sequential reads with full coalescing
 per COG is the simpler and more reliable approach.
 
 
+
+
 ## TODO maybe
 
 - Bilinear / cubic / lanczos resampling (currently nearest-neighbor only)
-- Extend current per-session wide persistent COG header cache across sessions (e.g. SQLite/diskcache)
 - Basic raster stats (min, max, mean, histogram)

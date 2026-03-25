@@ -16,7 +16,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-index = ["geopandas>=1.0.0", "obstore>=0.9.0"]
+index = ["geopandas>=1.0.0", "obstore>=0.9.0", "pyarrow>=18.0.0"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

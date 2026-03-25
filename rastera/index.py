@@ -25,6 +25,8 @@ from .reader import (
 )
 
 
+
+
 class HeaderCacheStore:
     """Obspec-compatible store wrapper that serves pre-fetched header bytes from cache.
 
@@ -119,7 +121,6 @@ async def build_index(
     uris = list(uris)
     if not uris:
         return _empty_geodataframe()
-
     shared_store = store if store is not None else _build_store(uris[0], **store_kwargs)
     obs = _build_obstore(uris[0], **store_kwargs)
     sem = asyncio.Semaphore(concurrency)
@@ -132,7 +133,10 @@ async def build_index(
                 hdr = bytes(await obstore.get_range_async(obs, key, start=0, end=prefetch))
                 return src, hdr
             except Exception as exc:
-                raise RuntimeError(f"Failed to index {uri!r}") from exc
+                hint = ""
+                if _resolve_local_path(uri) is not None:
+                    hint = " (local files are not supported, use remote URIs)"
+                raise RuntimeError(f"Failed to index {uri!r}{hint}") from exc
 
     results = await asyncio.gather(*(_open_and_fetch(u) for u in uris))
 
