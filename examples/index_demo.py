@@ -93,11 +93,13 @@ async def cmd_open():
     n = len(uris)
     print(f"Index: {n} files\n", flush=True)
 
-    with timed(f"Opened {n} from index") as t_idx:
-        await rastera.open_from_index(gdf, concurrency=50, **S3_OPTS)
-
+    rastera.clear_cache()
     with timed(f"Opened {n} from network") as t_net:
         await rastera.open(uris, **S3_OPTS)
+
+    rastera.clear_cache()
+    with timed(f"Opened {n} from index") as t_idx:
+        await rastera.open_from_index(gdf, concurrency=50, **S3_OPTS)
 
     ratio = t_net.elapsed / t_idx.elapsed if t_idx.elapsed > 0 else float("inf")
     print(f"\n  Speedup: {ratio:.1f}x\n", flush=True)

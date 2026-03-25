@@ -39,7 +39,7 @@ data, profile = await rastera.merge(sources, bbox=bbox, bbox_crs=32633, target_r
 
 ### COG header cache via geoparquet index
 
-Pre-cache COG headers in a geoparquet file to skip S3 round-trips on open (~5-6x faster).
+Pre-cache COG headers in a geoparquet file to skip S3 round-trips on open (~6x faster, e.g. 0.2s vs 1.3s for 100 COGs).
 Requires additionals dependencies, install via `pip install rastera[index]`
 
 ```python
