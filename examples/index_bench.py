@@ -110,7 +110,7 @@ async def main():
     for i in range(N_ROUNDS):
         row = gdf.iloc[step * (i + 1) % n_files]
         c = row.geometry.centroid
-        qbbox = (c.x - 5000, c.y - 5000, c.x + 5000, c.y + 5000)
+        qbbox = (c.x - 0.05, c.y - 0.05, c.x + 0.05, c.y + 0.05)
         matched = gdf[gdf.intersects(box(*qbbox))]["uri"].tolist()
         sites.append((qbbox, matched))
 
@@ -153,21 +153,19 @@ async def main():
         print(f"  [{i+1:2d}] index={t_open_idx[-1]:.2f}s  network={t_open_net[-1]:.2f}s", flush=True)
 
     # --- Benchmark: query + merge ---
-    print(f"\n[3/3] Query+merge 10km window ({N_ROUNDS} different sites)...", flush=True)
+    print(f"\n[3/3] Query+merge ~10km window ({N_ROUNDS} different sites)...", flush=True)
     t_query_idx, t_query_net = [], []
     for i, (qbbox, matched_uris) in enumerate(sites):
         rastera.clear_cache()
         t0 = time.perf_counter()
         sources = await rastera.open_from_index(gdf, bbox=qbbox, **S3_OPTS)
-        crs = sources[0].profile.crs_epsg
-        await rastera.merge(sources, bbox=qbbox, bbox_crs=crs)
+        await rastera.merge(sources, bbox=qbbox, bbox_crs=4326)
         t_query_idx.append(time.perf_counter() - t0)
 
         rastera.clear_cache()
         t0 = time.perf_counter()
         sources = await rastera.open(matched_uris, **S3_OPTS)
-        crs = sources[0].profile.crs_epsg
-        await rastera.merge(sources, bbox=qbbox, bbox_crs=crs)
+        await rastera.merge(sources, bbox=qbbox, bbox_crs=4326)
         t_query_net.append(time.perf_counter() - t0)
 
         print(f"  [{i+1:2d}] {len(matched_uris)} files  index={t_query_idx[-1]:.2f}s  network={t_query_net[-1]:.2f}s", flush=True)

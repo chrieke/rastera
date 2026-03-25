@@ -108,12 +108,12 @@ async def cmd_query():
     gdf = gpd.read_parquet(INDEX_PATH)
     print(f"Index: {len(gdf)} files\n", flush=True)
 
-    # Pick N bboxes spread across the dataset (10km x 10km each)
+    # Pick N bboxes spread across the dataset (~10km x 10km each, in EPSG:4326)
     step = len(gdf) // (N_QUERIES + 1)
     bboxes = []
     for i in range(N_QUERIES):
         c = gdf.iloc[step * (i + 1)].geometry.centroid
-        bboxes.append((c.x - 5000, c.y - 5000, c.x + 5000, c.y + 5000))
+        bboxes.append((c.x - 0.05, c.y - 0.05, c.x + 0.05, c.y + 0.05))
 
     print(f"--- {N_QUERIES} queries via index (cold cache) ---", flush=True)
     t_total_idx = 0.0
@@ -121,8 +121,7 @@ async def cmd_query():
         rastera.clear_cache()
         t0 = time.perf_counter()
         sources = await rastera.open_from_index(gdf, bbox=qbbox, **S3_OPTS)
-        crs = sources[0].profile.crs_epsg
-        data, _ = await rastera.merge(sources, bbox=qbbox, bbox_crs=crs)
+        data, _ = await rastera.merge(sources, bbox=qbbox, bbox_crs=4326)
         dt = time.perf_counter() - t0
         t_total_idx += dt
         print(f"  [{i+1}] {len(sources)} files  {data.shape}  {dt:.2f}s", flush=True)
@@ -134,8 +133,7 @@ async def cmd_query():
         t0 = time.perf_counter()
         matched_uris = gdf[gdf.intersects(box(*qbbox))]["uri"].tolist()
         sources = await rastera.open(matched_uris, **S3_OPTS)
-        crs = sources[0].profile.crs_epsg
-        data, _ = await rastera.merge(sources, bbox=qbbox, bbox_crs=crs)
+        data, _ = await rastera.merge(sources, bbox=qbbox, bbox_crs=4326)
         dt = time.perf_counter() - t0
         t_total_net += dt
         print(f"  [{i+1}] {len(sources)} files  {data.shape}  {dt:.2f}s", flush=True)
