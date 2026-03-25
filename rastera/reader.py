@@ -32,6 +32,13 @@ _geotiff_cache: dict[str, GeoTIFF] = {}
 _cache_max_size: int = 128
 
 
+def get_cached_geotiff(uri: str) -> GeoTIFF | None:
+    """Return a cached GeoTIFF object for *uri*, or None on cache miss."""
+    if _cache_max_size > 0:
+        return _geotiff_cache.get(uri)
+    return None
+
+
 def clear_cache() -> None:
     """Clear the in-memory GeoTIFF header cache."""
     _geotiff_cache.clear()

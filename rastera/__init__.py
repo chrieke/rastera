@@ -23,6 +23,12 @@ __all__ = [
     "merge",
 ]
 
+try:
+    from .index import build_index, open_from_index
+    __all__ += ["build_index", "open_from_index"]
+except ImportError:
+    pass
+
 
 @overload
 async def open(
