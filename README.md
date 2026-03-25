@@ -56,26 +56,6 @@ sources = await rastera.open_from_index("index.parquet", bbox=(minx, miny, maxx,
 data, profile = await rastera.merge(sources, bbox=bbox, bbox_crs=4326)
 ```
 
-## Concurrency
-
-When reading a single COG, async-geotiff fires all tile HTTP range requests in
-parallel with request coalescing via obspec (contiguous tile ranges are merged
-into fewer HTTP requests), and decodes tiles on a Rust thread pool.
-
-When mosaicing via `merge`, COGs are read sequentially — one COG is fully read
-and pasted before the next starts. Tile-level parallelism within each COG (via
-async-geotiff's coalesced fetches and Rust-native decoding) keeps the network
-busy.
-
-Reading multiple COGs concurrently would be faster — the next COG's tile fetches
-could overlap with the previous COG's decoding, keeping the network saturated
-instead of idle between COGs. However, async-geotiff coalesces contiguous tile
-ranges into single HTTP requests, and this coalescing only works within a single
-`fetch_tiles()` call. Batching tiles to limit concurrent requests (as needed
-when multiple COGs fire requests simultaneously) would break coalescing at batch
-boundaries, negating the benefit. For now, sequential reads with full coalescing
-per COG is the simpler and more reliable approach.
-
 
 
 

@@ -259,3 +259,75 @@ class TestMergeCogs:
         )
         # nodata=None with method="last", so cog2's zeros overwrite cog1's 42s
         assert np.all(result_arr == 0)
+
+
+# ── merge_cogs: reprojected path ────────────────────────────────────────
+
+
+class TestMergeReprojected:
+    """Tests for _merge_reprojected, triggered by target_crs or target_resolution."""
+
+    async def test_merge_with_target_crs(self):
+        """Setting target_crs different from native CRS triggers the reprojected path."""
+        cog = _make_cog(width=10, height=10, scale=1.0, bands=1, crs=32632)
+
+        read_arr = np.ones((1, 10, 10), dtype=np.uint16) * 42
+        read_profile = Profile(
+            width=10, height=10, count=1, dtype=np.dtype("u2"),
+            transform=Affine(1, 0, 0, 0, -1, 10),
+            res=(1.0, 1.0), crs_epsg=4326, bounds=BBox(0, 0, 10, 10),
+        )
+        cog.read = AsyncMock(return_value=(read_arr, read_profile))
+
+        result_arr, result_profile = await merge_cogs(
+            [cog], bbox=BBox(0, 0, 10, 10), bbox_crs=32632,
+            band_indices=[1], target_crs=4326,
+        )
+        assert result_profile.crs_epsg == 4326
+        # cog.read should be called (reprojected path) instead of _read_native
+        cog.read.assert_called()
+
+    async def test_merge_with_target_resolution(self):
+        """Setting target_resolution different from native triggers the reprojected path."""
+        cog = _make_cog(width=10, height=10, scale=1.0, bands=1)
+
+        # The reprojected path calls cog.read() with target_resolution
+        read_arr = np.ones((1, 5, 5), dtype=np.uint16) * 7
+        read_profile = Profile(
+            width=5, height=5, count=1, dtype=np.dtype("u2"),
+            transform=Affine(2.0, 0, 0, 0, -2.0, 10),
+            res=(2.0, 2.0), crs_epsg=32632, bounds=BBox(0, 0, 10, 10),
+        )
+        cog.read = AsyncMock(return_value=(read_arr, read_profile))
+
+        result_arr, result_profile = await merge_cogs(
+            [cog], bbox=BBox(0, 0, 10, 10), bbox_crs=32632,
+            band_indices=[1], target_resolution=2.0,
+        )
+        # Output should use the requested resolution
+        assert result_profile.res[0] == pytest.approx(2.0)
+        cog.read.assert_called()
+
+    async def test_merge_method_first_reprojected(self):
+        """method='first' in reprojected path keeps the first COG's pixels."""
+        # Two fully overlapping COGs, different values. method="first" should
+        # keep cog1's value everywhere.
+        cog1 = _make_cog(width=10, height=10, scale=1.0, bands=1, crs=32632)
+        cog2 = _make_cog(width=10, height=10, scale=1.0, bands=1, crs=32632)
+
+        out_profile = Profile(
+            width=5, height=5, count=1, dtype=np.dtype("u2"),
+            transform=Affine(2.0, 0, 0, 0, -2.0, 10),
+            res=(2.0, 2.0), crs_epsg=32632, bounds=BBox(0, 0, 10, 10),
+        )
+        arr1 = np.ones((1, 5, 5), dtype=np.uint16) * 1
+        arr2 = np.ones((1, 5, 5), dtype=np.uint16) * 2
+        cog1.read = AsyncMock(return_value=(arr1, out_profile))
+        cog2.read = AsyncMock(return_value=(arr2, out_profile))
+
+        result_arr, _ = await merge_cogs(
+            [cog1, cog2], bbox=BBox(0, 0, 10, 10), bbox_crs=32632,
+            band_indices=[1], target_resolution=2.0, method="first",
+        )
+        # method="first": cog1's values should take precedence everywhere
+        assert np.all(result_arr == 1)
