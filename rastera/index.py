@@ -16,7 +16,6 @@ from shapely.geometry import box
 
 from .reader import (
     AsyncGeoTIFF,
-    _build_store,
     _detect_region,
     _extract_key,
     _is_s3_uri,
@@ -121,16 +120,25 @@ async def build_index(
     uris = list(uris)
     if not uris:
         return _empty_geodataframe()
-    shared_store = store if store is not None else _build_store(uris[0], **store_kwargs)
     obs = _build_obstore(uris[0], **store_kwargs)
     sem = asyncio.Semaphore(concurrency)
 
-    async def _open_and_fetch(uri: str) -> tuple[AsyncGeoTIFF, bytes]:
+    # Fetch header bytes once, then open COGs through cache so async-geotiff
+    # reads from memory instead of making a second network request.
+    async def _fetch_header(uri: str) -> tuple[str, str, bytes]:
+        async with sem:
+            key = _obstore_key(uri)
+            hdr = bytes(await obstore.get_range_async(obs, key, start=0, end=prefetch))
+            return uri, key, hdr
+
+    fetched = await asyncio.gather(*(_fetch_header(u) for u in uris))
+    cache = {key: hdr for _, key, hdr in fetched}
+    cached_store = HeaderCacheStore(obs, cache)
+
+    async def _open_one(uri: str, hdr: bytes) -> tuple[AsyncGeoTIFF, bytes]:
         async with sem:
             try:
-                src = await AsyncGeoTIFF.open(uri, store=shared_store, prefetch=prefetch)
-                key = _obstore_key(uri)
-                hdr = bytes(await obstore.get_range_async(obs, key, start=0, end=prefetch))
+                src = await AsyncGeoTIFF.open(uri, store=cached_store, prefetch=prefetch)
                 return src, hdr
             except Exception as exc:
                 hint = ""
@@ -138,7 +146,7 @@ async def build_index(
                     hint = " (local files are not supported, use remote URIs)"
                 raise RuntimeError(f"Failed to index {uri!r}{hint}") from exc
 
-    results = await asyncio.gather(*(_open_and_fetch(u) for u in uris))
+    results = await asyncio.gather(*(_open_one(u, hdr) for u, _, hdr in fetched))
 
     rows: dict[str, list] = {
         "uri": [],
