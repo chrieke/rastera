@@ -153,34 +153,26 @@ def compute_paste_slices(
     )
 
 
-def transform_bbox(bbox: BBox, from_crs: int, to_crs: int) -> BBox:
-    """Transform a BBox between CRS (EPSG codes). Samples corners + edge midpoints for accuracy."""
+def transform_bbox(bbox: BBox, from_crs: int, to_crs: int, densify_pts: int = 21) -> BBox:
+    """Transform a BBox between CRS (EPSG codes).
+
+    Densifies all 4 edges with *densify_pts* samples each (default 21,
+    matching rasterio's ``transform_bounds``). This captures the curvature
+    of projected edges at high latitudes and near polar singularities.
+    """
     if from_crs == to_crs:
         return bbox
     transformer = Transformer.from_crs(from_crs, to_crs, always_xy=True)
-    # Sample corners + edge midpoints for better accuracy with non-linear transforms
-    xs_in = [
-        bbox.minx,
-        bbox.maxx,
-        bbox.minx,
-        bbox.maxx,
-        (bbox.minx + bbox.maxx) / 2,
-        (bbox.minx + bbox.maxx) / 2,
-        bbox.minx,
-        bbox.maxx,
-    ]
-    ys_in = [
-        bbox.miny,
-        bbox.miny,
-        bbox.maxy,
-        bbox.maxy,
-        bbox.miny,
-        bbox.maxy,
-        (bbox.miny + bbox.maxy) / 2,
-        (bbox.miny + bbox.maxy) / 2,
-    ]
-    xs_out, ys_out = transformer.transform(xs_in, ys_in)
-    return BBox(min(xs_out), min(ys_out), max(xs_out), max(ys_out))
+    xs, ys = [], []
+    for t in np.linspace(0, 1, densify_pts):
+        dx = t * (bbox.maxx - bbox.minx)
+        dy = t * (bbox.maxy - bbox.miny)
+        xs.extend([bbox.minx + dx, bbox.maxx, bbox.maxx - dx, bbox.minx])
+        ys.extend([bbox.miny, bbox.miny + dy, bbox.maxy, bbox.maxy - dy])
+    xs_out, ys_out = transformer.transform(xs, ys)
+    xs_valid = [x for x in xs_out if np.isfinite(x)]
+    ys_valid = [y for y in ys_out if np.isfinite(y)]
+    return BBox(min(xs_valid), min(ys_valid), max(xs_valid), max(ys_valid))
 
 
 def resample_nearest(
