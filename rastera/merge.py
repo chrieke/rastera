@@ -6,8 +6,10 @@ from typing import Literal
 
 import numpy as np
 from affine import Affine
+from async_geotiff import Array
+from pyproj import CRS
 
-from .reader import AsyncGeoTIFF
+from .reader import AsyncGeoTIFF, _CrsNodata, _grid_for_bbox, _make_output_array
 from .geo import (
     BBox,
     _affine_apply,
@@ -17,7 +19,6 @@ from .geo import (
     normalize_band_indices,
     transform_bbox,
 )
-from .meta import Profile
 
 
 async def merge_cogs(
@@ -30,7 +31,7 @@ async def merge_cogs(
     target_crs: int | None = None,
     target_resolution: float | None = None,
     method: Literal["first", "last"] = "first",
-) -> tuple[np.ndarray, Profile]:
+) -> Array:
     """
     Merge a bbox that may span multiple GeoTIFFs and return a single stitched array.
 
@@ -51,7 +52,7 @@ async def merge_cogs(
             default). ``"last"`` lets later COGs overwrite earlier ones.
 
     Returns:
-        Tuple of numpy array and window metadata
+        An ``async_geotiff.Array`` containing the merged mosaic.
     """
     if not cogs:
         raise ValueError("merge requires at least one AsyncGeoTIFF")
@@ -61,21 +62,22 @@ async def merge_cogs(
 
     bbox = ensure_bbox(bbox)
     base = cogs[0]
+    base_gt = base._geotiff
 
     # Validate + resolve count; keep original band_indices for cog.read() calls.
-    n_out_bands = len(normalize_band_indices(band_indices, base.profile.count))
+    n_out_bands = len(normalize_band_indices(band_indices, base_gt.count))
 
     # Decide whether we need the reprojected merge path.
     all_same_crs = all(
-        cog.profile.crs_epsg == base.profile.crs_epsg for cog in cogs[1:]
+        cog._crs_epsg == base._crs_epsg for cog in cogs[1:]
     )
     all_same_res = all(
-        math.isclose(float(cog.profile.transform.a), float(base.profile.transform.a))
+        math.isclose(float(cog._geotiff.transform.a), float(base_gt.transform.a))
         for cog in cogs[1:]
     )
-    crs_matches_target = target_crs is None or target_crs == base.profile.crs_epsg
+    crs_matches_target = target_crs is None or target_crs == base._crs_epsg
     res_matches_target = target_resolution is None or math.isclose(
-        target_resolution, base.profile.res[0], rel_tol=1e-6
+        target_resolution, base_gt.res[0], rel_tol=1e-6
     )
 
     needs_reproject = (
@@ -106,50 +108,41 @@ async def merge_cogs(
     # resampling even when CRS and resolution already match.
     _require_compatible_merge_inputs(cogs)
 
-    native_crs = base.profile.crs_epsg
+    native_crs = base._crs_epsg
     native_bbox = transform_bbox(bbox, bbox_crs, native_crs)
 
-    # Get profile for bbox image mosaic
+    # Get grid for bbox image mosaic
     window_transform, win_width, win_height, out_bounds = _mosaic_grid_from_bbox(
-        base_transform=base.profile.transform,
+        base_transform=base_gt.transform,
         bbox=native_bbox,
-    )
-    out_profile = Profile(
-        width=win_width,
-        height=win_height,
-        count=base.profile.count,
-        dtype=base.profile.dtype,
-        transform=window_transform,
-        res=base.profile.res,
-        crs_epsg=base.profile.crs_epsg,
-        bounds=out_bounds,
-        nodata=base.profile.nodata,
-        tile_width=base.profile.tile_width,
-        tile_height=base.profile.tile_height,
     )
 
     # Get sub bboxes specific to the contributing image
     sub_bboxes: list[tuple[AsyncGeoTIFF, BBox]] = []
     for cog in cogs:
-        sub_bbox = native_bbox.intersect(cog.profile.bounds)
+        sub_bbox = native_bbox.intersect(BBox(*cog._geotiff.bounds))
         if sub_bbox is not None:
             sub_bboxes.append((cog, sub_bbox))
 
     async def _read_native_bands(
         cog: AsyncGeoTIFF, sb: BBox
-    ) -> tuple[np.ndarray, Profile]:
-        indices = normalize_band_indices(band_indices, cog.profile.count)
+    ) -> Array:
+        indices = normalize_band_indices(band_indices, cog._geotiff.count)
         return await cog._read_native(bbox=sb, band_indices=indices)
 
-    out_array = await _gather_and_paste(
+    out_data = await _gather_and_paste(
         contributing=sub_bboxes,
-        out_profile=out_profile,
+        dst_transform=window_transform,
+        dst_width=win_width,
+        dst_height=win_height,
         n_bands=n_out_bands,
+        dtype=base_gt.dtype,
+        nodata=base._nodata,
         fill_value=fill_value,
         read_fn=_read_native_bands,
         method=method,
     )
-    return out_array, out_profile
+    return _make_output_array(out_data, window_transform, win_width, win_height, base_gt)
 
 
 async def _merge_reprojected(
@@ -163,10 +156,11 @@ async def _merge_reprojected(
     target_crs: int | None,
     target_resolution: float | None,
     method: Literal["first", "last"] = "first",
-) -> tuple[np.ndarray, Profile]:
+) -> Array:
     """Path B: merge with reprojection — supports mixed-CRS inputs."""
     base = cogs[0]
-    out_crs = target_crs if target_crs is not None else base.profile.crs_epsg
+    base_gt = base._geotiff
+    out_crs = target_crs if target_crs is not None else base._crs_epsg
 
     # Transform bbox into the output CRS
     target_bbox = transform_bbox(bbox, bbox_crs, out_crs)
@@ -176,8 +170,8 @@ async def _merge_reprojected(
         res = target_resolution
     else:
         # Preserve native pixel density of the first COG
-        native_res = base.profile.res[0]
-        src_bbox = transform_bbox(target_bbox, out_crs, base.profile.crs_epsg)
+        native_res = base_gt.res[0]
+        src_bbox = transform_bbox(target_bbox, out_crs, base._crs_epsg)
         n_cols = max(1, round(src_bbox.width / native_res))
         n_rows = max(1, round(src_bbox.height / native_res))
         res_x = target_bbox.width / n_cols
@@ -185,30 +179,21 @@ async def _merge_reprojected(
         res = min(res_x, res_y)
 
     # Build output grid
-    out_profile = Profile.for_bbox(
-        target_bbox,
-        res,
-        out_crs,
-        count=n_out_bands,
-        dtype=base.profile.dtype,
-        nodata=base.profile.nodata,
-        tile_width=base.profile.tile_width,
-        tile_height=base.profile.tile_height,
-    )
+    out_transform, out_w, out_h = _grid_for_bbox(target_bbox, res)
 
     # Find contributing COGs by intersecting their bounds (in target CRS) with output bbox
     contributing: list[tuple[AsyncGeoTIFF, BBox]] = []
     for cog in cogs:
         cog_bounds_in_target = transform_bbox(
-            cog.profile.bounds, cog.profile.crs_epsg, out_crs
+            BBox(*cog._geotiff.bounds), cog._crs_epsg, out_crs
         )
         sub_bbox = target_bbox.intersect(cog_bounds_in_target)
         if sub_bbox is not None:
             contributing.append((cog, sub_bbox))
 
-    async def _read_and_unwrap(
+    async def _read_and_reproject(
         cog: AsyncGeoTIFF, sb: BBox
-    ) -> tuple[np.ndarray, Profile]:
+    ) -> Array:
         return await cog.read(
             bbox=sb,
             bbox_crs=out_crs,
@@ -217,24 +202,34 @@ async def _merge_reprojected(
             band_indices=band_indices,
         )
 
-    out_array = await _gather_and_paste(
+    out_data = await _gather_and_paste(
         contributing=contributing,
-        out_profile=out_profile,
+        dst_transform=out_transform,
+        dst_width=out_w,
+        dst_height=out_h,
         n_bands=n_out_bands,
+        dtype=base_gt.dtype,
+        nodata=base._nodata,
         fill_value=fill_value,
-        read_fn=_read_and_unwrap,
+        read_fn=_read_and_reproject,
         method=method,
     )
-    return out_array, out_profile
+
+    geotiff_ref = _CrsNodata(CRS.from_epsg(out_crs), base._nodata) if target_crs else base_gt
+    return _make_output_array(out_data, out_transform, out_w, out_h, geotiff_ref)
 
 
 async def _gather_and_paste(
     *,
     contributing: list[tuple[AsyncGeoTIFF, BBox]],
-    out_profile: Profile,
+    dst_transform: Affine,
+    dst_width: int,
+    dst_height: int,
     n_bands: int,
+    dtype: np.dtype,
+    nodata: int | float | None,
     fill_value: int | float,
-    read_fn: Callable[[AsyncGeoTIFF, BBox], Awaitable[tuple[np.ndarray, Profile]]],
+    read_fn: Callable[[AsyncGeoTIFF, BBox], Awaitable[Array]],
     method: Literal["first", "last"] = "first",
 ) -> np.ndarray:
     """Read contributing COGs sequentially and paste into a single output array.
@@ -244,34 +239,33 @@ async def _gather_and_paste(
     overwrite earlier ones.
     """
     out_array = np.full(
-        (n_bands, out_profile.height, out_profile.width),
+        (n_bands, dst_height, dst_width),
         fill_value,
-        dtype=out_profile.dtype,
+        dtype=dtype,
     )
 
     if not contributing:
         return out_array
 
     filled = (
-        np.zeros((out_profile.height, out_profile.width), dtype=bool)
+        np.zeros((dst_height, dst_width), dtype=bool)
         if method == "first"
         else None
     )
 
     for cog, sub_bbox in contributing:
-        arr, prof = await read_fn(cog, sub_bbox)
+        arr = await read_fn(cog, sub_bbox)
 
         slices = compute_paste_slices(
-            src_profile=prof,
-            dst_transform=out_profile.transform,
-            dst_width=out_profile.width,
-            dst_height=out_profile.height,
+            src=arr,
+            dst_transform=dst_transform,
+            dst_width=dst_width,
+            dst_height=dst_height,
         )
         if slices is None:
             continue
         dst_rows, dst_cols, src_rows, src_cols = slices
-        src_data = arr[:, src_rows, src_cols]
-        nodata = prof.nodata
+        src_data = arr.data[:, src_rows, src_cols]
 
         if nodata is not None:
             if isinstance(nodata, float) and math.isnan(nodata):
@@ -347,7 +341,7 @@ def _require_compatible_merge_inputs(cogs: Sequence[AsyncGeoTIFF]) -> None:
     all sources are aligned to that grid (origins differ by whole pixels).
     """
     base = cogs[0]
-    base_transform = base.profile.transform
+    base_transform = base._geotiff.transform
     scale_x = float(base_transform.a)
     scale_y = float(-base_transform.e)
 
@@ -360,16 +354,16 @@ def _require_compatible_merge_inputs(cogs: Sequence[AsyncGeoTIFF]) -> None:
         )
 
     for cog in cogs[1:]:
-        if cog.profile.crs_epsg != base.profile.crs_epsg:
+        if cog._crs_epsg != base._crs_epsg:
             raise ValueError("All GeoTIFFs must share the same CRS EPSG")
-        if cog.profile.count != base.profile.count:
+        if cog._geotiff.count != base._geotiff.count:
             raise ValueError("All GeoTIFFs must share the same band count")
-        if not math.isclose(float(cog.profile.transform.a), scale_x):
+        if not math.isclose(float(cog._geotiff.transform.a), scale_x):
             raise ValueError("All GeoTIFFs must share the same pixel width")
-        if not math.isclose(float(-cog.profile.transform.e), scale_y):
+        if not math.isclose(float(-cog._geotiff.transform.e), scale_y):
             raise ValueError("All GeoTIFFs must share the same pixel height")
-        if not math.isclose(float(cog.profile.transform.b), 0.0) or not math.isclose(
-            float(cog.profile.transform.d),
+        if not math.isclose(float(cog._geotiff.transform.b), 0.0) or not math.isclose(
+            float(cog._geotiff.transform.d),
             0.0,
         ):
             raise NotImplementedError(
@@ -377,8 +371,8 @@ def _require_compatible_merge_inputs(cogs: Sequence[AsyncGeoTIFF]) -> None:
             )
 
         # Ensure origins line up on the same pixel grid (integer pixel offsets).
-        off_x = (float(cog.profile.transform.c) - float(base_transform.c)) / scale_x
-        off_y = (float(base_transform.f) - float(cog.profile.transform.f)) / scale_y
+        off_x = (float(cog._geotiff.transform.c) - float(base_transform.c)) / scale_x
+        off_y = (float(base_transform.f) - float(cog._geotiff.transform.f)) / scale_y
         if not math.isclose(off_x, round(off_x), abs_tol=1e-6) or not math.isclose(
             off_y, round(off_y), abs_tol=1e-6
         ):

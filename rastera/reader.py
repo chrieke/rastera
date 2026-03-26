@@ -4,13 +4,15 @@ import math
 import os
 import re
 from collections.abc import Sequence
+from dataclasses import dataclass, replace as dc_replace
 from typing import Any
 from urllib.parse import urlparse
 
 import numpy as np
-from async_geotiff import GeoTIFF, Window
+from affine import Affine
+from async_geotiff import Array, GeoTIFF, Window
 from async_tiff.store import from_url
-from pyproj import Transformer
+from pyproj import CRS, Transformer
 
 from .geo import (
     BBox,
@@ -20,7 +22,6 @@ from .geo import (
     transform_bbox,
     window_from_bbox,
 )
-from .meta import Profile
 
 _DEFAULT_REGION = (
     os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION") or "us-west-2"
@@ -52,6 +53,55 @@ def set_cache_size(n: int) -> None:
         _geotiff_cache.pop(next(iter(_geotiff_cache)))
 
 
+# ---- Internal helpers for constructing output Arrays ----
+
+
+@dataclass(frozen=True, slots=True)
+class _CrsNodata:
+    """Stub standing in for ``_geotiff`` on constructed Array objects."""
+    crs: CRS
+    nodata: float | None
+
+
+def _grid_for_bbox(bbox: BBox, res: float) -> tuple[Affine, int, int]:
+    """Compute (transform, width, height) for a regular grid covering *bbox*."""
+    width = max(1, math.ceil(bbox.width / res))
+    height = max(1, math.ceil(bbox.height / res))
+    transform = Affine(res, 0, bbox.minx, 0, -res, bbox.maxy)
+    return transform, width, height
+
+
+def _make_output_array(
+    data: np.ndarray,
+    transform: Affine,
+    width: int,
+    height: int,
+    geotiff,
+    mask: np.ndarray | None = None,
+) -> Array:
+    """Construct an Array for rastera output."""
+    return Array(
+        data=data,
+        mask=mask,
+        width=width,
+        height=height,
+        count=data.shape[0],
+        transform=transform,
+        _alpha_band_idx=None,
+        _geotiff=geotiff,
+    )
+
+
+def _coerce_nodata(nodata: float | None, dtype: np.dtype) -> int | float | None:
+    """Coerce nodata from async-geotiff (always float) to match the raster dtype."""
+    if nodata is None:
+        return None
+    kind = np.dtype(dtype).kind
+    if kind in ("i", "u"):
+        return None if math.isnan(nodata) else int(nodata)
+    return float(nodata)
+
+
 class AsyncGeoTIFF:
     """AsyncGeoTIFF instance for a single GeoTIFF file.
 
@@ -62,17 +112,17 @@ class AsyncGeoTIFF:
     def __init__(self, uri: str, geotiff: GeoTIFF):
         self.uri = uri
         self._geotiff = geotiff
-        self.profile: Profile = Profile.from_geotiff(geotiff)
+        self._crs_epsg: int | None = geotiff.crs.to_epsg()
+        self._nodata: int | float | None = _coerce_nodata(geotiff.nodata, geotiff.dtype)
 
         self.overviews: list[tuple[int, int]] = [
             (o.width, o.height) for o in geotiff.overviews
         ]
-        self.profile.overviews = self.overviews
 
     def _best_overview_for_resolution(self, target_resolution: float):
         """Return the Overview whose resolution is closest to *target_resolution*
         without being coarser. Returns None to use full resolution."""
-        native_res = self.profile.res[0]
+        native_res = self._geotiff.res[0]
         best = None
         best_res = native_res
 
@@ -142,7 +192,7 @@ class AsyncGeoTIFF:
         band_indices: Sequence[int] | None = None,
         target_crs: int | None = None,
         target_resolution: float | None = None,
-    ) -> tuple[np.ndarray, Profile]:
+    ) -> Array:
         """Read image data, optionally reprojecting and resampling.
 
         Args:
@@ -158,9 +208,10 @@ class AsyncGeoTIFF:
             target_resolution: Output pixel size in target CRS units.
 
         Returns:
-            Tuple of (numpy array, Profile) containing pixel data and spatial metadata.
+            An ``async_geotiff.Array`` containing pixel data and spatial metadata.
         """
-        band_indices = normalize_band_indices(band_indices, self.profile.count)
+        gt = self._geotiff
+        band_indices = normalize_band_indices(band_indices, gt.count)
         if window is not None and bbox is not None:
             raise ValueError("Cannot specify both bbox and window")
         if bbox is not None and bbox_crs is None:
@@ -168,9 +219,9 @@ class AsyncGeoTIFF:
         if window is not None and target_crs is not None:
             raise ValueError("Cannot combine window with target_crs")
 
-        needs_reproject = target_crs is not None and target_crs != self.profile.crs_epsg
+        needs_reproject = target_crs is not None and target_crs != self._crs_epsg
         needs_resample = target_resolution is not None and not math.isclose(
-            target_resolution, self.profile.res[0], rel_tol=1e-6
+            target_resolution, gt.res[0], rel_tol=1e-6
         )
 
         # When bbox_crs is given with no reprojection/resampling, transform
@@ -181,13 +232,12 @@ class AsyncGeoTIFF:
             and not needs_reproject
             and not needs_resample
         ):
-            bbox = transform_bbox(ensure_bbox(bbox), bbox_crs, self.profile.crs_epsg)
+            bbox = transform_bbox(ensure_bbox(bbox), bbox_crs, self._crs_epsg)
 
         if not needs_reproject and not needs_resample:
-            data, profile = await self._read_native(
+            return await self._read_native(
                 bbox=bbox, window=window, band_indices=band_indices,
             )
-            return data, profile
 
         # Pick the best overview for the target resolution
         overview = (
@@ -198,31 +248,24 @@ class AsyncGeoTIFF:
 
         # Window + resample: read native pixels for the window, then resample
         if window is not None and needs_resample:
-            native_arr, native_profile = await self._read_native(
+            native = await self._read_native(
                 window=window, band_indices=band_indices, overview=overview,
             )
-            target_bbox = native_profile.bounds
+            target_bbox = BBox(*native.bounds)
             res = target_resolution
-            out_profile = Profile.for_bbox(
-                target_bbox,
-                res,
-                self.profile.crs_epsg,
-                count=len(band_indices),
-                dtype=self.profile.dtype,
-                nodata=self.profile.nodata,
+            out_transform, out_w, out_h = _grid_for_bbox(target_bbox, res)
+            out_data = resample_nearest(
+                native.data,
+                src_transform=native.transform,
+                dst_transform=out_transform,
+                dst_width=out_w,
+                dst_height=out_h,
+                nodata=self._nodata,
             )
-            out_array = resample_nearest(
-                native_arr,
-                src_transform=native_profile.transform,
-                dst_transform=out_profile.transform,
-                dst_width=out_profile.width,
-                dst_height=out_profile.height,
-                nodata=self.profile.nodata,
-            )
-            return out_array, out_profile
+            return _make_output_array(out_data, out_transform, out_w, out_h, gt)
 
         # Target bbox in target CRS (or source CRS if no reprojection)
-        src_crs = self.profile.crs_epsg
+        src_crs = self._crs_epsg
         out_crs = target_crs or src_crs
 
         if bbox is not None:
@@ -236,9 +279,9 @@ class AsyncGeoTIFF:
         # Transform bbox to source CRS for tile fetching
         if target_bbox is None:
             if needs_reproject:
-                target_bbox = transform_bbox(self.profile.bounds, src_crs, out_crs)
+                target_bbox = transform_bbox(BBox(*gt.bounds), src_crs, out_crs)
             else:
-                target_bbox = self.profile.bounds
+                target_bbox = BBox(*gt.bounds)
 
         if needs_reproject:
             src_bbox = transform_bbox(target_bbox, out_crs, src_crs)
@@ -246,7 +289,7 @@ class AsyncGeoTIFF:
             src_bbox = target_bbox
 
         # Read from best overview (or full res if no suitable overview)
-        native_arr, native_profile = await self._read_native(
+        native = await self._read_native(
             bbox=src_bbox, band_indices=band_indices, overview=overview,
         )
 
@@ -256,7 +299,7 @@ class AsyncGeoTIFF:
         elif needs_reproject:
             # Derive a resolution in the target CRS that preserves the native
             # pixel density: use the native pixel count across the source bbox.
-            native_res = self.profile.res[0]
+            native_res = gt.res[0]
             src_bbox_width = src_bbox.width
             src_bbox_height = src_bbox.height
             n_cols = max(1, round(src_bbox_width / native_res))
@@ -265,31 +308,27 @@ class AsyncGeoTIFF:
             res_y = target_bbox.height / n_rows
             res = min(res_x, res_y)
         else:
-            res = self.profile.res[0]
-        out_profile = Profile.for_bbox(
-            target_bbox,
-            res,
-            out_crs,
-            count=len(band_indices),
-            dtype=self.profile.dtype,
-            nodata=self.profile.nodata,
-        )
+            res = gt.res[0]
+        out_transform, out_w, out_h = _grid_for_bbox(target_bbox, res)
 
         # Reproject/resample
         transformer = None
         if needs_reproject:
             transformer = Transformer.from_crs(out_crs, src_crs, always_xy=True)
 
-        out_array = resample_nearest(
-            native_arr,
-            src_transform=native_profile.transform,
-            dst_transform=out_profile.transform,
-            dst_width=out_profile.width,
-            dst_height=out_profile.height,
-            nodata=self.profile.nodata,
+        out_data = resample_nearest(
+            native.data,
+            src_transform=native.transform,
+            dst_transform=out_transform,
+            dst_width=out_w,
+            dst_height=out_h,
+            nodata=self._nodata,
             transformer=transformer,
         )
-        return out_array, out_profile
+
+        # Use a CRS stub when reprojecting so Array.crs returns the output CRS
+        geotiff_ref = _CrsNodata(CRS.from_epsg(out_crs), self._nodata) if needs_reproject else gt
+        return _make_output_array(out_data, out_transform, out_w, out_h, geotiff_ref)
 
     async def _read_native(
         self,
@@ -297,33 +336,35 @@ class AsyncGeoTIFF:
         window: Window | None = None,
         band_indices: Sequence[int] | None = None,
         overview: Any | None = None,
-    ) -> tuple[np.ndarray, Profile]:
+    ) -> Array:
         """Read at native resolution/CRS, optionally from an overview."""
         # Determine which readable to use (full-res GeoTIFF or an Overview)
         if overview is not None:
             readable = overview
-            readable_profile = Profile.from_overview(self._geotiff, overview)
         else:
             readable = self._geotiff
-            readable_profile = self.profile
 
         if bbox is None and window is None:
-            bbox = readable_profile.bounds
+            bbox = BBox(*readable.bounds)
         if window is None:
-            window = window_from_bbox(readable_profile, bbox)
+            window = window_from_bbox(readable, bbox)
 
         # Use async-geotiff's built-in read (handles tile fetching + stitching)
         result = await readable.read(window=window)
-        data = result.data  # shape: (bands, height, width)
 
         # Select requested bands
-        out_array = data[band_indices]
+        if band_indices is not None:
+            result = dc_replace(result, data=result.data[band_indices], count=len(band_indices))
 
-        out_profile = readable_profile.adjust_to_window(window)
-        return out_array, out_profile
+        return result
 
     def __repr__(self) -> str:
-        return f"AsyncGeoTIFF({self.uri}, profile={self.profile})"
+        gt = self._geotiff
+        return (
+            f"AsyncGeoTIFF({self.uri}, "
+            f"width={gt.width}, height={gt.height}, "
+            f"crs={self._crs_epsg})"
+        )
 
 
 def _is_s3_uri(uri: str) -> bool:

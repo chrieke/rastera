@@ -5,24 +5,38 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import numpy as np
 import pytest
 from affine import Affine
+from async_geotiff import Array, Window
 
 import rastera
 from rastera.reader import AsyncGeoTIFF, _extract_key
-from async_geotiff import Window
 
 from rastera.geo import BBox
-from rastera.meta import Profile
 from tests.conftest import make_mock_geotiff
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────
 
 
-def _make_read_result(shape, dtype=np.uint16, fill=1):
+def _make_read_result(shape, dtype=np.uint16, fill=1, transform=None, geotiff=None):
     """Create a mock async-geotiff Array result."""
-    result = MagicMock()
-    result.data = np.full(shape, fill, dtype=dtype)
-    return result
+    data = np.full(shape, fill, dtype=dtype)
+    if transform is None:
+        transform = Affine(1, 0, 0, 0, -1, shape[1])
+    if geotiff is None:
+        geotiff = MagicMock()
+        geotiff.nodata = None
+        geotiff.crs = MagicMock()
+        geotiff.crs.to_epsg.return_value = 32632
+    return Array(
+        data=data,
+        mask=None,
+        width=shape[2],
+        height=shape[1],
+        count=shape[0],
+        transform=transform,
+        _alpha_band_idx=None,
+        _geotiff=geotiff,
+    )
 
 
 # ── Construction & properties ────────────────────────────────────────────
@@ -33,7 +47,7 @@ class TestAsyncGeoTIFFInit:
         gt = make_mock_geotiff()
         obj = AsyncGeoTIFF("s3://bucket/key.tif", gt)
         assert obj.uri == "s3://bucket/key.tif"
-        assert isinstance(obj.profile, Profile)
+        assert obj._crs_epsg == 32632
 
     def test_repr(self):
         gt = make_mock_geotiff()
@@ -42,12 +56,12 @@ class TestAsyncGeoTIFFInit:
         assert "AsyncGeoTIFF" in r
         assert "s3://bucket/key.tif" in r
 
-    def test_profile_matches_geotiff(self):
+    def test_geotiff_attrs(self):
         gt = make_mock_geotiff(width=200, height=150, count=4)
         obj = AsyncGeoTIFF("s3://b/k.tif", gt)
-        assert obj.profile.width == 200
-        assert obj.profile.height == 150
-        assert obj.profile.count == 4
+        assert obj._geotiff.width == 200
+        assert obj._geotiff.height == 150
+        assert obj._geotiff.count == 4
 
     def test_overviews_populated(self):
         gt = make_mock_geotiff()
@@ -130,44 +144,47 @@ class TestRead:
         gt = make_mock_geotiff(width=16, height=16, scale=1.0, count=1, tile_width=16, tile_height=16)
         obj = AsyncGeoTIFF("s3://b/k.tif", gt)
 
-        result = _make_read_result((1, 16, 16), dtype=np.uint16)
+        result = _make_read_result((1, 16, 16), dtype=np.uint16, geotiff=gt)
         gt.read = AsyncMock(return_value=result)
 
-        data, profile = await obj.read()
-        assert data.shape == (1, 16, 16)
-        assert data.dtype == np.uint16
-        assert profile.width == 16
-        assert profile.height == 16
-        np.testing.assert_array_equal(data, 1)
+        arr = await obj.read()
+        assert arr.data.shape == (1, 16, 16)
+        assert arr.data.dtype == np.uint16
+        assert arr.width == 16
+        assert arr.height == 16
+        np.testing.assert_array_equal(arr.data, 1)
 
     @pytest.mark.asyncio
     async def test_read_with_window(self):
         gt = make_mock_geotiff(width=32, height=32, scale=1.0, count=2, tile_width=32, tile_height=32)
         obj = AsyncGeoTIFF("s3://b/k.tif", gt)
 
-        result = _make_read_result((2, 16, 16), dtype=np.uint16, fill=42)
+        result = _make_read_result((2, 16, 16), dtype=np.uint16, fill=42, geotiff=gt)
         gt.read = AsyncMock(return_value=result)
 
         window = Window(col_off=4, row_off=4, width=16, height=16)
-        data, profile = await obj.read(window=window)
-        assert data.shape == (2, 16, 16)
-        np.testing.assert_array_equal(data, 42)
+        arr = await obj.read(window=window)
+        assert arr.data.shape == (2, 16, 16)
+        np.testing.assert_array_equal(arr.data, 42)
 
     @pytest.mark.asyncio
     async def test_read_band_indices(self):
         gt = make_mock_geotiff(width=16, height=16, scale=1.0, count=3, tile_width=16, tile_height=16)
         obj = AsyncGeoTIFF("s3://b/k.tif", gt)
 
-        arr = np.arange(3 * 16 * 16, dtype=np.uint16).reshape(3, 16, 16)
-        result = MagicMock()
-        result.data = arr
+        data = np.arange(3 * 16 * 16, dtype=np.uint16).reshape(3, 16, 16)
+        result = Array(
+            data=data, mask=None, width=16, height=16, count=3,
+            transform=Affine(1, 0, 0, 0, -1, 16),
+            _alpha_band_idx=None, _geotiff=gt,
+        )
         gt.read = AsyncMock(return_value=result)
 
-        data, profile = await obj.read(band_indices=[1, 3])
-        assert data.shape == (2, 16, 16)
+        arr = await obj.read(band_indices=[1, 3])
+        assert arr.data.shape == (2, 16, 16)
         # band_indices [1, 3] → 0-based [0, 2]
-        np.testing.assert_array_equal(data[0], arr[0])
-        np.testing.assert_array_equal(data[1], arr[2])
+        np.testing.assert_array_equal(arr.data[0], data[0])
+        np.testing.assert_array_equal(arr.data[1], data[2])
 
     @pytest.mark.asyncio
     async def test_read_band_index_zero_raises(self):

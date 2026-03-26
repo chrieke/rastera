@@ -12,7 +12,7 @@ from rastera.geo import (
     window_from_bbox,
 )
 from rastera.reader import _extract_key
-from tests.conftest import make_profile
+from tests.conftest import make_meta
 
 
 # ── BBox ──────────────────────────────────────────────────────────────────
@@ -57,24 +57,24 @@ class TestBBox:
 
 class TestWindow:
     def test_from_bbox_full(self):
-        p = make_profile()
+        p = make_meta()
         w = window_from_bbox(p, BBox(0, 0, 1000, 1000))
         assert w.col_off == 0 and w.width == 100
         assert w.row_off == 0 and w.height == 100
 
     def test_from_bbox_subset(self):
-        p = make_profile()
+        p = make_meta()
         w = window_from_bbox(p, BBox(100, 200, 500, 800))
         assert w.width > 0 and w.height > 0
         assert w.col_off >= 10 and w.col_off + w.width <= 50
 
     def test_from_bbox_no_intersect(self):
-        p = make_profile()
+        p = make_meta()
         with pytest.raises(ValueError, match="does not intersect"):
             window_from_bbox(p, BBox(2000, 2000, 3000, 3000))
 
     def test_from_bbox_clamps(self):
-        p = make_profile()
+        p = make_meta()
         # bbox extends beyond image
         w = window_from_bbox(p, BBox(-500, -500, 500, 500))
         assert w.col_off == 0
@@ -90,10 +90,10 @@ class TestWindow:
 class TestComputePasteSlices:
     def test_aligned_paste(self):
         # src profile has origin at (0, 500) in world coords (north-up)
-        src = make_profile(width=50, height=50, scale=10.0)
+        src = make_meta(width=50, height=50, scale=10.0)
         dst_transform = Affine(10, 0, 0, 0, -10, 1000)
         result = compute_paste_slices(
-            src_profile=src, dst_transform=dst_transform, dst_width=100, dst_height=100
+            src=src, dst_transform=dst_transform, dst_width=100, dst_height=100
         )
         assert result is not None
         dst_rows, dst_cols, src_rows, src_cols = result
@@ -101,11 +101,11 @@ class TestComputePasteSlices:
         assert dst_rows.stop - dst_rows.start == 50  # correct height
 
     def test_no_overlap(self):
-        src = make_profile(width=50, height=50, scale=10.0)
+        src = make_meta(width=50, height=50, scale=10.0)
         # destination is far away
         dst_transform = Affine(10, 0, 5000, 0, -10, 10000)
         result = compute_paste_slices(
-            src_profile=src, dst_transform=dst_transform, dst_width=100, dst_height=100
+            src=src, dst_transform=dst_transform, dst_width=100, dst_height=100
         )
         assert result is None
 

@@ -3,15 +3,10 @@ from __future__ import annotations
 import math
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
-
 import numpy as np
 from affine import Affine
 from async_geotiff import Window
 from pyproj import Transformer
-
-if TYPE_CHECKING:
-    from .meta import Profile
 
 _WARP_GRID_STEP = 16
 
@@ -54,7 +49,7 @@ class BBox:
 
 
 def window_from_bbox(
-    meta: Profile,
+    meta,
     bbox: BBox | tuple[float, float, float, float],
 ) -> Window:
     """Return pixel window for a world-space bbox."""
@@ -99,7 +94,7 @@ def window_from_bbox(
 
 def compute_paste_slices(
     *,
-    src_profile: Profile,
+    src,
     dst_transform: Affine,
     dst_width: int,
     dst_height: int,
@@ -107,9 +102,11 @@ def compute_paste_slices(
     """
     Compute aligned source/target slices for pasting a read window into a mosaic.
 
-    This is used when you have already read a window (described by `src_profile`)
+    This is used when you have already read a window (described by `src`)
     and want to paste it into a destination array whose pixel grid is described
     by `dst_transform` (pixel -> world for the destination).
+
+    `src` must have `.transform`, `.width`, `.height` attributes.
 
     Returns (dst_rows, dst_cols, src_rows, src_cols) or None if there is no
     overlap after clipping to destination bounds.
@@ -117,7 +114,7 @@ def compute_paste_slices(
     dst_inv_transform = ~dst_transform
 
     # Top-left world coordinate of the source window.
-    wx0, wy0 = _affine_apply(src_profile.transform, 0, 0)
+    wx0, wy0 = _affine_apply(src.transform, 0, 0)
 
     # Map into destination pixel coordinates.
     dst_c0_f, dst_r0_f = _affine_apply(dst_inv_transform, wx0, wy0)
@@ -125,8 +122,8 @@ def compute_paste_slices(
     dst_r0 = int(round(dst_r0_f))
 
     # Initial (unclipped) target indices in destination pixel coordinates.
-    dst_c1 = dst_c0 + src_profile.width
-    dst_r1 = dst_r0 + src_profile.height
+    dst_c1 = dst_c0 + src.width
+    dst_r1 = dst_r0 + src.height
 
     # Clip to destination bounds. NumPy will silently clip slice endpoints that
     # exceed the array shape; we clip explicitly so we can also crop the source

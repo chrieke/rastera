@@ -4,6 +4,7 @@ import asyncio
 from collections.abc import Sequence
 from typing import Any, Literal, overload
 
+from async_geotiff import Array
 from async_tiff.store import S3Store
 
 from .reader import (
@@ -16,6 +17,7 @@ from .reader import (
 from .merge import merge_cogs
 
 __all__ = [
+    "Array",
     "AsyncGeoTIFF",
     "S3Store",
     "clear_cache",
@@ -116,7 +118,7 @@ async def merge(
     target_crs: int | None = None,
     target_resolution: float | None = None,
     method: Literal["first", "last"] = "first",
-) -> tuple:
+) -> Array:
     """
     Rasterio-style helper: read a bbox mosaic from multiple already-open sources.
 

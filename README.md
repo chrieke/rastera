@@ -17,10 +17,11 @@ uri = "s3://my-bucket/my-cog.tif"
 src = await rastera.open(uri)
 
 # Full image
-data, profile = await src.read()
+array = await src.read()
+# array.data, array.transform, array.bounds, array.crs, array.nodata, ...
 
 # Spatial subset with reprojection
-data, profile = await src.read(
+array = await src.read(
     bbox=(minx, miny, maxx, maxy),
     bbox_crs=32633,
     target_crs=32632,
@@ -34,7 +35,7 @@ data, profile = await src.read(
 uris = ["s3://bucket/tile_a.tif", "s3://bucket/tile_b.tif", ...]
 sources = await rastera.open(uris)  # concurrent opens, shared connection pool
 
-data, profile = await rastera.merge(sources, bbox=bbox, bbox_crs=32633, target_resolution=20)
+array = await rastera.merge(sources, bbox=bbox, bbox_crs=32633, target_resolution=20)
 ```
 
 ### COG header cache via geoparquet index
@@ -53,7 +54,7 @@ gdf.to_parquet("index.parquet")
 
 # Open from index (reusable across sessions, ~5-6x faster opens)
 sources = await rastera.open_from_index("index.parquet", bbox=(minx, miny, maxx, maxy), region="us-west-2")
-data, profile = await rastera.merge(sources, bbox=bbox, bbox_crs=4326)
+array = await rastera.merge(sources, bbox=bbox, bbox_crs=4326)
 ```
 
 

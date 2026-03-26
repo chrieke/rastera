@@ -1,25 +1,16 @@
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import numpy as np
 from affine import Affine
 
 from rastera.geo import BBox
-from rastera.meta import Profile
 
 
-def make_profile(width=100, height=100, scale=10.0, count=1, dtype=np.uint8):
-    """North-up profile with origin at (0, height*scale)."""
+def make_meta(width=100, height=100, scale=10.0):
+    """Duck-typed object with transform/width/height for window_from_bbox etc."""
     transform = Affine(scale, 0, 0, 0, -scale, height * scale)
-    return Profile(
-        width=width,
-        height=height,
-        count=count,
-        dtype=np.dtype(dtype),
-        transform=transform,
-        res=(scale, scale),
-        crs_epsg=32632,
-        bounds=BBox(0, 0, width * scale, height * scale),
-    )
+    return SimpleNamespace(width=width, height=height, transform=transform)
 
 
 def make_mock_geotiff(
@@ -27,7 +18,7 @@ def make_mock_geotiff(
     tile_width=256, tile_height=256, dtype=np.dtype("u2"),
     nodata=None, crs_epsg=32632,
 ):
-    """Build a mock async_geotiff.GeoTIFF suitable for Profile.from_geotiff()."""
+    """Build a mock async_geotiff.GeoTIFF."""
     gt = MagicMock()
     gt.width = width
     gt.height = height

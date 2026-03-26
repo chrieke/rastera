@@ -11,9 +11,7 @@ from shapely.geometry import box
 
 from rastera.geo import BBox
 from rastera.index import HeaderCacheStore, _obstore_key, build_index, open_from_index
-from rastera.meta import Profile
 from rastera.reader import AsyncGeoTIFF
-from tests.conftest import make_mock_geotiff
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────
@@ -23,17 +21,32 @@ def _make_mock_async_geotiff(
     uri="s3://bucket/key.tif", crs_epsg=32632, width=100, height=100,
     scale=10.0, count=3, dtype=np.dtype("u2"), nodata=None,
 ):
-    """Build a mock AsyncGeoTIFF with a realistic Profile."""
+    """Build a mock AsyncGeoTIFF with _geotiff, _crs_epsg, _nodata."""
     transform = Affine(scale, 0, 0, 0, -scale, height * scale)
-    bounds = BBox(0, 0, width * scale, height * scale)
-    profile = Profile(
-        width=width, height=height, count=count, dtype=dtype,
-        transform=transform, res=(scale, scale), crs_epsg=crs_epsg,
-        bounds=bounds, nodata=nodata, overviews=[],
-    )
+    bounds = (0, 0, width * scale, height * scale)
+
+    gt = MagicMock()
+    gt.width = width
+    gt.height = height
+    gt.count = count
+    gt.dtype = dtype
+    gt.nodata = float(nodata) if nodata is not None else None
+    gt.transform = transform
+    gt.res = (scale, scale)
+    gt.bounds = bounds
+    gt.tile_width = 256
+    gt.tile_height = 256
+    crs_mock = MagicMock()
+    crs_mock.to_epsg.return_value = crs_epsg
+    gt.crs = crs_mock
+    gt.overviews = []
+
     obj = MagicMock(spec=AsyncGeoTIFF)
     obj.uri = uri
-    obj.profile = profile
+    obj._geotiff = gt
+    obj._crs_epsg = crs_epsg
+    obj._nodata = nodata
+    obj.overviews = []
     return obj
 
 

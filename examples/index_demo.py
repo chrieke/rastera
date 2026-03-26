@@ -123,10 +123,10 @@ async def cmd_query():
         rastera.clear_cache()
         t0 = time.perf_counter()
         sources = await rastera.open_from_index(gdf, bbox=qbbox, **S3_OPTS)
-        data, _ = await rastera.merge(sources, bbox=qbbox, bbox_crs=4326)
+        result = await rastera.merge(sources, bbox=qbbox, bbox_crs=4326)
         dt = time.perf_counter() - t0
         t_total_idx += dt
-        print(f"  [{i+1}] {len(sources)} files  {data.shape}  {dt:.2f}s", flush=True)
+        print(f"  [{i+1}] {len(sources)} files  {result.shape}  {dt:.2f}s", flush=True)
 
     print(f"\n--- {N_QUERIES} queries via network (cold cache) ---", flush=True)
     t_total_net = 0.0
@@ -135,10 +135,10 @@ async def cmd_query():
         t0 = time.perf_counter()
         matched_uris = gdf[gdf.intersects(box(*qbbox))]["uri"].tolist()
         sources = await rastera.open(matched_uris, **S3_OPTS)
-        data, _ = await rastera.merge(sources, bbox=qbbox, bbox_crs=4326)
+        result = await rastera.merge(sources, bbox=qbbox, bbox_crs=4326)
         dt = time.perf_counter() - t0
         t_total_net += dt
-        print(f"  [{i+1}] {len(sources)} files  {data.shape}  {dt:.2f}s", flush=True)
+        print(f"  [{i+1}] {len(sources)} files  {result.shape}  {dt:.2f}s", flush=True)
 
     print(f"\n--- Results ---", flush=True)
     print(f"  Index:   {t_total_idx:.2f}s  ({t_total_idx/N_QUERIES:.2f}s avg)", flush=True)

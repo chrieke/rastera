@@ -26,11 +26,11 @@ def read_rastera(uri: str, bbox: tuple, bbox_crs: int,
 
     async def _run():
         src = await rastera.open(uri)
-        data, profile = await src.read(
+        result = await src.read(
             bbox=bbox, bbox_crs=bbox_crs,
             target_crs=target_crs, target_resolution=target_resolution,
         )
-        return data
+        return result.data
 
     return asyncio.run(_run())
 
@@ -42,11 +42,11 @@ def merge_rastera(uris: list[str], bbox: tuple, bbox_crs: int,
 
     async def _run():
         sources = await rastera.open(uris)
-        data, profile = await rastera.merge(
+        result = await rastera.merge(
             sources, bbox=bbox, bbox_crs=bbox_crs,
             target_crs=target_crs, target_resolution=target_resolution,
         )
-        return data
+        return result.data
 
     return asyncio.run(_run())
 
