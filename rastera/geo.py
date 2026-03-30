@@ -160,18 +160,34 @@ def transform_bbox(bbox: BBox, from_crs: int, to_crs: int, densify_pts: int = 21
     if from_crs == to_crs:
         return bbox
     transformer = Transformer.from_crs(from_crs, to_crs, always_xy=True)
-    xs, ys = [], []
-    for t in np.linspace(0, 1, densify_pts):
-        dx = t * (bbox.maxx - bbox.minx)
-        dy = t * (bbox.maxy - bbox.miny)
-        xs.extend([bbox.minx + dx, bbox.maxx, bbox.maxx - dx, bbox.minx])
-        ys.extend([bbox.miny, bbox.miny + dy, bbox.maxy, bbox.maxy - dy])
+    t = np.linspace(0, 1, densify_pts)
+    dx = t * (bbox.maxx - bbox.minx)
+    dy = t * (bbox.maxy - bbox.miny)
+    xs = np.concatenate([
+        bbox.minx + dx,              # bottom edge
+        np.full_like(t, bbox.maxx),  # right edge
+        bbox.maxx - dx,              # top edge
+        np.full_like(t, bbox.minx),  # left edge
+    ])
+    ys = np.concatenate([
+        np.full_like(t, bbox.miny),  # bottom edge
+        bbox.miny + dy,              # right edge
+        np.full_like(t, bbox.maxy),  # top edge
+        bbox.maxy - dy,              # left edge
+    ])
     xs_out, ys_out = transformer.transform(xs, ys)
-    xs_valid = [x for x in xs_out if np.isfinite(x)]
-    ys_valid = [y for y in ys_out if np.isfinite(y)]
-    if not xs_valid or not ys_valid:
-        raise ValueError(f"All coordinates became inf/nan transforming bbox from EPSG:{from_crs} to EPSG:{to_crs}")
-    return BBox(min(xs_valid), min(ys_valid), max(xs_valid), max(ys_valid))
+    valid = np.isfinite(xs_out) & np.isfinite(ys_out)
+    if not np.any(valid):
+        raise ValueError(
+            f"All coordinates became inf/nan transforming bbox "
+            f"from EPSG:{from_crs} to EPSG:{to_crs}"
+        )
+    return BBox(
+        float(np.min(xs_out[valid])),
+        float(np.min(ys_out[valid])),
+        float(np.max(xs_out[valid])),
+        float(np.max(ys_out[valid])),
+    )
 
 
 def resample_nearest(

@@ -283,15 +283,13 @@ async def _gather_and_paste(
                 paste_mask = unfilled & src_valid
             else:
                 paste_mask = unfilled
-            out_array[:, dst_rows, dst_cols] = np.where(
-                paste_mask, src_data, out_array[:, dst_rows, dst_cols]
-            )
+            np.copyto(out_array[:, dst_rows, dst_cols], src_data, where=paste_mask)
             filled[dst_rows, dst_cols] |= paste_mask
+            if filled.all():
+                break
         else:
             if src_valid is not None:
-                out_array[:, dst_rows, dst_cols] = np.where(
-                    src_valid, src_data, out_array[:, dst_rows, dst_cols]
-                )
+                np.copyto(out_array[:, dst_rows, dst_cols], src_data, where=src_valid)
             else:
                 out_array[:, dst_rows, dst_cols] = src_data
 

@@ -5,7 +5,18 @@ Usage:
 
 Each run is a fresh Python process so neither library benefits from
 in-process caching (rastera TIFF header cache, GDAL VSI cache).
+
+Scenarios
+---------
+1. Read: same CRS, native resolution (bbox subset)
+2. Read: same CRS, downsampled to 60 m
+3. Read: cross-CRS reproject to EPSG:4326, 0.001 deg
+4. Merge: 2 adjacent UTM tiles, same CRS, 10 m resolution
+
+Each scenario measures wall-clock time, peak RSS, output accuracy
+(array comparison), and result consistency (mean, dtype, shape).
 """
+
 from __future__ import annotations
 
 import json
@@ -62,26 +73,39 @@ SCENARIOS = [
 def purge_page_cache():
     """Drop OS page cache for cold-cache benchmarks. Requires sudo on macOS."""
     import platform
+
     if platform.system() == "Darwin":
         subprocess.run(["sudo", "-n", "purge"], capture_output=True)
     else:
         # Linux: drop page cache
-        subprocess.run(["sudo", "-n", "sh", "-c", "echo 3 > /proc/sys/vm/drop_caches"],
-                       capture_output=True)
+        subprocess.run(
+            ["sudo", "-n", "sh", "-c", "echo 3 > /proc/sys/vm/drop_caches"],
+            capture_output=True,
+        )
 
 
-def run_once(scenario: dict, library: str, save_array: str | None = None,
-             cold_cache: bool = False) -> dict:
+def run_once(
+    scenario: dict,
+    library: str,
+    save_array: str | None = None,
+    cold_cache: bool = False,
+) -> dict:
     if cold_cache:
         purge_page_cache()
     mode = scenario.get("mode", "read")
     cmd = [
-        PYTHON, RUNNER,
-        "--library", library,
-        "--mode", mode,
-        "--uri", URI,
-        "--bbox", scenario["bbox"],
-        "--bbox-crs", str(scenario["bbox_crs"]),
+        PYTHON,
+        RUNNER,
+        "--library",
+        library,
+        "--mode",
+        mode,
+        "--uri",
+        URI,
+        "--bbox",
+        scenario["bbox"],
+        "--bbox-crs",
+        str(scenario["bbox_crs"]),
     ]
     if mode == "merge":
         cmd += ["--uri2", URI2]
@@ -95,7 +119,11 @@ def run_once(scenario: dict, library: str, save_array: str | None = None,
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
     if result.returncode != 0:
         print(f"  FAILED ({library}): {result.stderr.strip()}", file=sys.stderr)
-        return {"library": library, "elapsed_s": float("inf"), "error": result.stderr.strip()}
+        return {
+            "library": library,
+            "elapsed_s": float("inf"),
+            "error": result.stderr.strip(),
+        }
 
     return json.loads(result.stdout.strip())
 
@@ -123,43 +151,59 @@ def compare_arrays(path_a: str, path_b: str) -> dict:
         "shape_rastera": list(a_raw.shape),
         "shape_rasterio": list(b_raw.shape),
         "compared_shape": [min_bands, min_h, min_w],
-        "rmse": round(float(np.sqrt(np.mean(diff ** 2))), 4),
+        "rmse": round(float(np.sqrt(np.mean(diff**2))), 4),
         "max_abs_error": round(float(np.max(diff)), 4),
         "pct_pixels_differ": round(float(np.mean(diff > 0) * 100), 2),
         "data_range": round(data_range, 1),
     }
     if len(nonzero) > 0:
         result["median_diff_where_nonzero"] = round(float(np.median(nonzero)), 1)
-        result["rmse_pct_of_range"] = round(result["rmse"] / data_range * 100, 2) if data_range > 0 else 0.0
+        result["rmse_pct_of_range"] = (
+            round(result["rmse"] / data_range * 100, 2) if data_range > 0 else 0.0
+        )
     return result
 
 
 def print_accuracy(accuracy: dict):
     if not accuracy["shapes_exact_match"]:
-        print(f"    Shapes differ (off-by-one rounding): "
-              f"rastera={accuracy['shape_rastera']} "
-              f"rasterio={accuracy['shape_rasterio']}")
+        print(
+            f"    Shapes differ (off-by-one rounding): "
+            f"rastera={accuracy['shape_rastera']} "
+            f"rasterio={accuracy['shape_rasterio']}"
+        )
         print(f"    Comparing overlap: {accuracy['compared_shape']}")
     else:
         print(f"    Shape: {accuracy['shape_rastera']}")
-    print(f"    RMSE: {accuracy['rmse']}  "
-          f"({accuracy.get('rmse_pct_of_range', 0)}% of data range)")
-    print(f"    Max abs error: {accuracy['max_abs_error']}  "
-          f"(data range: {accuracy['data_range']})")
+    print(
+        f"    RMSE: {accuracy['rmse']}  "
+        f"({accuracy.get('rmse_pct_of_range', 0)}% of data range)"
+    )
+    print(
+        f"    Max abs error: {accuracy['max_abs_error']}  "
+        f"(data range: {accuracy['data_range']})"
+    )
     if "median_diff_where_nonzero" in accuracy:
-        print(f"    Median diff (where nonzero): {accuracy['median_diff_where_nonzero']}")
+        print(
+            f"    Median diff (where nonzero): {accuracy['median_diff_where_nonzero']}"
+        )
     print(f"    Pixels that differ: {accuracy['pct_pixels_differ']}%")
-    if accuracy['pct_pixels_differ'] > 50:
+    if accuracy["pct_pixels_differ"] > 50:
         print(f"    Note: High pixel difference is expected for nearest-neighbor")
-        print(f"    resampling — different grid alignment picks different source pixels.")
+        print(
+            f"    resampling — different grid alignment picks different source pixels."
+        )
 
 
 def main():
     import argparse
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--runs", type=int, default=5)
-    parser.add_argument("--cold-cache", action="store_true",
-                        help="Purge OS page cache before each run (requires sudo)")
+    parser.add_argument(
+        "--cold-cache",
+        action="store_true",
+        help="Purge OS page cache before each run (requires sudo)",
+    )
     args = parser.parse_args()
 
     if args.cold_cache:
@@ -172,33 +216,56 @@ def main():
         print("Cold-cache mode: purging OS page cache before each run\n")
 
     for scenario in SCENARIOS:
-        print(f"\n{'='*60}")
+        print(f"\n{'=' * 60}")
         print(f"Scenario: {scenario['name']}")
-        print(f"{'='*60}")
+        print(f"{'=' * 60}")
 
         timings = {"rastera": [], "rasterio": []}
         memory = {"rastera": [], "rasterio": []}
 
         # First run: save arrays for accuracy comparison
-        with tempfile.NamedTemporaryFile(suffix=".npy", delete=False) as f_rastera, \
-             tempfile.NamedTemporaryFile(suffix=".npy", delete=False) as f_rasterio:
-
+        first_results = {}
+        with (
+            tempfile.NamedTemporaryFile(suffix=".npy", delete=False) as f_rastera,
+            tempfile.NamedTemporaryFile(suffix=".npy", delete=False) as f_rasterio,
+        ):
             for library in ["rastera", "rasterio"]:
                 save_path = f_rastera.name if library == "rastera" else f_rasterio.name
-                result = run_once(scenario, library, save_array=save_path,
-                                  cold_cache=args.cold_cache)
+                result = run_once(
+                    scenario, library, save_array=save_path, cold_cache=args.cold_cache
+                )
                 if "error" not in result:
+                    first_results[library] = result
                     timings[library].append(result["elapsed_s"])
                     memory[library].append(result.get("peak_rss_mb", 0))
-                    print(f"  {library} run 1: {result['elapsed_s']:.3f}s  "
-                          f"mem={result.get('peak_rss_mb', '?')}MB  shape={result['shape']}")
+                    print(
+                        f"  {library} run 1: {result['elapsed_s']:.3f}s  "
+                        f"mem={result.get('peak_rss_mb', '?')}MB  shape={result['shape']}"
+                    )
                 else:
                     print(f"  {library} run 1: FAILED")
+
+            # Result consistency check
+            if "rastera" in first_results and "rasterio" in first_results:
+                r, rio = first_results["rastera"], first_results["rasterio"]
+                print(f"\n  Result consistency:")
+                print(
+                    f"    mean:  rastera={r['mean']}  rasterio={rio['mean']}  "
+                    f"diff={abs(r['mean'] - rio['mean']):.4f}"
+                )
+                print(
+                    f"    dtype: rastera={r['dtype']}  rasterio={rio['dtype']}  "
+                    f"match={'yes' if r['dtype'] == rio['dtype'] else 'NO'}"
+                )
+                print(
+                    f"    shape: rastera={r['shape']}  rasterio={rio['shape']}  "
+                    f"match={'yes' if r['shape'] == rio['shape'] else 'NO'}"
+                )
 
             # Accuracy comparison
             try:
                 accuracy = compare_arrays(f_rastera.name, f_rasterio.name)
-                print(f"\n  Accuracy comparison:")
+                print("\n  Accuracy comparison:")
                 print_accuracy(accuracy)
             except Exception as e:
                 print(f"  Accuracy comparison failed: {e}")
@@ -210,8 +277,10 @@ def main():
                 if "error" not in result:
                     timings[library].append(result["elapsed_s"])
                     memory[library].append(result.get("peak_rss_mb", 0))
-                    print(f"  {library} run {run_idx}: {result['elapsed_s']:.3f}s  "
-                          f"mem={result.get('peak_rss_mb', '?')}MB")
+                    print(
+                        f"  {library} run {run_idx}: {result['elapsed_s']:.3f}s  "
+                        f"mem={result.get('peak_rss_mb', '?')}MB"
+                    )
                 else:
                     print(f"  {library} run {run_idx}: FAILED")
 
@@ -223,8 +292,10 @@ def main():
             if t:
                 med = median(t)
                 mem_med = median(m) if m else 0
-                print(f"    {library}: median={med:.3f}s  range=[{min(t):.3f}, {max(t):.3f}]  "
-                      f"mem={mem_med:.0f}MB (peak RSS)")
+                print(
+                    f"    {library}: median={med:.3f}s  range=[{min(t):.3f}, {max(t):.3f}]  "
+                    f"mem={mem_med:.0f}MB (peak RSS)"
+                )
             else:
                 print(f"    {library}: all runs failed")
 
@@ -232,7 +303,11 @@ def main():
             speedup = median(timings["rasterio"]) / median(timings["rastera"])
             print(f"    rastera speedup: {speedup:.2f}x")
         if memory["rastera"] and memory["rasterio"]:
-            mem_ratio = median(memory["rasterio"]) / median(memory["rastera"]) if median(memory["rastera"]) > 0 else 0
+            mem_ratio = (
+                median(memory["rasterio"]) / median(memory["rastera"])
+                if median(memory["rastera"]) > 0
+                else 0
+            )
             print(f"    memory ratio (rasterio/rastera): {mem_ratio:.2f}x")
 
 
