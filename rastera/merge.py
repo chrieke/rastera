@@ -32,7 +32,7 @@ async def merge_cogs(
     target_resolution: float | None = None,
     method: Literal["first", "last"] = "first",
     snap_to_grid: bool = False,
-    use_overviews: bool = True,
+    use_overviews: bool = False,
 ) -> Array:
     """
     Merge a bbox that may span multiple GeoTIFFs and return a single stitched array.
@@ -161,7 +161,7 @@ async def _merge_reprojected(
     target_crs: int | None,
     target_resolution: float | None,
     method: Literal["first", "last"] = "first",
-    use_overviews: bool = True,
+    use_overviews: bool = False,
 ) -> Array:
     """Path B: merge with reprojection — supports mixed-CRS inputs."""
     base = cogs[0]

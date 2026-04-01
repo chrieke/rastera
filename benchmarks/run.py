@@ -8,22 +8,31 @@ in-process caching (rastera TIFF header cache, GDAL VSI cache).
 
 Measures wall-clock time, peak RSS, output accuracy (pixel comparison),
 result consistency (mean, dtype, shape), and spatial alignment (transform,
-pixel size, bounds).  Scenarios 1 and 5 also benchmark snap_to_grid=True
-(native pixel-copy fast path) vs the default exact-bbox alignment.
+pixel size, bounds).
 
 Scenarios and expected accuracy
 -------------------------------
-1. Read: same CRS, native resolution — pixel-exact match (0% differ).
-2. Read: same CRS, 60 m downsample — ~97% differ.  rastera reads from
-   the 40 m COG overview (pre-averaged pixels); rasterio/GDAL WarpedVRT
-   reads full 10 m resolution.  Different source data, not a bug.
-3. Read: cross-CRS reproject to EPSG:4326 — ~2% differ.  Different
-   reprojection implementations (pyproj + numpy NN vs GDAL warp kernel).
-4. Read: large bbox at 120 m — ~97% differ.  Same overview explanation
-   as scenario 2 (rastera uses the 80 m overview).
-5. Merge: 2 adjacent UTM tiles, same CRS, 10 m — near-exact (<0.1%).
-6. Merge: cross-CRS (32632 + 32633), reproject to 4326 — ~98% differ.
-   Combination of overview use and different reprojection implementations.
+1.  Read: same CRS, native resolution, not snapped — pixel-exact match
+    (0% differ).  Transform differs from rasterio (sub-pixel origin shift).
+2.  Read: same CRS, native resolution, snapped — pixel-exact match.
+    Transform matches rasterio (grid-aligned origin).
+3.  Read: same CRS, 60 m, no overviews (default) — same pipeline as rasterio.
+4.  Read: same CRS, 60 m downsample via overviews — ~97% differ.  rastera
+    reads from the 40 m COG overview (pre-averaged pixels); rasterio/GDAL
+    WarpedVRT reads full 10 m resolution.  Different source data, not a bug.
+5.  Read: cross-CRS reproject to EPSG:4326 (default) — ~2% differ.
+    Different reprojection implementations (pyproj + numpy NN vs GDAL
+    warp kernel).
+6.  Read: cross-CRS reproject to EPSG:4326 via overviews — larger diff
+    expected due to overview source pixels + different reprojection.
+7.  Read: large bbox at 120 m — ~97% differ.  Same overview explanation
+    as scenario 4 (rastera uses the 80 m overview).
+8.  Merge: 2 adjacent UTM tiles, same CRS, 10 m, not snapped —
+    near-exact (<0.1%).  Transform differs (sub-pixel origin shift).
+9.  Merge: same as 8 but snapped — near-exact, transform matches.
+10. Merge: cross-CRS (32632 + 32633), reproject to 32633, 10 m.
+11. Merge: cross-CRS (32632 + 32633), reproject to 4326 — ~98% differ.
+    Combination of overview use and different reprojection implementations.
 """
 
 from __future__ import annotations
@@ -52,34 +61,51 @@ URI_32TQM = "s3://e84-earth-search-sentinel-data/sentinel-2-c1-l2a/32/T/QM/2025/
 SCENARIOS = [
     # --- Single-file reads ---
     {
-        "name": "Read: same CRS, native resolution (bbox subset)",
+        "name": "Read: same CRS, native resolution (bbox subset), not snapped - raster matches bbox exactly (default)",
         "mode": "read",
         "bbox": "255804.0,4626619.0,274330.0,4644625.0",
         "bbox_crs": 32633,
-        "compare_snap": True,
     },
     {
-        "name": "Read: same CRS, downsampled to 60m",
+        "name": "Read: same CRS, native resolution (bbox subset), snapped to raster grid (rastera)",
+        "mode": "read",
+        "bbox": "255804.0,4626619.0,274330.0,4644625.0",
+        "bbox_crs": 32633,
+        "snap_to_grid": True,
+    },
+    {
+        "name": "Read: same CRS, downsampled to 60m, no overviews (default)",
         "mode": "read",
         "bbox": "255804.0,4626619.0,274330.0,4644625.0",
         "bbox_crs": 32633,
         "target_resolution": 60.0,
     },
     {
-        "name": "Read: same CRS, 60m, no overviews",
+        "name": "Read: same CRS, downsampled to 60m via overviews (rastera)",
         "mode": "read",
         "bbox": "255804.0,4626619.0,274330.0,4644625.0",
         "bbox_crs": 32633,
         "target_resolution": 60.0,
-        "no_overviews": True,
+        "use_overviews": True,
     },
     {
-        "name": "Read: cross-CRS reproject to EPSG:4326, 0.001 deg",
+        "name": "Read: cross-CRS reproject to EPSG:4326, 0.001 deg, no overviews (default)",
         "mode": "read",
         "bbox": "255804.0,4626619.0,274330.0,4644625.0",
         "bbox_crs": 32633,
         "target_crs": 4326,
         "target_resolution": 0.001,
+        "reproject_bbox": True,
+    },
+    {
+        "name": "Read: cross-CRS reproject to EPSG:4326, 0.001 deg, via overviews (rastera)",
+        "mode": "read",
+        "bbox": "255804.0,4626619.0,274330.0,4644625.0",
+        "bbox_crs": 32633,
+        "target_crs": 4326,
+        "target_resolution": 0.001,
+        "reproject_bbox": True,
+        "use_overviews": True,
     },
     {
         "name": "Read: large bbox, overview resolution (120m)",
@@ -90,12 +116,19 @@ SCENARIOS = [
     },
     # --- Multi-file merges ---
     {
-        "name": "Merge: 2 tiles, same CRS, 10m resolution",
+        "name": "Merge: 2 tiles, same CRS, 10m resolution, not snapped - raster matches bbox exactly (default)",
         "mode": "merge",
         "bbox": "283838.0,4629464.7,326626.2,4648263.2",
         "bbox_crs": 32633,
         "target_resolution": 10.0,
-        "compare_snap": True,
+    },
+    {
+        "name": "Merge: 2 tiles, same CRS, 10m resolution, snapped to raster grid (rastera)",
+        "mode": "merge",
+        "bbox": "283838.0,4629464.7,326626.2,4648263.2",
+        "bbox_crs": 32633,
+        "target_resolution": 10.0,
+        "snap_to_grid": True,
     },
     {
         "name": "Merge: 2 tiles, cross-CRS (32632+32633), reproject to 32633, 10m",
@@ -147,6 +180,27 @@ def run_once(
     mode = scenario.get("mode", "read")
     uri = scenario.get("uri", URI)
     uri2 = scenario.get("uri2", URI_33TUG)
+
+    bbox_str = scenario["bbox"]
+    bbox_crs = scenario["bbox_crs"]
+
+    # rastera requires bbox_crs == target_crs; reproject the bbox upfront
+    if (
+        scenario.get("reproject_bbox")
+        and library == "rastera"
+        and "target_crs" in scenario
+    ):
+        from pyproj import Transformer as ProjTransformer
+
+        target_crs = scenario["target_crs"]
+        minx, miny, maxx, maxy = (float(x) for x in bbox_str.split(","))
+        t = ProjTransformer.from_crs(bbox_crs, target_crs, always_xy=True)
+        xs = [minx, maxx, minx, maxx]
+        ys = [miny, miny, maxy, maxy]
+        txs, tys = t.transform(xs, ys)
+        bbox_str = f"{min(txs)},{min(tys)},{max(txs)},{max(tys)}"
+        bbox_crs = target_crs
+
     cmd = [
         PYTHON,
         RUNNER,
@@ -157,9 +211,9 @@ def run_once(
         "--uri",
         uri,
         "--bbox",
-        scenario["bbox"],
+        bbox_str,
         "--bbox-crs",
-        str(scenario["bbox_crs"]),
+        str(bbox_crs),
     ]
     if mode == "merge":
         cmd += ["--uri2", uri2]
@@ -188,6 +242,7 @@ def run_once(
 
 def compare_arrays(path_a: str, path_b: str) -> dict:
     import rasterio
+
     with rasterio.open(path_a) as src:
         a_raw = src.read()
     with rasterio.open(path_b) as src:
@@ -248,9 +303,9 @@ def print_accuracy(accuracy: dict):
     )
     if pct_diff > 50:
         print(
-            "    ↳ Expected: different resampling pipelines (rastera uses COG "
-            "overviews + direct reprojection; rasterio/GDAL uses WarpedVRT "
-            "warp-then-downsample). Different source data and pixel selection."
+            "    ↳ Expected: different overview strategies (rastera reads "
+            "pre-built COG overviews; rasterio/GDAL downsamples from "
+            "full-resolution data). Different source pixels."
         )
 
 
@@ -345,7 +400,8 @@ def main():
         slug = slug.replace("(", "").replace(")", "")
         slug = "_".join(slug.split())
 
-        no_overviews = scenario.get("no_overviews", False)
+        no_overviews = not scenario.get("use_overviews", False)
+        snap_to_grid = scenario.get("snap_to_grid", False)
         timings = {"rastera": [], "rasterio": []}
         memory = {"rastera": [], "rasterio": []}
 
@@ -365,8 +421,12 @@ def main():
             for library in ["rastera", "rasterio"]:
                 save_path = saved_paths[library]
                 result = run_once(
-                    scenario, library, save_array=save_path,
-                    cold_cache=args.cold_cache, no_overviews=no_overviews,
+                    scenario,
+                    library,
+                    save_array=save_path,
+                    cold_cache=args.cold_cache,
+                    snap_to_grid=snap_to_grid,
+                    no_overviews=no_overviews,
                 )
                 if "error" not in result:
                     first_results[library] = result
@@ -407,7 +467,8 @@ def main():
             # Accuracy comparison
             try:
                 accuracy = compare_arrays(
-                    saved_paths["rastera"], saved_paths["rasterio"],
+                    saved_paths["rastera"],
+                    saved_paths["rasterio"],
                 )
                 print("\n  Accuracy comparison:")
                 print_accuracy(accuracy)
@@ -428,8 +489,13 @@ def main():
         # Remaining runs for timing
         for run_idx in range(2, args.runs + 1):
             for library in ["rastera", "rasterio"]:
-                result = run_once(scenario, library, cold_cache=args.cold_cache,
-                                  no_overviews=no_overviews)
+                result = run_once(
+                    scenario,
+                    library,
+                    cold_cache=args.cold_cache,
+                    snap_to_grid=snap_to_grid,
+                    no_overviews=no_overviews,
+                )
                 if "error" not in result:
                     timings[library].append(result["elapsed_s"])
                     memory[library].append(result.get("peak_rss_mb", 0))
@@ -466,33 +532,6 @@ def main():
                 else 0
             )
             print(f"    memory ratio (rasterio/rastera): {mem_ratio:.2f}x")
-
-        # snap_to_grid comparison: measure overhead of exact bbox (default)
-        # vs snapped grid (fast native path)
-        if scenario.get("compare_snap") and timings["rastera"]:
-            snap_timings = []
-            for run_idx in range(1, args.runs + 1):
-                result = run_once(
-                    scenario,
-                    "rastera",
-                    cold_cache=args.cold_cache,
-                    snap_to_grid=True,
-                )
-                if "error" not in result:
-                    snap_timings.append(result["elapsed_s"])
-                    print(
-                        f"  rastera (snapped) run {run_idx}: {result['elapsed_s']:.3f}s"
-                    )
-            if snap_timings:
-                snap_med = median(snap_timings)
-                exact_med = median(timings["rastera"])
-                overhead = (exact_med - snap_med) / snap_med * 100
-                print(
-                    f"\n  snap_to_grid overhead: "
-                    f"exact={exact_med:.3f}s  snapped={snap_med:.3f}s  "
-                    f"overhead={overhead:+.1f}%"
-                )
-
 
 
 if __name__ == "__main__":

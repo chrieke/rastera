@@ -63,6 +63,7 @@ def set_cache_size(n: int) -> None:
 @dataclass(frozen=True, slots=True)
 class _CrsNodata:
     """Stub standing in for ``_geotiff`` on constructed Array objects."""
+
     crs: CRS
     nodata: float | None
 
@@ -175,7 +176,9 @@ class AsyncGeoTIFF:
             local_path = _resolve_local_path(uri)
             if local_path is not None:
                 store = from_url(local_path.parent.as_uri(), **store_kwargs)
-                geotiff = await GeoTIFF.open(local_path.name, store=store, prefetch=prefetch)
+                geotiff = await GeoTIFF.open(
+                    local_path.name, store=store, prefetch=prefetch
+                )
             else:
                 if _is_s3_uri(uri):
                     store_kwargs.setdefault("skip_signature", True)
@@ -199,15 +202,15 @@ class AsyncGeoTIFF:
         target_crs: int | None = None,
         target_resolution: float | None = None,
         snap_to_grid: bool = False,
-        use_overviews: bool = True,
+        use_overviews: bool = False,
     ) -> Array:
         """Read image data, optionally reprojecting and resampling.
 
         Args:
-            bbox: (minx, miny, maxx, maxy). In bbox_crs if set, else
-                target_crs if set, else dataset CRS.
-            bbox_crs: EPSG code of the bbox coordinate system. When set, the
-                bbox is transformed to the appropriate CRS automatically.
+            bbox: (minx, miny, maxx, maxy). Must be in target_crs if set,
+                else dataset CRS.
+            bbox_crs: EPSG code of the bbox coordinate system. Must match
+                target_crs (or the dataset CRS when target_crs is not set).
             window: Pixel window (col_off, row_off, width, height). Can
                 combine with target_resolution for resampling but not with
                 target_crs.
@@ -242,113 +245,149 @@ class AsyncGeoTIFF:
         # directly from the source without an extra copy through resample_nearest.
         use_native = not needs_reproject and not needs_resample
 
-        if bbox is not None and bbox_crs is not None and use_native:
-            bbox = transform_bbox(ensure_bbox(bbox), bbox_crs, self._crs_epsg)
+        if bbox is not None and use_native:
+            if bbox_crs != self._crs_epsg:
+                raise ValueError(
+                    f"bbox_crs ({bbox_crs}) does not match target CRS ({self._crs_epsg}). "
+                    f"Please provide bbox in the target CRS."
+                )
+            bbox = ensure_bbox(bbox)
 
         if use_native:
             return await self._read_native(
-                bbox=bbox, window=window, band_indices=band_indices,
+                bbox=bbox,
+                window=window,
+                band_indices=band_indices,
+                snap_to_grid=snap_to_grid,
             )
 
-        # Pick the best overview for the target resolution.
-        # For same-CRS reads, target_resolution is already in source units.
-        # For cross-CRS, defer until we have both bboxes so we can convert.
-        overview = None
-        if needs_resample and not needs_reproject:
-            overview = self._best_overview_for_resolution(target_resolution) if use_overviews else None
-
-        # Window + resample: read native pixels for the window, then resample
-        if window is not None and needs_resample:
-            native = await self._read_native(
-                window=window, band_indices=band_indices, overview=overview,
+        # Window + resample (window + reproject is rejected above)
+        if window is not None:
+            return await self._read_window_resampled(
+                window=window,
+                band_indices=band_indices,
+                target_resolution=target_resolution,
+                use_overviews=use_overviews,
             )
-            target_bbox = BBox(*native.bounds)
-            res = target_resolution
-            out_transform, out_w, out_h = _grid_for_bbox(target_bbox, res)
-            out_data = resample_nearest(
-                native.data,
-                src_transform=native.transform,
-                dst_transform=out_transform,
-                dst_width=out_w,
-                dst_height=out_h,
-                nodata=self._nodata,
-            )
-            return _make_output_array(out_data, out_transform, out_w, out_h, gt)
 
-        # Target bbox in target CRS (or source CRS if no reprojection)
+        return await self._read_resampled(
+            bbox=ensure_bbox(bbox) if bbox is not None else None,
+            bbox_crs=bbox_crs,
+            band_indices=band_indices,
+            target_crs=target_crs,
+            target_resolution=target_resolution,
+            needs_reproject=needs_reproject,
+            needs_resample=needs_resample,
+            use_overviews=use_overviews,
+        )
+
+    async def _read_window_resampled(
+        self,
+        window: Window,
+        band_indices: Sequence[int] | None,
+        target_resolution: float,
+        use_overviews: bool,
+    ) -> Array:
+        """Read a pixel window and resample to *target_resolution*."""
+        overview = (
+            self._best_overview_for_resolution(target_resolution)
+            if use_overviews
+            else None
+        )
+        native = await self._read_native(
+            window=window,
+            band_indices=band_indices,
+            overview=overview,
+        )
+        target_bbox = BBox(*native.bounds)
+        out_transform, out_w, out_h = _grid_for_bbox(target_bbox, target_resolution)
+        out_data = resample_nearest(
+            native.data,
+            src_transform=native.transform,
+            dst_transform=out_transform,
+            dst_width=out_w,
+            dst_height=out_h,
+            nodata=self._nodata,
+        )
+        return _make_output_array(out_data, out_transform, out_w, out_h, self._geotiff)
+
+    async def _read_resampled(
+        self,
+        bbox: BBox | None,
+        bbox_crs: int | None,
+        band_indices: Sequence[int] | None,
+        target_crs: int | None,
+        target_resolution: float | None,
+        needs_reproject: bool,
+        needs_resample: bool,
+        use_overviews: bool,
+    ) -> Array:
+        """Read with reprojection and/or resampling."""
+        gt = self._geotiff
         src_crs = self._crs_epsg
         out_crs = target_crs or src_crs
 
         if bbox is not None:
-            target_bbox = ensure_bbox(bbox)
-            # Transform bbox from bbox_crs into the output CRS
+            target_bbox = bbox
             if bbox_crs is not None and bbox_crs != out_crs:
-                target_bbox = transform_bbox(target_bbox, bbox_crs, out_crs)
+                raise ValueError(
+                    f"bbox_crs ({bbox_crs}) does not match target CRS ({out_crs}). "
+                    f"Please provide bbox in the target CRS."
+                )
+        elif needs_reproject:
+            target_bbox = transform_bbox(BBox(*gt.bounds), src_crs, out_crs)
         else:
-            target_bbox = None
+            target_bbox = BBox(*gt.bounds)
 
-        # Transform bbox to source CRS for tile fetching
-        if target_bbox is None:
-            if needs_reproject:
-                target_bbox = transform_bbox(BBox(*gt.bounds), src_crs, out_crs)
-            else:
-                target_bbox = BBox(*gt.bounds)
-
-        if needs_reproject:
-            src_bbox = transform_bbox(target_bbox, out_crs, src_crs)
-        else:
-            src_bbox = target_bbox
-
-        # Cross-CRS overview selection: convert target resolution to source CRS
-        # units using the bbox width ratio (e.g. 0.001° → ~83m)
-        if needs_resample and needs_reproject and use_overviews:
-            src_equiv_res = target_resolution * (src_bbox.width / target_bbox.width)
-            overview = self._best_overview_for_resolution(src_equiv_res)
-
-        # Read from best overview (or full res if no suitable overview)
-        native = await self._read_native(
-            bbox=src_bbox, band_indices=band_indices, overview=overview,
+        src_bbox = (
+            transform_bbox(target_bbox, out_crs, src_crs)
+            if needs_reproject
+            else target_bbox
         )
 
-        # Build target grid
+        # Pick the best overview for the target resolution.
+        # For cross-CRS reads, convert target resolution to source CRS units
+        # using the bbox width ratio (e.g. 0.001° → ~83m).
+        overview = None
+        if needs_resample and use_overviews:
+            src_res = target_resolution
+            if needs_reproject:
+                src_res = target_resolution * (src_bbox.width / target_bbox.width)
+            overview = self._best_overview_for_resolution(src_res)
+
+        # Determine output resolution
         if target_resolution is not None:
             res = target_resolution
         elif needs_reproject:
-            # Derive a resolution in the target CRS that preserves the native
-            # pixel density: use the native pixel count across the source bbox.
+            # Preserve native pixel density across the CRS change.
             native_res = gt.res[0]
-            src_bbox_width = src_bbox.width
-            src_bbox_height = src_bbox.height
-            n_cols = max(1, round(src_bbox_width / native_res))
-            n_rows = max(1, round(src_bbox_height / native_res))
-            res_x = target_bbox.width / n_cols
-            res_y = target_bbox.height / n_rows
-            res = min(res_x, res_y)
+            n_cols = max(1, round(src_bbox.width / native_res))
+            n_rows = max(1, round(src_bbox.height / native_res))
+            res = min(target_bbox.width / n_cols, target_bbox.height / n_rows)
         else:
             res = gt.res[0]
 
-        if not needs_reproject and not needs_resample:
-            # Same CRS + resolution, snap_to_grid=False.
-            # GDAL's GDALRasterIOEx accepts fractional pixel windows and
-            # maps output pixels via:
-            #   src = floor(frac_offset + (dst + 0.5) * frac_span / buf_size)
-            # The ratio frac_span/buf_size differs from 1.0 by ~1e-4,
-            # which matters at half-pixel bbox boundaries.  We encode the
-            # same ratio in the resampling transform so resample_nearest
-            # reproduces GDAL's pixel selection.  The output Array gets
-            # the nominal pixel size (matching rasterio's window_transform).
-            out_w = max(1, round(target_bbox.width / res))
-            out_h = max(1, round(target_bbox.height / res))
-            resample_transform = Affine(
-                target_bbox.width / out_w, 0, target_bbox.minx,
-                0, -(target_bbox.height / out_h), target_bbox.maxy,
-            )
-            out_transform = Affine(res, 0, target_bbox.minx, 0, -res, target_bbox.maxy)
-        else:
-            out_transform, out_w, out_h = _grid_for_bbox(target_bbox, res)
-            resample_transform = out_transform
+        out_transform, out_w, out_h = _grid_for_bbox(target_bbox, res)
 
-        # Reproject/resample
+        # ceil() in _grid_for_bbox may extend the output grid beyond
+        # target_bbox.  Expand the source read bbox to cover the full
+        # output extent so the resampler has source data for every
+        # destination pixel (avoids nodata/black edges).
+        read_bbox = BBox(
+            target_bbox.minx,
+            target_bbox.maxy - out_h * res,
+            target_bbox.minx + out_w * res,
+            target_bbox.maxy,
+        )
+        if needs_reproject:
+            read_bbox = transform_bbox(read_bbox, out_crs, src_crs)
+
+        native = await self._read_native(
+            bbox=read_bbox,
+            band_indices=band_indices,
+            overview=overview,
+        )
+
         transformer = None
         if needs_reproject:
             transformer = Transformer.from_crs(out_crs, src_crs, always_xy=True)
@@ -356,15 +395,16 @@ class AsyncGeoTIFF:
         out_data = resample_nearest(
             native.data,
             src_transform=native.transform,
-            dst_transform=resample_transform,
+            dst_transform=out_transform,
             dst_width=out_w,
             dst_height=out_h,
             nodata=self._nodata,
             transformer=transformer,
         )
 
-        # Use a CRS stub when reprojecting so Array.crs returns the output CRS
-        geotiff_ref = _CrsNodata(CRS.from_epsg(out_crs), self._nodata) if needs_reproject else gt
+        geotiff_ref = (
+            _CrsNodata(CRS.from_epsg(out_crs), self._nodata) if needs_reproject else gt
+        )
         return _make_output_array(out_data, out_transform, out_w, out_h, geotiff_ref)
 
     async def _read_native(
@@ -373,6 +413,7 @@ class AsyncGeoTIFF:
         window: Window | None = None,
         band_indices: Sequence[int] | None = None,
         overview: Any | None = None,
+        snap_to_grid: bool = True,
     ) -> Array:
         """Read at native resolution/CRS, optionally from an overview."""
         # Determine which readable to use (full-res GeoTIFF or an Overview)
@@ -391,7 +432,20 @@ class AsyncGeoTIFF:
 
         # Select requested bands
         if band_indices is not None:
-            result = dc_replace(result, data=result.data[band_indices], count=len(band_indices))
+            result = dc_replace(
+                result, data=result.data[band_indices], count=len(band_indices)
+            )
+
+        # When reading by bbox, override the transform origin to match the
+        # exact requested bbox (not the pixel-snapped window origin).  This
+        # mirrors rasterio's fractional-window behaviour.
+        if bbox is not None and not snap_to_grid:
+            bbox = ensure_bbox(bbox)
+            res = readable.res[0]
+            result = dc_replace(
+                result,
+                transform=Affine(res, 0, bbox.minx, 0, -res, bbox.maxy),
+            )
 
         return result
 
