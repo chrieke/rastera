@@ -4,8 +4,6 @@ from unittest.mock import MagicMock
 import numpy as np
 from affine import Affine
 
-from rastera.geo import BBox
-
 
 def make_meta(width=100, height=100, scale=10.0):
     """Duck-typed object with transform/width/height for window_from_bbox etc."""
@@ -14,9 +12,15 @@ def make_meta(width=100, height=100, scale=10.0):
 
 
 def make_mock_geotiff(
-    width=100, height=100, scale=10.0, count=3,
-    tile_width=256, tile_height=256, dtype=np.dtype("u2"),
-    nodata=None, crs_epsg=32632,
+    width=100,
+    height=100,
+    scale=10.0,
+    count=3,
+    tile_width=256,
+    tile_height=256,
+    dtype=np.dtype("u2"),
+    nodata=None,
+    crs_epsg=32632,
 ):
     """Build a mock async_geotiff.GeoTIFF."""
     gt = MagicMock()

@@ -9,7 +9,6 @@ from affine import Affine
 from async_geotiff import RasterArray
 from pyproj import CRS, Transformer
 
-from .reader import AsyncGeoTIFF, _CrsNodata, _grid_for_bbox, _make_output_array
 from .geo import (
     BBox,
     _affine_apply,
@@ -20,6 +19,7 @@ from .geo import (
     resample_nearest,
     transform_bbox,
 )
+from .reader import AsyncGeoTIFF, _CrsNodata, _grid_for_bbox, _make_output_array
 
 
 async def merge_cogs(
@@ -81,17 +81,13 @@ async def merge_cogs(
     n_out_bands = len(normalize_band_indices(band_indices, base_gt.count))
 
     # Decide whether we need the reprojected merge path.
-    all_same_crs = all(
-        cog._crs_epsg == base._crs_epsg for cog in cogs[1:]
-    )
+    all_same_crs = all(cog._crs_epsg == base._crs_epsg for cog in cogs[1:])
     all_same_res = all(
         math.isclose(float(cog._geotiff.transform.a), float(base_gt.transform.a))
         for cog in cogs[1:]
     )
     crs_matches_target = target_crs == base._crs_epsg
-    res_matches_target = math.isclose(
-        target_resolution, base_gt.res[0], rel_tol=1e-6
-    )
+    res_matches_target = math.isclose(target_resolution, base_gt.res[0], rel_tol=1e-6)
 
     needs_reproject = (
         not all_same_crs
@@ -123,6 +119,7 @@ async def merge_cogs(
     _require_compatible_merge_inputs(cogs)
 
     native_crs = base._crs_epsg
+    assert native_crs is not None
     native_bbox = transform_bbox(bbox, bbox_crs, native_crs)
 
     if snap_to_grid:
@@ -132,7 +129,8 @@ async def merge_cogs(
         )
     else:
         window_transform, win_width, win_height = _grid_for_bbox(
-            native_bbox, target_resolution,
+            native_bbox,
+            target_resolution,
         )
 
     # Get sub bboxes specific to the contributing image
@@ -142,12 +140,11 @@ async def merge_cogs(
         if sub_bbox is not None:
             sub_bboxes.append((cog, sub_bbox))
 
-    async def _read_native_bands(
-        cog: AsyncGeoTIFF, sb: BBox
-    ) -> RasterArray:
+    async def _read_native_bands(cog: AsyncGeoTIFF, sb: BBox) -> RasterArray:
         indices = normalize_band_indices(band_indices, cog._geotiff.count)
         return await cog._read_native(bbox=sb, band_indices=indices)
 
+    assert base_gt.dtype is not None
     out_data = await _gather_and_paste(
         contributing=sub_bboxes,
         dst_transform=window_transform,
@@ -160,7 +157,9 @@ async def merge_cogs(
         read_fn=_read_native_bands,
         method=method,
     )
-    return _make_output_array(out_data, window_transform, win_width, win_height, base_gt)
+    return _make_output_array(
+        out_data, window_transform, win_width, win_height, base_gt
+    )
 
 
 async def _merge_reprojected(
@@ -188,9 +187,10 @@ async def _merge_reprojected(
     # Build output grid
     out_transform, out_w, out_h = _grid_for_bbox(target_bbox, res)
 
-    # Find contributing COGs by intersecting their bounds (in target CRS) with output bbox
+    # Find contributing COGs by intersecting bounds (in target CRS) with output bbox
     contributing: list[tuple[AsyncGeoTIFF, BBox]] = []
     for cog in cogs:
+        assert cog._crs_epsg is not None
         cog_bounds_in_target = transform_bbox(
             BBox(*cog._geotiff.bounds), cog._crs_epsg, out_crs
         )
@@ -198,15 +198,15 @@ async def _merge_reprojected(
         if sub_bbox is not None:
             contributing.append((cog, sub_bbox))
 
-    async def _read_and_reproject(
-        cog: AsyncGeoTIFF, sb: BBox
-    ) -> RasterArray:
+    async def _read_and_reproject(cog: AsyncGeoTIFF, sb: BBox) -> RasterArray:
         # Compute an output-aligned sub-grid for this COG's contribution.
         subgrid = _output_subgrid(out_transform, out_w, out_h, sb)
         if subgrid is None:
             return _make_output_array(
                 np.full((n_out_bands, 0, 0), 0, dtype=base_gt.dtype),
-                out_transform, 0, 0,
+                out_transform,
+                0,
+                0,
                 _CrsNodata(CRS.from_epsg(out_crs), cog._nodata),
             )
         sub_transform, sub_w, sub_h = subgrid
@@ -215,6 +215,7 @@ async def _merge_reprojected(
         # larger than sb due to integer pixel rounding).
         read_bbox = bounds_from_transform(sub_transform, sub_w, sub_h)
 
+        assert cog._crs_epsg is not None
         needs_reproject = cog._crs_epsg != out_crs
         if needs_reproject:
             read_bbox = transform_bbox(read_bbox, out_crs, cog._crs_epsg)
@@ -234,6 +235,7 @@ async def _merge_reprojected(
         if use_overviews:
             src_res = res
             if needs_reproject:
+                assert cog._crs_epsg is not None
                 cog_bounds_target = transform_bbox(
                     BBox(*cog._geotiff.bounds), cog._crs_epsg, out_crs
                 )
@@ -243,7 +245,9 @@ async def _merge_reprojected(
 
         indices = normalize_band_indices(band_indices, cog._geotiff.count)
         native = await cog._read_native(
-            bbox=read_bbox, band_indices=indices, overview=overview,
+            bbox=read_bbox,
+            band_indices=indices,
+            overview=overview,
         )
 
         transformer = None
@@ -263,6 +267,7 @@ async def _merge_reprojected(
         geotiff_ref = _CrsNodata(CRS.from_epsg(out_crs), cog._nodata)
         return _make_output_array(out_data, sub_transform, sub_w, sub_h, geotiff_ref)
 
+    assert base_gt.dtype is not None
     out_data = await _gather_and_paste(
         contributing=contributing,
         dst_transform=out_transform,
@@ -315,9 +320,7 @@ async def _gather_and_paste(
         return out_array
 
     filled = (
-        np.zeros((dst_height, dst_width), dtype=bool)
-        if method == "first"
-        else None
+        np.zeros((dst_height, dst_width), dtype=bool) if method == "first" else None
     )
 
     for cog, sub_bbox in contributing:
@@ -344,6 +347,7 @@ async def _gather_and_paste(
             src_valid = None
 
         if method == "first":
+            assert filled is not None
             unfilled = ~filled[dst_rows, dst_cols]
             if src_valid is not None:
                 paste_mask = unfilled & src_valid
@@ -388,8 +392,12 @@ def _output_subgrid(
 
     res = out_transform.a
     sub_transform = Affine(
-        res, 0, out_transform.c + col_min * res,
-        0, -res, out_transform.f - row_min * res,
+        res,
+        0,
+        out_transform.c + col_min * res,
+        0,
+        -res,
+        out_transform.f - row_min * res,
     )
     return sub_transform, sub_w, sub_h
 
@@ -468,5 +476,6 @@ def _require_compatible_merge_inputs(cogs: Sequence[AsyncGeoTIFF]) -> None:
             off_y, round(off_y), abs_tol=1e-6
         ):
             raise ValueError(
-                "All GeoTIFFs must be aligned to the same pixel grid (origins differ by whole pixels)"
+                "All GeoTIFFs must be aligned to the same pixel grid "
+                "(origins differ by whole pixels)"
             )

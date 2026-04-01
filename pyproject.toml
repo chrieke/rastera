@@ -25,5 +25,42 @@ markers = [
     "live: tests that hit real remote services (deselected by default)",
 ]
 
+[dependency-groups]
+dev = [
+    "ruff==0.8.5",
+    "pyright>=1.1.408,<2.0.0",
+    "pytest>=8.0.0",
+    "pytest-asyncio>=1.0.0",
+]
+
+[tool.ruff]
+src = ["rastera"]
+line-length = 88
+fix = true
+
+[tool.ruff.lint]
+extend-select = [
+    "I",    # isort
+    "E501", # line length
+    "UP",   # pyupgrade
+]
+ignore = []
+
+[tool.ruff.lint.per-file-ignores]
+"benchmarks/**/*.py" = ["E501"]
+"tests/**/*.py" = ["E501"]
+"examples/**/*.py" = ["E501"]
+"notebooks/**/*.ipynb" = ["E501", "F821"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["rastera"]
+
+[tool.pyright]
+include = ["rastera", "tests"]
+pythonVersion = "3.11"
+strictListInference = true
+strictSetInference = true
+strictDictionaryInference = true
+
 [tool.setuptools]
 packages = ["rastera"]

@@ -6,15 +6,16 @@ import os
 import re
 from collections import OrderedDict
 from collections.abc import Sequence
-from dataclasses import dataclass, replace as dc_replace
+from dataclasses import dataclass
+from dataclasses import replace as dc_replace
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
 import numpy as np
 from affine import Affine
-from async_geotiff import RasterArray, GeoTIFF, Window
-from async_tiff.store import from_url
+from async_geotiff import GeoTIFF, RasterArray, Window
+from async_tiff.store import from_url  # type: ignore[import-untyped]
 from pyproj import CRS, Transformer
 
 from .geo import (
@@ -48,7 +49,11 @@ class AsyncGeoTIFF:
         self.uri = uri
         self._geotiff = geotiff
         self._crs_epsg: int | None = geotiff.crs.to_epsg()
-        self._nodata: int | float | None = _coerce_nodata(geotiff.nodata, geotiff.dtype)
+        self._nodata: int | float | None = (
+            _coerce_nodata(geotiff.nodata, geotiff.dtype)
+            if geotiff.dtype is not None
+            else geotiff.nodata
+        )
 
         self.overviews: list[tuple[int, int]] = [
             (o.width, o.height) for o in geotiff.overviews
@@ -80,10 +85,12 @@ class AsyncGeoTIFF:
         Supports s3://, https://, gs://, az://, and local file paths.
 
         Args:
-            uri: Any URI supported by object_store (s3://, https://, gs://, file://, etc.).
-            store: Optional pre-constructed store. When provided, the key is
-                extracted from the URI and used as the path within the store. If no store is
-                provided, it is auto-constructed from the URI via ``async_tiff.store.from_url``.
+            uri: Any URI supported by object_store
+                (s3://, https://, gs://, file://, etc.).
+            store: Optional pre-constructed store. When provided,
+                the key is extracted from the URI and used as the
+                path within the store. If no store is provided, it
+                is auto-constructed via ``async_tiff.store.from_url``.
             prefetch: Number of bytes to prefetch when opening the TIFF.
             cache: When True, cache the parsed GeoTIFF object in memory so that
                 subsequent opens of the same URI skip the header fetch.
@@ -180,7 +187,8 @@ class AsyncGeoTIFF:
         if bbox is not None and use_native:
             if bbox_crs != self._crs_epsg:
                 raise ValueError(
-                    f"bbox_crs ({bbox_crs}) does not match target CRS ({self._crs_epsg}). "
+                    f"bbox_crs ({bbox_crs}) does not match "
+                    f"target CRS ({self._crs_epsg}). "
                     f"Please provide bbox in the target CRS."
                 )
             bbox = ensure_bbox(bbox)
@@ -195,6 +203,7 @@ class AsyncGeoTIFF:
 
         # Window + resample (window + reproject is rejected above)
         if window is not None:
+            assert target_resolution is not None
             return await self._read_window_resampled(
                 window=window,
                 band_indices=band_indices,
@@ -232,7 +241,9 @@ class AsyncGeoTIFF:
             overview=overview,
         )
         target_bbox = BBox(*native.bounds)
-        out_transform, out_w, out_h = _grid_for_bbox(target_bbox, target_resolution, use_ceil=True)
+        out_transform, out_w, out_h = _grid_for_bbox(
+            target_bbox, target_resolution, use_ceil=True
+        )
         out_data = resample_nearest(
             native.data,
             src_transform=native.transform,
@@ -257,6 +268,7 @@ class AsyncGeoTIFF:
         """Read with reprojection and/or resampling."""
         gt = self._geotiff
         src_crs = self._crs_epsg
+        assert src_crs is not None
         out_crs = target_crs or src_crs
 
         if bbox is not None:
@@ -282,6 +294,7 @@ class AsyncGeoTIFF:
         # using the bbox width ratio (e.g. 0.001° → ~83m).
         overview = None
         if needs_resample and use_overviews:
+            assert target_resolution is not None
             src_res = target_resolution
             if needs_reproject:
                 src_res = target_resolution * (src_bbox.width / target_bbox.width)
@@ -362,6 +375,7 @@ class AsyncGeoTIFF:
         if bbox is None and window is None:
             bbox = BBox(*readable.bounds)
         if window is None:
+            assert bbox is not None
             window = window_from_bbox(readable, bbox)
 
         # Use async-geotiff's built-in read (handles tile fetching + stitching)
@@ -417,10 +431,14 @@ async def open_many(
                 f"do not: {mismatched}"
             )
         store = _build_store(uris[0], **store_kwargs)
-    return list(await asyncio.gather(
-        *(AsyncGeoTIFF.open(u, store=store, prefetch=prefetch, cache=cache)
-          for u in uris)
-    ))
+    return list(
+        await asyncio.gather(
+            *(
+                AsyncGeoTIFF.open(u, store=store, prefetch=prefetch, cache=cache)
+                for u in uris
+            )
+        )
+    )
 
 
 # ---- Public cache API ----
@@ -442,7 +460,7 @@ def clear_cache() -> None:
 
 
 def set_cache_size(n: int) -> None:
-    """Set the maximum number of cached GeoTIFF objects (LRU eviction). 0 disables caching."""
+    """Set max number of cached GeoTIFF objects (LRU eviction). 0 disables."""
     global _cache_max_size
     _cache_max_size = n
     while len(_geotiff_cache) > _cache_max_size:

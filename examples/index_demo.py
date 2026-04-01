@@ -30,41 +30,52 @@ N_QUERIES = 5
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def search_stac(bbox: list, limit: int = 100) -> list[str]:
     """Search Element84 Earth Search STAC for Sentinel-2 B04 COG URIs."""
     url = "https://earth-search.aws.element84.com/v1/search"
-    body = json.dumps({
-        "collections": ["sentinel-2-l2a"],
-        "limit": limit,
-        "bbox": bbox,
-        "datetime": "2024-06-01T00:00:00Z/2024-06-30T23:59:59Z",
-        "fields": {"includes": ["assets.red.href"]},
-    }).encode()
-    req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
+    body = json.dumps(
+        {
+            "collections": ["sentinel-2-l2a"],
+            "limit": limit,
+            "bbox": bbox,
+            "datetime": "2024-06-01T00:00:00Z/2024-06-30T23:59:59Z",
+            "fields": {"includes": ["assets.red.href"]},
+        }
+    ).encode()
+    req = urllib.request.Request(
+        url, data=body, headers={"Content-Type": "application/json"}
+    )
     resp = json.loads(urllib.request.urlopen(req).read())
 
     uris = []
     for feat in resp.get("features", []):
         href = feat.get("assets", {}).get("red", {}).get("href", "")
         if href:
-            uris.append(href.replace(
-                "https://sentinel-cogs.s3.us-west-2.amazonaws.com/",
-                "s3://sentinel-cogs/",
-            ))
+            uris.append(
+                href.replace(
+                    "https://sentinel-cogs.s3.us-west-2.amazonaws.com/",
+                    "s3://sentinel-cogs/",
+                )
+            )
     return uris
 
 
 def timed(label: str):
     """Context manager that prints elapsed time."""
+
     class Timer:
         def __init__(self):
             self.elapsed = 0.0
+
         def __enter__(self):
             self._t0 = time.perf_counter()
             return self
+
         def __exit__(self, *_):
             self.elapsed = time.perf_counter() - self._t0
             print(f"  {label}: {self.elapsed:.2f}s", flush=True)
+
     return Timer()
 
 
@@ -72,13 +83,14 @@ def timed(label: str):
 # Commands
 # ---------------------------------------------------------------------------
 
+
 async def cmd_build():
     """Build a geoparquet index from a STAC search."""
     print("Searching STAC...", flush=True)
     uris = search_stac(bbox=STAC_BBOX, limit=STAC_LIMIT)
     print(f"Found {len(uris)} COGs\n", flush=True)
 
-    with timed(f"Built index for {len(uris)} files") as t:
+    with timed(f"Built index for {len(uris)} files"):
         gdf = await rastera.build_index(uris, concurrency=50, **S3_OPTS)
 
     gdf.to_parquet(INDEX_PATH, compression="zstd")
@@ -123,7 +135,9 @@ async def cmd_query():
         rastera.clear_cache()
         t0 = time.perf_counter()
         sources = await rastera.open_from_index(gdf, bbox=qbbox, **S3_OPTS)
-        result = await rastera.merge(sources, bbox=qbbox, bbox_crs=4326, target_crs=4326, target_resolution=10)
+        result = await rastera.merge(
+            sources, bbox=qbbox, bbox_crs=4326, target_crs=4326, target_resolution=10
+        )
         dt = time.perf_counter() - t0
         t_total_idx += dt
         print(f"  [{i+1}] {len(sources)} files  {result.shape}  {dt:.2f}s", flush=True)
@@ -135,14 +149,20 @@ async def cmd_query():
         t0 = time.perf_counter()
         matched_uris = gdf[gdf.intersects(box(*qbbox))]["uri"].tolist()
         sources = await rastera.open(matched_uris, **S3_OPTS)
-        result = await rastera.merge(sources, bbox=qbbox, bbox_crs=4326, target_crs=4326, target_resolution=10)
+        result = await rastera.merge(
+            sources, bbox=qbbox, bbox_crs=4326, target_crs=4326, target_resolution=10
+        )
         dt = time.perf_counter() - t0
         t_total_net += dt
         print(f"  [{i+1}] {len(sources)} files  {result.shape}  {dt:.2f}s", flush=True)
 
-    print(f"\n--- Results ---", flush=True)
-    print(f"  Index:   {t_total_idx:.2f}s  ({t_total_idx/N_QUERIES:.2f}s avg)", flush=True)
-    print(f"  Network: {t_total_net:.2f}s  ({t_total_net/N_QUERIES:.2f}s avg)", flush=True)
+    print("\n--- Results ---", flush=True)
+    print(
+        f"  Index:   {t_total_idx:.2f}s  ({t_total_idx/N_QUERIES:.2f}s avg)", flush=True
+    )
+    print(
+        f"  Network: {t_total_net:.2f}s  ({t_total_net/N_QUERIES:.2f}s avg)", flush=True
+    )
     print(f"  Speedup: {t_total_net / t_total_idx:.1f}x\n", flush=True)
 
 

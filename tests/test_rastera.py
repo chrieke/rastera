@@ -8,11 +8,13 @@ from affine import Affine
 from async_geotiff import RasterArray, Window
 
 import rastera
-from rastera.reader import AsyncGeoTIFF, _extract_key, _geotiff_cache, set_cache_size, clear_cache
-
-from rastera.geo import BBox
+from rastera.reader import (
+    AsyncGeoTIFF,
+    _geotiff_cache,
+    clear_cache,
+    set_cache_size,
+)
 from tests.conftest import make_mock_geotiff
-
 
 # ── Helpers ──────────────────────────────────────────────────────────────
 
@@ -87,9 +89,7 @@ class TestOpen:
         mock_from_url.return_value = mock_store
         mock_geotiff_cls.open = AsyncMock(return_value=gt)
 
-        obj = await AsyncGeoTIFF.open(
-            "s3://bucket/key.tif", skip_signature=True
-        )
+        obj = await AsyncGeoTIFF.open("s3://bucket/key.tif", skip_signature=True)
 
         mock_from_url.assert_called_once_with(
             "s3://bucket/key.tif", skip_signature=True, region="us-west-2"
@@ -121,10 +121,12 @@ class TestOpen:
     async def test_open_multi_uri_cross_bucket_raises(self):
         """Passing URIs from different buckets without an explicit store should raise."""
         with pytest.raises(ValueError, match="same bucket/host"):
-            await rastera.open([
-                "s3://bucket-a/file1.tif",
-                "s3://bucket-b/file2.tif",
-            ])
+            await rastera.open(
+                [
+                    "s3://bucket-a/file1.tif",
+                    "s3://bucket-b/file2.tif",
+                ]
+            )
 
 
 # ── read() ───────────────────────────────────────────────────────────────
@@ -136,12 +138,18 @@ class TestRead:
         gt = make_mock_geotiff()
         obj = AsyncGeoTIFF("s3://b/k.tif", gt)
         with pytest.raises(ValueError, match="Cannot specify both"):
-            await obj.read(bbox=(0, 0, 100, 100), bbox_crs=32632, window=Window(col_off=0, row_off=0, width=10, height=10))
+            await obj.read(
+                bbox=(0, 0, 100, 100),
+                bbox_crs=32632,
+                window=Window(col_off=0, row_off=0, width=10, height=10),
+            )
 
     @pytest.mark.asyncio
     async def test_read_full_image(self):
         """Read with no bbox/window should use full image bounds."""
-        gt = make_mock_geotiff(width=16, height=16, scale=1.0, count=1, tile_width=16, tile_height=16)
+        gt = make_mock_geotiff(
+            width=16, height=16, scale=1.0, count=1, tile_width=16, tile_height=16
+        )
         obj = AsyncGeoTIFF("s3://b/k.tif", gt)
 
         result = _make_read_result((1, 16, 16), dtype=np.uint16, geotiff=gt)
@@ -156,7 +164,9 @@ class TestRead:
 
     @pytest.mark.asyncio
     async def test_read_with_window(self):
-        gt = make_mock_geotiff(width=32, height=32, scale=1.0, count=2, tile_width=32, tile_height=32)
+        gt = make_mock_geotiff(
+            width=32, height=32, scale=1.0, count=2, tile_width=32, tile_height=32
+        )
         obj = AsyncGeoTIFF("s3://b/k.tif", gt)
 
         result = _make_read_result((2, 16, 16), dtype=np.uint16, fill=42, geotiff=gt)
@@ -169,14 +179,21 @@ class TestRead:
 
     @pytest.mark.asyncio
     async def test_read_band_indices(self):
-        gt = make_mock_geotiff(width=16, height=16, scale=1.0, count=3, tile_width=16, tile_height=16)
+        gt = make_mock_geotiff(
+            width=16, height=16, scale=1.0, count=3, tile_width=16, tile_height=16
+        )
         obj = AsyncGeoTIFF("s3://b/k.tif", gt)
 
         data = np.arange(3 * 16 * 16, dtype=np.uint16).reshape(3, 16, 16)
         result = RasterArray(
-            data=data, mask=None, width=16, height=16, count=3,
+            data=data,
+            mask=None,
+            width=16,
+            height=16,
+            count=3,
             transform=Affine(1, 0, 0, 0, -1, 16),
-            _alpha_band_idx=None, _geotiff=gt,
+            _alpha_band_idx=None,
+            _geotiff=gt,
         )
         gt.read = AsyncMock(return_value=result)
 
@@ -227,4 +244,6 @@ class TestLRUCache:
 
         assert "a" in _geotiff_cache, "A was accessed recently and should survive"
         assert "c" in _geotiff_cache, "C was just inserted and should survive"
-        assert "b" not in _geotiff_cache, "B was least-recently-used and should be evicted"
+        assert (
+            "b" not in _geotiff_cache
+        ), "B was least-recently-used and should be evicted"

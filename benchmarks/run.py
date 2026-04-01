@@ -19,7 +19,7 @@ import os
 import subprocess
 import sys
 import tempfile
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from statistics import median
 
@@ -225,7 +225,9 @@ def format_accuracy(accuracy: dict) -> list[str]:
     return lines
 
 
-def format_spatial_alignment(r: dict, rio: dict, snap_to_grid: bool = True) -> list[str]:
+def format_spatial_alignment(
+    r: dict, rio: dict, snap_to_grid: bool = True
+) -> list[str]:
     """Compare transforms (origin, pixel size, bounds) between two results."""
     lines = []
     t_r = r["transform"]  # [a, b, c, d, e, f]
@@ -277,7 +279,12 @@ def format_spatial_alignment(r: dict, rio: dict, snap_to_grid: bool = True) -> l
     return lines
 
 
-def _assess_result(scenario: dict, accuracy: dict | None, consistency: dict | None, border_check: dict | None = None) -> tuple[bool, str]:
+def _assess_result(
+    scenario: dict,
+    accuracy: dict | None,
+    consistency: dict | None,
+    border_check: dict | None = None,
+) -> tuple[bool, str]:
     """Determine overall pass/fail against the scenario's ``expect`` spec.
 
     Each scenario should declare an ``expect`` dict with:
@@ -313,7 +320,9 @@ def _assess_result(scenario: dict, accuracy: dict | None, consistency: dict | No
             problems.append(f"RMSE {rmse_pct}% of range (limit {max_rmse}%)")
 
     if border_check and not border_check["ok"]:
-        bad_edges = [name for name, info in border_check["edges"].items() if info["bad"]]
+        bad_edges = [
+            name for name, info in border_check["edges"].items() if info["bad"]
+        ]
         problems.append(f"suspect border edges: {', '.join(bad_edges)}")
 
     if not problems:
@@ -343,8 +352,12 @@ def run_benchmarks(scenarios: list[dict]):
 
     # Derive subdir from first scenario's mode (read / merge) + timestamp
     mode = scenarios[0].get("mode", "read")
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    export_dir = None if args.no_export else Path(__file__).parent / "data" / f"{mode}_{timestamp}"
+    timestamp = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
+    export_dir = (
+        None
+        if args.no_export
+        else Path(__file__).parent / "data" / f"{mode}_{timestamp}"
+    )
     if export_dir:
         export_dir.mkdir(parents=True, exist_ok=True)
 
@@ -422,7 +435,9 @@ def run_benchmarks(scenarios: list[dict]):
                     "shape_rio": rio["shape"],
                 }
                 if "transform" in ra and "transform" in rio:
-                    spatial_lines = format_spatial_alignment(ra, rio, snap_to_grid=snap_to_grid)
+                    spatial_lines = format_spatial_alignment(
+                        ra, rio, snap_to_grid=snap_to_grid
+                    )
 
             # Accuracy comparison
             try:
@@ -560,5 +575,3 @@ def run_benchmarks(scenarios: list[dict]):
         out(f"\n{'─' * 60}")
         out(f"All arrays exported to: {export_dir}")
         out(f"Report written to:      {report_path}")
-
-

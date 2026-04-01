@@ -8,7 +8,9 @@ URI = "s3://e84-earth-search-sentinel-data/sentinel-2-c1-l2a/33/T/TG/2025/7/S2B_
 BBOX = (255804.0, 4626619.0, 274330.0, 4644625.0)  # UTM subset over Rome
 
 
-@pytest.mark.skip(reason="Downloads full 10980x10980 image (~230MB), too slow for routine use")
+@pytest.mark.skip(
+    reason="Downloads full 10980x10980 image (~230MB), too slow for routine use"
+)
 @live
 @pytest.mark.asyncio
 async def test_read_full_image():

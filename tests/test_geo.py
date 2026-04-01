@@ -1,7 +1,7 @@
 """Unit tests for pure geometry, parsing, and utility functions."""
 
-import pytest
 import numpy as np
+import pytest
 from affine import Affine
 
 from rastera.geo import (
@@ -13,7 +13,6 @@ from rastera.geo import (
 )
 from rastera.reader import _extract_key
 from tests.conftest import make_meta
-
 
 # ── BBox ──────────────────────────────────────────────────────────────────
 
@@ -82,8 +81,6 @@ class TestWindow:
         assert w.width > 0 and w.height > 0
 
 
-
-
 # ── compute_paste_slices ──────────────────────────────────────────────────
 
 
@@ -108,7 +105,6 @@ class TestComputePasteSlices:
             src=src, dst_transform=dst_transform, dst_width=100, dst_height=100
         )
         assert result is None
-
 
 
 # ── _extract_key ─────────────────────────────────────────────────────────
@@ -220,7 +216,9 @@ class TestResampleNearest:
         # Small bbox in WGS84 covering the source area
         dst_t = Affine(0.001, 0, 9.0, 0, -0.001, 45.1)
         transformer = Transformer.from_crs(4326, 32632, always_xy=True)
-        out = resample_nearest(src_arr, src_t, dst_t, 10, 10, nodata=0, transformer=transformer)
+        out = resample_nearest(
+            src_arr, src_t, dst_t, 10, 10, nodata=0, transformer=transformer
+        )
         assert out.shape == (1, 10, 10)
         # Some pixels should have data (1.0), some may be nodata (0) depending on coverage
         assert np.any(out == 1.0) or np.any(out == 0)
@@ -262,7 +260,9 @@ class TestResampleNearest:
         src_t = Affine(100, 0, 500000, 0, -100, 5000000)
         dst_t = Affine(0.001, 0, 9.0, 0, -0.001, 45.1)
         transformer = Transformer.from_crs(4326, 32632, always_xy=True)
-        out = resample_nearest(src_arr, src_t, dst_t, 5, 5, nodata=-1, transformer=transformer)
+        out = resample_nearest(
+            src_arr, src_t, dst_t, 5, 5, nodata=-1, transformer=transformer
+        )
         assert out.shape == (1, 5, 5)
 
     def test_single_pixel_with_transformer(self):
@@ -273,5 +273,7 @@ class TestResampleNearest:
         src_t = Affine(100, 0, 500000, 0, -100, 5000000)
         dst_t = Affine(0.01, 0, 9.0, 0, -0.01, 45.1)
         transformer = Transformer.from_crs(4326, 32632, always_xy=True)
-        out = resample_nearest(src_arr, src_t, dst_t, 1, 1, nodata=0, transformer=transformer)
+        out = resample_nearest(
+            src_arr, src_t, dst_t, 1, 1, nodata=0, transformer=transformer
+        )
         assert out.shape == (1, 1, 1)

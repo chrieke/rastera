@@ -1,6 +1,5 @@
 """Unit tests for build_index, open_from_index, and HeaderCacheStore."""
 
-import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import geopandas as gpd
@@ -9,17 +8,21 @@ import pytest
 from affine import Affine
 from shapely.geometry import box
 
-from rastera.geo import BBox
 from rastera.index import HeaderCacheStore, _obstore_key, build_index, open_from_index
 from rastera.reader import AsyncGeoTIFF
-
 
 # ── Helpers ──────────────────────────────────────────────────────────────
 
 
 def _make_mock_async_geotiff(
-    uri="s3://bucket/key.tif", crs_epsg=32632, width=100, height=100,
-    scale=10.0, count=3, dtype=np.dtype("u2"), nodata=None,
+    uri="s3://bucket/key.tif",
+    crs_epsg=32632,
+    width=100,
+    height=100,
+    scale=10.0,
+    count=3,
+    dtype=np.dtype("u2"),
+    nodata=None,
 ):
     """Build a mock AsyncGeoTIFF with _geotiff, _crs_epsg, _nodata."""
     transform = Affine(scale, 0, 0, 0, -scale, height * scale)
@@ -57,9 +60,17 @@ def _make_index_gdf(entries):
     Missing keys get sensible defaults.
     """
     rows = {
-        "uri": [], "header_bytes": [], "crs_epsg": [], "width": [],
-        "height": [], "count": [], "res_x": [], "res_y": [],
-        "dtype": [], "nodata": [], "overviews": [],
+        "uri": [],
+        "header_bytes": [],
+        "crs_epsg": [],
+        "width": [],
+        "height": [],
+        "count": [],
+        "res_x": [],
+        "res_y": [],
+        "dtype": [],
+        "nodata": [],
+        "overviews": [],
     }
     geometries = []
     for e in entries:
@@ -105,7 +116,11 @@ class TestHeaderCacheStore:
 
         assert result == b"REMOTE_DATA"
         mock_get_range.assert_awaited_once_with(
-            inner, "file.tif", start=3, end=10, length=None,
+            inner,
+            "file.tif",
+            start=3,
+            end=10,
+            length=None,
         )
 
     @pytest.mark.asyncio
@@ -125,7 +140,10 @@ class TestHeaderCacheStore:
         assert result[0] == b"0123"  # from cache
         assert result[1] == b"REMOTE"  # delegated
         mock_get_ranges.assert_awaited_once_with(
-            inner, "file.tif", starts=[8], ends=[20],
+            inner,
+            "file.tif",
+            starts=[8],
+            ends=[20],
         )
 
 
@@ -141,15 +159,19 @@ class TestBuildIndex:
         mock_build_obs.return_value = MagicMock()
         mock_get_range.return_value = b"\x00" * 32768
         mock_cog = _make_mock_async_geotiff(
-            uri="s3://bucket/key.tif", crs_epsg=32632,
-            width=100, height=100, scale=10.0, count=3,
+            uri="s3://bucket/key.tif",
+            crs_epsg=32632,
+            width=100,
+            height=100,
+            scale=10.0,
+            count=3,
         )
         mock_open.return_value = mock_cog
 
         gdf = await build_index(["s3://bucket/key.tif"])
 
         assert len(gdf) == 1
-        assert gdf.crs.to_epsg() == 4326
+        assert gdf.crs is not None and gdf.crs.to_epsg() == 4326
         row = gdf.iloc[0]
         assert row["uri"] == "s3://bucket/key.tif"
         assert row["crs_epsg"] == 32632
@@ -159,8 +181,18 @@ class TestBuildIndex:
         assert row["res_x"] == 10.0
         assert row["dtype"] == "uint16"
         expected_cols = {
-            "uri", "header_bytes", "crs_epsg", "width", "height",
-            "count", "res_x", "res_y", "dtype", "nodata", "overviews", "geometry",
+            "uri",
+            "header_bytes",
+            "crs_epsg",
+            "width",
+            "height",
+            "count",
+            "res_x",
+            "res_y",
+            "dtype",
+            "nodata",
+            "overviews",
+            "geometry",
         }
         assert set(gdf.columns) == expected_cols
 
@@ -168,13 +200,18 @@ class TestBuildIndex:
     @patch("rastera.index._build_obstore")
     @patch("rastera.index.AsyncGeoTIFF.open", new_callable=AsyncMock)
     @patch("rastera.index.obstore.get_range_async", new_callable=AsyncMock)
-    async def test_reprojects_bounds_to_4326(self, mock_get_range, mock_open, mock_build_obs):
+    async def test_reprojects_bounds_to_4326(
+        self, mock_get_range, mock_open, mock_build_obs
+    ):
         """A UTM COG's geometry in the index should be in EPSG:4326, not UTM."""
         mock_build_obs.return_value = MagicMock()
         mock_get_range.return_value = b"\x00" * 100
         mock_cog = _make_mock_async_geotiff(
-            uri="s3://bucket/utm.tif", crs_epsg=32632,
-            width=100, height=100, scale=10.0,
+            uri="s3://bucket/utm.tif",
+            crs_epsg=32632,
+            width=100,
+            height=100,
+            scale=10.0,
         )
         mock_open.return_value = mock_cog
 
@@ -193,7 +230,7 @@ class TestBuildIndex:
         gdf = await build_index([])
 
         assert len(gdf) == 0
-        assert gdf.crs.to_epsg() == 4326
+        assert gdf.crs is not None and gdf.crs.to_epsg() == 4326
         assert "uri" in gdf.columns
         assert "header_bytes" in gdf.columns
 
@@ -210,10 +247,12 @@ class TestOpenFromIndex:
         mock_build_obs.return_value = MagicMock()
         mock_open.return_value = MagicMock(spec=AsyncGeoTIFF)
 
-        gdf = _make_index_gdf([
-            {"uri": "s3://b/a.tif", "minx": 0, "miny": 0, "maxx": 1, "maxy": 1},
-            {"uri": "s3://b/b.tif", "minx": 1, "miny": 0, "maxx": 2, "maxy": 1},
-        ])
+        gdf = _make_index_gdf(
+            [
+                {"uri": "s3://b/a.tif", "minx": 0, "miny": 0, "maxx": 1, "maxy": 1},
+                {"uri": "s3://b/b.tif", "minx": 1, "miny": 0, "maxx": 2, "maxy": 1},
+            ]
+        )
 
         result = await open_from_index(gdf)
 
@@ -228,11 +267,13 @@ class TestOpenFromIndex:
         mock_build_obs.return_value = MagicMock()
         mock_open.return_value = MagicMock(spec=AsyncGeoTIFF)
 
-        gdf = _make_index_gdf([
-            {"uri": "s3://b/a.tif", "minx": 0, "miny": 0, "maxx": 1, "maxy": 1},
-            {"uri": "s3://b/b.tif", "minx": 10, "miny": 10, "maxx": 11, "maxy": 11},
-            {"uri": "s3://b/c.tif", "minx": 20, "miny": 20, "maxx": 21, "maxy": 21},
-        ])
+        gdf = _make_index_gdf(
+            [
+                {"uri": "s3://b/a.tif", "minx": 0, "miny": 0, "maxx": 1, "maxy": 1},
+                {"uri": "s3://b/b.tif", "minx": 10, "miny": 10, "maxx": 11, "maxy": 11},
+                {"uri": "s3://b/c.tif", "minx": 20, "miny": 20, "maxx": 21, "maxy": 21},
+            ]
+        )
 
         result = await open_from_index(gdf, bbox=(0, 0, 1, 1), bbox_crs=4326)
 
@@ -241,9 +282,11 @@ class TestOpenFromIndex:
 
     @pytest.mark.asyncio
     async def test_empty_after_filter(self):
-        gdf = _make_index_gdf([
-            {"uri": "s3://b/a.tif", "minx": 10, "miny": 10, "maxx": 11, "maxy": 11},
-        ])
+        gdf = _make_index_gdf(
+            [
+                {"uri": "s3://b/a.tif", "minx": 10, "miny": 10, "maxx": 11, "maxy": 11},
+            ]
+        )
 
         result = await open_from_index(gdf, bbox=(0, 0, 1, 1), bbox_crs=4326)
 

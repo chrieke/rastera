@@ -80,3 +80,9 @@ raster_array = await rastera.merge(sources, bbox=bbox, bbox_crs=4326, target_crs
 ```
 
 `rastera.open()` also keeps an in-memory LRU cache of parsed headers within the session (default 128 entries, configurable via `set_cache_size()`), so repeated opens of the same URI skip the network fetch even without an index.
+
+### Linting & type checking
+
+```bash
+uv run ruff format . && uv run ruff check --fix . && uv run pyright
+```

@@ -69,7 +69,9 @@ async def build_index(
     async def _open_one(uri: str, hdr: bytes) -> tuple[AsyncGeoTIFF, bytes]:
         async with sem:
             try:
-                src = await AsyncGeoTIFF.open(uri, store=cached_store, prefetch=prefetch)
+                src = await AsyncGeoTIFF.open(
+                    uri, store=cached_store, prefetch=prefetch
+                )
                 return src, hdr
             except Exception as exc:
                 hint = ""
@@ -214,9 +216,15 @@ class HeaderCacheStore:
         cached = self._cache.get(path)
         if cached is not None and actual_end is not None and actual_end <= len(cached):
             return cached[start:actual_end]
-        return bytes(await obstore.get_range_async(
-            self._inner, path, start=start, end=end, length=length,
-        ))
+        return bytes(
+            await obstore.get_range_async(
+                self._inner,
+                path,
+                start=start,
+                end=end,
+                length=length,
+            )
+        )
 
     async def get_ranges_async(
         self,
@@ -233,7 +241,12 @@ class HeaderCacheStore:
         uncached_ends: list[int] = []
 
         for i, s in enumerate(starts):
-            e = ends[i] if ends is not None else s + lengths[i]
+            if ends is not None:
+                e = ends[i]
+            elif lengths is not None:
+                e = s + lengths[i]
+            else:
+                raise ValueError("Either ends or lengths must be provided")
             if cached is not None and e <= len(cached):
                 results[i] = cached[s:e]
             else:
@@ -243,7 +256,10 @@ class HeaderCacheStore:
 
         if uncached_indices:
             fetched = await obstore.get_ranges_async(
-                self._inner, path, starts=uncached_starts, ends=uncached_ends,
+                self._inner,
+                path,
+                starts=uncached_starts,
+                ends=uncached_ends,
             )
             for idx, data in zip(uncached_indices, fetched):
                 results[idx] = bytes(data)
@@ -267,7 +283,7 @@ def _read_geoparquet(
     meta_cols = [c for c in pq.read_schema(path).names if c != "header_bytes"]
     gdf_meta = gpd.read_parquet(path, columns=meta_cols).reset_index(drop=True)
 
-    filtered = _filter_gdf(gdf_meta, bbox, bbox_crs)
+    filtered = _filter_gdf(gpd.GeoDataFrame(gdf_meta), bbox, bbox_crs)
     if len(filtered) == 0:
         return filtered
 
@@ -292,7 +308,9 @@ def _filter_gdf(
         transformer = Transformer.from_crs(bbox_crs, gdf.crs.to_epsg(), always_xy=True)
         query_geom = ops.transform(transformer.transform, query_geom)
 
-    return gdf[gdf.intersects(query_geom)]
+    result = gdf[gdf.intersects(query_geom)]
+    assert isinstance(result, gpd.GeoDataFrame)
+    return result
 
 
 def _build_obstore(uri: str, **store_kwargs: Any) -> Any:

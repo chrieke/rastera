@@ -4,7 +4,7 @@ from collections.abc import Sequence
 from typing import Any, Literal, overload
 
 from async_geotiff import RasterArray, Window
-from async_tiff.store import S3Store
+from async_tiff.store import S3Store  # type: ignore[import-untyped]
 
 from .merge import merge_cogs
 from .reader import AsyncGeoTIFF, clear_cache, open_many, set_cache_size
@@ -28,6 +28,7 @@ except ImportError:
     pass
 else:
     from .index import build_index, open_from_index
+
     __all__ += ["build_index", "open_from_index"]
 
 

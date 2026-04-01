@@ -25,23 +25,29 @@ N_ROUNDS = 20
 
 def search_stac(bbox: list, limit: int = 100) -> list[str]:
     url = "https://earth-search.aws.element84.com/v1/search"
-    body = json.dumps({
-        "collections": ["sentinel-2-l2a"],
-        "limit": limit,
-        "bbox": bbox,
-        "datetime": "2024-06-01T00:00:00Z/2024-06-30T23:59:59Z",
-        "fields": {"includes": ["assets.red.href"]},
-    }).encode()
-    req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
+    body = json.dumps(
+        {
+            "collections": ["sentinel-2-l2a"],
+            "limit": limit,
+            "bbox": bbox,
+            "datetime": "2024-06-01T00:00:00Z/2024-06-30T23:59:59Z",
+            "fields": {"includes": ["assets.red.href"]},
+        }
+    ).encode()
+    req = urllib.request.Request(
+        url, data=body, headers={"Content-Type": "application/json"}
+    )
     resp = json.loads(urllib.request.urlopen(req).read())
     uris = []
     for feat in resp.get("features", []):
         href = feat.get("assets", {}).get("red", {}).get("href", "")
         if href:
-            uris.append(href.replace(
-                "https://sentinel-cogs.s3.us-west-2.amazonaws.com/",
-                "s3://sentinel-cogs/",
-            ))
+            uris.append(
+                href.replace(
+                    "https://sentinel-cogs.s3.us-west-2.amazonaws.com/",
+                    "s3://sentinel-cogs/",
+                )
+            )
     return uris
 
 
@@ -76,7 +82,10 @@ def print_table(headers: list[str], rows: list[list[str]]):
     widths = [max(len(h), *(len(r[i]) for r in rows)) for i, h in enumerate(headers)]
 
     def line(vals):
-        return "  ".join(v.rjust(w) if i > 0 else v.ljust(w) for i, (v, w) in enumerate(zip(vals, widths)))
+        return "  ".join(
+            v.rjust(w) if i > 0 else v.ljust(w)
+            for i, (v, w) in enumerate(zip(vals, widths))
+        )
 
     def sep():
         return "  ".join("-" * w for w in widths)
@@ -114,8 +123,14 @@ async def main():
         matched = gdf[gdf.intersects(box(*qbbox))]["uri"].tolist()
         sites.append((qbbox, matched))
 
-    print(f"Config: {N_ROUNDS} rounds, {n_files} files in index, cold cache each round", flush=True)
-    print(f"Index size: {os.path.getsize(INDEX_PATH) / 1024:.0f} KB (zstd geoparquet)\n", flush=True)
+    print(
+        f"Config: {N_ROUNDS} rounds, {n_files} files in index, cold cache each round",
+        flush=True,
+    )
+    print(
+        f"Index size: {os.path.getsize(INDEX_PATH) / 1024:.0f} KB (zstd geoparquet)\n",
+        flush=True,
+    )
 
     # --- Benchmark: open single file ---
     print(f"[1/3] Open single file ({N_ROUNDS} different files)...", flush=True)
@@ -134,7 +149,10 @@ async def main():
         await rastera.open(uri, **S3_OPTS)
         t_open1_net.append(time.perf_counter() - t0)
 
-        print(f"  [{i+1:2d}] index={t_open1_idx[-1]:.3f}s  network={t_open1_net[-1]:.3f}s", flush=True)
+        print(
+            f"  [{i+1:2d}] index={t_open1_idx[-1]:.3f}s  network={t_open1_net[-1]:.3f}s",
+            flush=True,
+        )
 
     # --- Benchmark: open all files ---
     print(f"\n[2/3] Open all {n_files} files ({N_ROUNDS} rounds)...", flush=True)
@@ -150,31 +168,49 @@ async def main():
         await rastera.open(uris, **S3_OPTS)
         t_open_net.append(time.perf_counter() - t0)
 
-        print(f"  [{i+1:2d}] index={t_open_idx[-1]:.2f}s  network={t_open_net[-1]:.2f}s", flush=True)
+        print(
+            f"  [{i+1:2d}] index={t_open_idx[-1]:.2f}s  network={t_open_net[-1]:.2f}s",
+            flush=True,
+        )
 
     # --- Benchmark: query + merge ---
-    print(f"\n[3/3] Query+merge ~10km window ({N_ROUNDS} different sites)...", flush=True)
+    print(
+        f"\n[3/3] Query+merge ~10km window ({N_ROUNDS} different sites)...", flush=True
+    )
     t_query_idx, t_query_net = [], []
     for i, (qbbox, matched_uris) in enumerate(sites):
         rastera.clear_cache()
         t0 = time.perf_counter()
         sources = await rastera.open_from_index(gdf, bbox=qbbox, **S3_OPTS)
-        await rastera.merge(sources, bbox=qbbox, bbox_crs=4326, target_crs=4326, target_resolution=10)
+        await rastera.merge(
+            sources, bbox=qbbox, bbox_crs=4326, target_crs=4326, target_resolution=10
+        )
         t_query_idx.append(time.perf_counter() - t0)
 
         rastera.clear_cache()
         t0 = time.perf_counter()
         sources = await rastera.open(matched_uris, **S3_OPTS)
-        await rastera.merge(sources, bbox=qbbox, bbox_crs=4326, target_crs=4326, target_resolution=10)
+        await rastera.merge(
+            sources, bbox=qbbox, bbox_crs=4326, target_crs=4326, target_resolution=10
+        )
         t_query_net.append(time.perf_counter() - t0)
 
-        print(f"  [{i+1:2d}] {len(matched_uris)} files  index={t_query_idx[-1]:.2f}s  network={t_query_net[-1]:.2f}s", flush=True)
+        print(
+            f"  [{i+1:2d}] {len(matched_uris)} files  index={t_query_idx[-1]:.2f}s  network={t_query_net[-1]:.2f}s",
+            flush=True,
+        )
 
     # --- Summary table ---
     headers = [
         "Operation",
-        "Idx avg", "Idx std", "Idx med", "Idx p90",
-        "Net avg", "Net std", "Net med", "Net p90",
+        "Idx avg",
+        "Idx std",
+        "Idx med",
+        "Idx p90",
+        "Net avg",
+        "Net std",
+        "Net med",
+        "Net p90",
         "Speedup",
     ]
     rows = [
@@ -186,7 +222,7 @@ async def main():
 
     print(f"  {N_ROUNDS} rounds, cold cache, different files/sites each round.")
     print(f"  Data: {n_files} public Sentinel-2 B04 COGs (us-west-2).")
-    print(f"  Speedup = mean(network) / mean(index).\n")
+    print("  Speedup = mean(network) / mean(index).\n")
 
 
 if __name__ == "__main__":

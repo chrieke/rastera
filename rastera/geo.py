@@ -3,6 +3,8 @@ from __future__ import annotations
 import math
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
+from typing import Any, cast
+
 import numpy as np
 from affine import Affine
 from async_geotiff import Window
@@ -186,7 +188,9 @@ def compute_paste_slices(
     )
 
 
-def transform_bbox(bbox: BBox, from_crs: int, to_crs: int, densify_pts: int = 21) -> BBox:
+def transform_bbox(
+    bbox: BBox, from_crs: int, to_crs: int, densify_pts: int = 21
+) -> BBox:
     """Transform a BBox between CRS (EPSG codes).
 
     Densifies all 4 edges with *densify_pts* samples each (default 21,
@@ -199,18 +203,22 @@ def transform_bbox(bbox: BBox, from_crs: int, to_crs: int, densify_pts: int = 21
     t = np.linspace(0, 1, densify_pts)
     dx = t * (bbox.maxx - bbox.minx)
     dy = t * (bbox.maxy - bbox.miny)
-    xs = np.concatenate([
-        bbox.minx + dx,              # bottom edge
-        np.full_like(t, bbox.maxx),  # right edge
-        bbox.maxx - dx,              # top edge
-        np.full_like(t, bbox.minx),  # left edge
-    ])
-    ys = np.concatenate([
-        np.full_like(t, bbox.miny),  # bottom edge
-        bbox.miny + dy,              # right edge
-        np.full_like(t, bbox.maxy),  # top edge
-        bbox.maxy - dy,              # left edge
-    ])
+    xs = np.concatenate(
+        [
+            bbox.minx + dx,  # bottom edge
+            np.full_like(t, bbox.maxx),  # right edge
+            bbox.maxx - dx,  # top edge
+            np.full_like(t, bbox.minx),  # left edge
+        ]
+    )
+    ys = np.concatenate(
+        [
+            np.full_like(t, bbox.miny),  # bottom edge
+            bbox.miny + dy,  # right edge
+            np.full_like(t, bbox.maxy),  # top edge
+            bbox.maxy - dy,  # left edge
+        ]
+    )
     xs_out, ys_out = transformer.transform(xs, ys)
     valid = np.isfinite(xs_out) & np.isfinite(ys_out)
     if not np.any(valid):
@@ -254,7 +262,7 @@ def resample_nearest(
 
     if transformer is None:
         # Same CRS: compose affines and use 1D index arrays (no meshgrid).
-        combined = ~src_transform * dst_transform
+        combined = cast(Affine, ~src_transform * dst_transform)
         src_col_1d = np.floor(
             float(combined.a) * (np.arange(dst_width, dtype=np.float64) + 0.5)
             + float(combined.c)
@@ -319,7 +327,7 @@ def _coarse_grid_transform(
     transformer: Transformer,
     step: int = _WARP_GRID_STEP,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Transform destination pixels to source pixel coords via coarse-grid interpolation.
+    """Transform dest pixels to source pixel coords via coarse-grid interpolation.
 
     Instead of transforming every destination pixel through pyproj, transforms a
     coarse grid (every ``step`` pixels) and bilinearly interpolates the rest.
@@ -371,7 +379,7 @@ def _coarse_grid_transform(
     return src_col_f, src_row_f
 
 
-def _affine_apply(t: Affine, x: float, y: float) -> tuple[float, float]:
+def _affine_apply(t: Any, x: float, y: float) -> tuple[float, float]:
     """Apply an affine transform to a point, with correct typing."""
-    rx, ry = t * (x, y)  # type: ignore[misc]
+    rx, ry = t * (x, y)
     return float(rx), float(ry)

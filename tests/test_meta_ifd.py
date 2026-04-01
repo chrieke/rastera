@@ -26,7 +26,7 @@ class TestCoerceNodata:
 
     def test_nan_preserved_for_float_dtype(self):
         result = _coerce_nodata(float("nan"), np.dtype("f4"))
-        assert math.isnan(result)
+        assert result is not None and math.isnan(result)
 
     def test_zero_nodata_int(self):
         result = _coerce_nodata(0.0, np.dtype("u1"))
