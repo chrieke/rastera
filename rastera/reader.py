@@ -37,87 +37,6 @@ _geotiff_cache: OrderedDict[str, GeoTIFF] = OrderedDict()
 _cache_max_size: int = 128
 
 
-def get_cached_geotiff(uri: str) -> GeoTIFF | None:
-    """Return a cached GeoTIFF object for *uri*, or None on cache miss."""
-    if _cache_max_size > 0:
-        gt = _geotiff_cache.get(uri)
-        if gt is not None:
-            _geotiff_cache.move_to_end(uri)
-        return gt
-    return None
-
-
-def clear_cache() -> None:
-    """Clear the in-memory GeoTIFF header cache."""
-    _geotiff_cache.clear()
-
-
-def set_cache_size(n: int) -> None:
-    """Set the maximum number of cached GeoTIFF objects (LRU eviction). 0 disables caching."""
-    global _cache_max_size
-    _cache_max_size = n
-    while len(_geotiff_cache) > _cache_max_size:
-        _geotiff_cache.popitem(last=False)
-
-
-# ---- Internal helpers for constructing output Arrays ----
-
-
-@dataclass(frozen=True, slots=True)
-class _CrsNodata:
-    """Stub standing in for ``_geotiff`` on constructed Array objects."""
-
-    crs: CRS
-    nodata: float | None
-
-
-def _grid_for_bbox(
-    bbox: BBox, res: float, *, use_ceil: bool = False
-) -> tuple[Affine, int, int]:
-    """Compute (transform, width, height) for a regular grid covering *bbox*.
-
-    Uses ``round()`` by default to match rasterio/GDAL merge behaviour.
-    When *use_ceil* is True, uses ``math.ceil()`` to match rasterio read
-    behaviour (always covers the full bbox).
-    """
-    fn = math.ceil if use_ceil else round
-    width = max(1, fn(bbox.width / res))
-    height = max(1, fn(bbox.height / res))
-    transform = Affine(res, 0, bbox.minx, 0, -res, bbox.maxy)
-    return transform, width, height
-
-
-def _make_output_array(
-    data: np.ndarray,
-    transform: Affine,
-    width: int,
-    height: int,
-    geotiff,
-    mask: np.ndarray | None = None,
-) -> Array:
-    """Construct an Array for rastera output."""
-    return Array(
-        data=data,
-        mask=mask,
-        width=width,
-        height=height,
-        count=data.shape[0],
-        transform=transform,
-        _alpha_band_idx=None,
-        _geotiff=geotiff,
-    )
-
-
-def _coerce_nodata(nodata: float | None, dtype: np.dtype) -> int | float | None:
-    """Coerce nodata from async-geotiff (always float) to match the raster dtype."""
-    if nodata is None:
-        return None
-    kind = np.dtype(dtype).kind
-    if kind in ("i", "u"):
-        return None if math.isnan(nodata) else int(nodata)
-    return float(nodata)
-
-
 class AsyncGeoTIFF:
     """AsyncGeoTIFF instance for a single GeoTIFF file.
 
@@ -139,16 +58,12 @@ class AsyncGeoTIFF:
         """Return the Overview whose resolution is closest to *target_resolution*
         without being coarser. Returns None to use full resolution."""
         native_res = self._geotiff.res[0]
-        best = None
-        best_res = native_res
-
-        for overview in self._geotiff.overviews:
-            ovr_res = native_res * (self._geotiff.width / overview.width)
-            if ovr_res <= target_resolution and ovr_res >= best_res:
-                best_res = ovr_res
-                best = overview
-
-        return best
+        valid = [
+            (o, native_res * (self._geotiff.width / o.width))
+            for o in self._geotiff.overviews
+            if native_res * (self._geotiff.width / o.width) <= target_resolution
+        ]
+        return max(valid, key=lambda x: x[1])[0] if valid else None
 
     @classmethod
     async def open(
@@ -506,6 +421,93 @@ async def open_many(
         *(AsyncGeoTIFF.open(u, store=store, prefetch=prefetch, cache=cache)
           for u in uris)
     ))
+
+
+# ---- Public cache API ----
+
+
+def get_cached_geotiff(uri: str) -> GeoTIFF | None:
+    """Return a cached GeoTIFF object for *uri*, or None on cache miss."""
+    if _cache_max_size > 0:
+        gt = _geotiff_cache.get(uri)
+        if gt is not None:
+            _geotiff_cache.move_to_end(uri)
+        return gt
+    return None
+
+
+def clear_cache() -> None:
+    """Clear the in-memory GeoTIFF header cache."""
+    _geotiff_cache.clear()
+
+
+def set_cache_size(n: int) -> None:
+    """Set the maximum number of cached GeoTIFF objects (LRU eviction). 0 disables caching."""
+    global _cache_max_size
+    _cache_max_size = n
+    while len(_geotiff_cache) > _cache_max_size:
+        _geotiff_cache.popitem(last=False)
+
+
+# ---- Internal helpers for constructing output Arrays ----
+
+
+@dataclass(frozen=True, slots=True)
+class _CrsNodata:
+    """Stub standing in for ``_geotiff`` on constructed Array objects."""
+
+    crs: CRS
+    nodata: float | None
+
+
+def _grid_for_bbox(
+    bbox: BBox, res: float, *, use_ceil: bool = False
+) -> tuple[Affine, int, int]:
+    """Compute (transform, width, height) for a regular grid covering *bbox*.
+
+    Uses ``round()`` by default to match rasterio/GDAL merge behaviour.
+    When *use_ceil* is True, uses ``math.ceil()`` to match rasterio read
+    behaviour (always covers the full bbox).
+    """
+    fn = math.ceil if use_ceil else round
+    width = max(1, fn(bbox.width / res))
+    height = max(1, fn(bbox.height / res))
+    transform = Affine(res, 0, bbox.minx, 0, -res, bbox.maxy)
+    return transform, width, height
+
+
+def _make_output_array(
+    data: np.ndarray,
+    transform: Affine,
+    width: int,
+    height: int,
+    geotiff,
+    mask: np.ndarray | None = None,
+) -> Array:
+    """Construct an Array for rastera output."""
+    return Array(
+        data=data,
+        mask=mask,
+        width=width,
+        height=height,
+        count=data.shape[0],
+        transform=transform,
+        _alpha_band_idx=None,
+        _geotiff=geotiff,
+    )
+
+
+def _coerce_nodata(nodata: float | None, dtype: np.dtype) -> int | float | None:
+    """Coerce nodata from async-geotiff (always float) to match the raster dtype."""
+    if nodata is None:
+        return None
+    kind = np.dtype(dtype).kind
+    if kind in ("i", "u"):
+        return None if math.isnan(nodata) else int(nodata)
+    return float(nodata)
+
+
+# ---- URI / store helpers ----
 
 
 def _is_s3_uri(uri: str) -> bool:

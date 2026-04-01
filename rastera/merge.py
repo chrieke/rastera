@@ -22,38 +22,6 @@ from .geo import (
 )
 
 
-def _output_subgrid(
-    out_transform: Affine, out_w: int, out_h: int, sub_bbox: BBox
-) -> tuple[Affine, int, int] | None:
-    """Compute the portion of the output grid covering *sub_bbox*.
-
-    Returns ``(sub_transform, sub_width, sub_height)`` where
-    *sub_transform* is an integer-pixel-offset window of *out_transform*,
-    guaranteeing pixel-perfect alignment with the output grid.
-    Returns ``None`` if the sub-bbox doesn't overlap.
-    """
-    inv = ~out_transform
-    c0, r0 = _affine_apply(inv, sub_bbox.minx, sub_bbox.maxy)
-    c1, r1 = _affine_apply(inv, sub_bbox.maxx, sub_bbox.miny)
-
-    col_min = max(0, math.floor(min(c0, c1)))
-    row_min = max(0, math.floor(min(r0, r1)))
-    col_max = min(out_w, math.ceil(max(c0, c1)))
-    row_max = min(out_h, math.ceil(max(r0, r1)))
-
-    sub_w = col_max - col_min
-    sub_h = row_max - row_min
-    if sub_w <= 0 or sub_h <= 0:
-        return None
-
-    res = out_transform.a
-    sub_transform = Affine(
-        res, 0, out_transform.c + col_min * res,
-        0, -res, out_transform.f - row_min * res,
-    )
-    return sub_transform, sub_w, sub_h
-
-
 async def merge_cogs(
     cogs: Sequence[AsyncGeoTIFF],
     *,
@@ -376,8 +344,6 @@ async def _gather_and_paste(
             src_valid = None
 
         if method == "first":
-            if filled is None:
-                raise RuntimeError("filled array required for method='first'")
             unfilled = ~filled[dst_rows, dst_cols]
             if src_valid is not None:
                 paste_mask = unfilled & src_valid
@@ -394,6 +360,38 @@ async def _gather_and_paste(
                 out_array[:, dst_rows, dst_cols] = src_data
 
     return out_array
+
+
+def _output_subgrid(
+    out_transform: Affine, out_w: int, out_h: int, sub_bbox: BBox
+) -> tuple[Affine, int, int] | None:
+    """Compute the portion of the output grid covering *sub_bbox*.
+
+    Returns ``(sub_transform, sub_width, sub_height)`` where
+    *sub_transform* is an integer-pixel-offset window of *out_transform*,
+    guaranteeing pixel-perfect alignment with the output grid.
+    Returns ``None`` if the sub-bbox doesn't overlap.
+    """
+    inv = ~out_transform
+    c0, r0 = _affine_apply(inv, sub_bbox.minx, sub_bbox.maxy)
+    c1, r1 = _affine_apply(inv, sub_bbox.maxx, sub_bbox.miny)
+
+    col_min = max(0, math.floor(min(c0, c1)))
+    row_min = max(0, math.floor(min(r0, r1)))
+    col_max = min(out_w, math.ceil(max(c0, c1)))
+    row_max = min(out_h, math.ceil(max(r0, r1)))
+
+    sub_w = col_max - col_min
+    sub_h = row_max - row_min
+    if sub_w <= 0 or sub_h <= 0:
+        return None
+
+    res = out_transform.a
+    sub_transform = Affine(
+        res, 0, out_transform.c + col_min * res,
+        0, -res, out_transform.f - row_min * res,
+    )
+    return sub_transform, sub_w, sub_h
 
 
 def _mosaic_grid_from_bbox(
@@ -439,38 +437,33 @@ def _require_compatible_merge_inputs(cogs: Sequence[AsyncGeoTIFF]) -> None:
     all sources are aligned to that grid (origins differ by whole pixels).
     """
     base = cogs[0]
-    base_transform = base._geotiff.transform
-    scale_x = float(base_transform.a)
-    scale_y = float(-base_transform.e)
+    base_t = base._geotiff.transform
+    scale_x = float(base_t.a)
+    scale_y = float(-base_t.e)
 
-    if not math.isclose(float(base_transform.b), 0.0) or not math.isclose(
-        float(base_transform.d),
-        0.0,
-    ):
+    if not math.isclose(float(base_t.b), 0.0) or not math.isclose(float(base_t.d), 0.0):
         raise NotImplementedError(
             "merge currently requires a north-up (non-rotated) grid"
         )
 
     for cog in cogs[1:]:
+        t = cog._geotiff.transform
         if cog._crs_epsg != base._crs_epsg:
             raise ValueError("All GeoTIFFs must share the same CRS EPSG")
         if cog._geotiff.count != base._geotiff.count:
             raise ValueError("All GeoTIFFs must share the same band count")
-        if not math.isclose(float(cog._geotiff.transform.a), scale_x):
+        if not math.isclose(float(t.a), scale_x):
             raise ValueError("All GeoTIFFs must share the same pixel width")
-        if not math.isclose(float(-cog._geotiff.transform.e), scale_y):
+        if not math.isclose(float(-t.e), scale_y):
             raise ValueError("All GeoTIFFs must share the same pixel height")
-        if not math.isclose(float(cog._geotiff.transform.b), 0.0) or not math.isclose(
-            float(cog._geotiff.transform.d),
-            0.0,
-        ):
+        if not math.isclose(float(t.b), 0.0) or not math.isclose(float(t.d), 0.0):
             raise NotImplementedError(
                 "merge currently requires a north-up (non-rotated) grid"
             )
 
         # Ensure origins line up on the same pixel grid (integer pixel offsets).
-        off_x = (float(cog._geotiff.transform.c) - float(base_transform.c)) / scale_x
-        off_y = (float(base_transform.f) - float(cog._geotiff.transform.f)) / scale_y
+        off_x = (float(t.c) - float(base_t.c)) / scale_x
+        off_y = (float(base_t.f) - float(t.f)) / scale_y
         if not math.isclose(off_x, round(off_x), abs_tol=1e-6) or not math.isclose(
             off_y, round(off_y), abs_tol=1e-6
         ):

@@ -24,75 +24,6 @@ from .reader import (
 )
 
 
-
-
-class HeaderCacheStore:
-    """Obspec-compatible store wrapper that serves pre-fetched header bytes from cache.
-
-    For byte ranges that fall within the cached region, data is served from memory.
-    For ranges beyond the cache (tile data), requests are delegated to the inner store
-    via ``obstore`` (which can call both native Rust stores and Python stores).
-    """
-
-    def __init__(self, inner: Any, cache: dict[str, bytes]):
-        self._inner = inner
-        self._cache = cache
-
-    async def get_range_async(
-        self,
-        path: str,
-        *,
-        start: int,
-        end: int | None = None,
-        length: int | None = None,
-    ) -> bytes:
-        if end is not None:
-            actual_end = end
-        elif length is not None:
-            actual_end = start + length
-        else:
-            actual_end = None
-
-        cached = self._cache.get(path)
-        if cached is not None and actual_end is not None and actual_end <= len(cached):
-            return cached[start:actual_end]
-        return bytes(await obstore.get_range_async(
-            self._inner, path, start=start, end=end, length=length,
-        ))
-
-    async def get_ranges_async(
-        self,
-        path: str,
-        *,
-        starts: Sequence[int],
-        ends: Sequence[int] | None = None,
-        lengths: Sequence[int] | None = None,
-    ) -> list[bytes]:
-        cached = self._cache.get(path)
-        results: list[bytes | None] = [None] * len(starts)
-        uncached_indices: list[int] = []
-        uncached_starts: list[int] = []
-        uncached_ends: list[int] = []
-
-        for i, s in enumerate(starts):
-            e = ends[i] if ends is not None else s + lengths[i]
-            if cached is not None and e <= len(cached):
-                results[i] = cached[s:e]
-            else:
-                uncached_indices.append(i)
-                uncached_starts.append(s)
-                uncached_ends.append(e)
-
-        if uncached_indices:
-            fetched = await obstore.get_ranges_async(
-                self._inner, path, starts=uncached_starts, ends=uncached_ends,
-            )
-            for idx, data in zip(uncached_indices, fetched):
-                results[idx] = bytes(data)
-
-        return results  # type: ignore[return-value]
-
-
 async def build_index(
     uris: Sequence[str],
     *,
@@ -248,6 +179,76 @@ async def open_from_index(
             return await AsyncGeoTIFF.open(uri, store=cached_store, prefetch=prefetch)
 
     return list(await asyncio.gather(*(_open_one(u) for u in uris)))
+
+
+# ---- Internal helpers ----
+
+
+class HeaderCacheStore:
+    """Obspec-compatible store wrapper that serves pre-fetched header bytes from cache.
+
+    For byte ranges that fall within the cached region, data is served from memory.
+    For ranges beyond the cache (tile data), requests are delegated to the inner store
+    via ``obstore`` (which can call both native Rust stores and Python stores).
+    """
+
+    def __init__(self, inner: Any, cache: dict[str, bytes]):
+        self._inner = inner
+        self._cache = cache
+
+    async def get_range_async(
+        self,
+        path: str,
+        *,
+        start: int,
+        end: int | None = None,
+        length: int | None = None,
+    ) -> bytes:
+        if end is not None:
+            actual_end = end
+        elif length is not None:
+            actual_end = start + length
+        else:
+            actual_end = None
+
+        cached = self._cache.get(path)
+        if cached is not None and actual_end is not None and actual_end <= len(cached):
+            return cached[start:actual_end]
+        return bytes(await obstore.get_range_async(
+            self._inner, path, start=start, end=end, length=length,
+        ))
+
+    async def get_ranges_async(
+        self,
+        path: str,
+        *,
+        starts: Sequence[int],
+        ends: Sequence[int] | None = None,
+        lengths: Sequence[int] | None = None,
+    ) -> list[bytes]:
+        cached = self._cache.get(path)
+        results: list[bytes | None] = [None] * len(starts)
+        uncached_indices: list[int] = []
+        uncached_starts: list[int] = []
+        uncached_ends: list[int] = []
+
+        for i, s in enumerate(starts):
+            e = ends[i] if ends is not None else s + lengths[i]
+            if cached is not None and e <= len(cached):
+                results[i] = cached[s:e]
+            else:
+                uncached_indices.append(i)
+                uncached_starts.append(s)
+                uncached_ends.append(e)
+
+        if uncached_indices:
+            fetched = await obstore.get_ranges_async(
+                self._inner, path, starts=uncached_starts, ends=uncached_ends,
+            )
+            for idx, data in zip(uncached_indices, fetched):
+                results[idx] = bytes(data)
+
+        return results  # type: ignore[return-value]
 
 
 def _read_geoparquet(

@@ -8,8 +8,6 @@ from affine import Affine
 from async_geotiff import Window
 from pyproj import Transformer
 
-_WARP_GRID_STEP = 16
-
 
 @dataclass(frozen=True, slots=True)
 class BBox:
@@ -46,6 +44,45 @@ class BBox:
         if inter.minx >= inter.maxx or inter.miny >= inter.maxy:
             return None
         return inter
+
+
+def ensure_bbox(bbox: BBox | tuple[float, float, float, float]) -> BBox:
+    """Normalize a bbox argument to a BBox instance."""
+    return bbox if isinstance(bbox, BBox) else BBox(*bbox)
+
+
+def normalize_band_indices(
+    band_indices: Sequence[int] | None, n_bands: int
+) -> list[int]:
+    """Return a concrete list of 0-based band indices for internal use.
+
+    Args:
+        band_indices: 1-based band indices (matching rasterio convention).
+            ``None`` selects all bands.
+        n_bands: Total number of bands in the dataset.
+
+    Returns:
+        0-based indices suitable for NumPy indexing.
+    """
+    if band_indices is None:
+        return list(range(n_bands))
+    for b in band_indices:
+        if b < 1:
+            raise ValueError(
+                f"Band indices are 1-based (got {b}). Use 1 for the first band."
+            )
+        if b > n_bands:
+            raise ValueError(
+                f"Band index {b} out of range for dataset with {n_bands} band(s)."
+            )
+    return [b - 1 for b in band_indices]
+
+
+def bounds_from_transform(transform: Affine, width: int, height: int) -> BBox:
+    """Compute bounding box in world coordinates from an affine transform."""
+    x0, y0 = _affine_apply(transform, 0, 0)
+    x1, y1 = _affine_apply(transform, width, height)
+    return BBox(minx=min(x0, x1), miny=min(y0, y1), maxx=max(x0, x1), maxy=max(y0, y1))
 
 
 def window_from_bbox(
@@ -89,7 +126,6 @@ def window_from_bbox(
         raise ValueError(msg)
 
     return Window(col_off=col_off, row_off=row_off, width=width, height=height)
-
 
 
 def compute_paste_slices(
@@ -270,50 +306,9 @@ def resample_nearest(
     return out
 
 
-# ---- Small public helpers ----
-
-
-def normalize_band_indices(
-    band_indices: Sequence[int] | None, n_bands: int
-) -> list[int]:
-    """Return a concrete list of 0-based band indices for internal use.
-
-    Args:
-        band_indices: 1-based band indices (matching rasterio convention).
-            ``None`` selects all bands.
-        n_bands: Total number of bands in the dataset.
-
-    Returns:
-        0-based indices suitable for NumPy indexing.
-    """
-    if band_indices is None:
-        return list(range(n_bands))
-    for b in band_indices:
-        if b < 1:
-            raise ValueError(
-                f"Band indices are 1-based (got {b}). Use 1 for the first band."
-            )
-        if b > n_bands:
-            raise ValueError(
-                f"Band index {b} out of range for dataset with {n_bands} band(s)."
-            )
-    return [b - 1 for b in band_indices]
-
-
-def bounds_from_transform(transform: Affine, width: int, height: int) -> BBox:
-    """Compute bounding box in world coordinates from an affine transform."""
-    x0, y0 = _affine_apply(transform, 0, 0)
-    x1, y1 = _affine_apply(transform, width, height)
-    return BBox(minx=min(x0, x1), miny=min(y0, y1), maxx=max(x0, x1), maxy=max(y0, y1))
-
-
-def ensure_bbox(bbox: BBox | tuple[float, float, float, float]) -> BBox:
-    """Normalize a bbox argument to a BBox instance."""
-    return bbox if isinstance(bbox, BBox) else BBox(*bbox)
-
-
-
 # ---- Private helpers ----
+
+_WARP_GRID_STEP = 16
 
 
 def _coarse_grid_transform(

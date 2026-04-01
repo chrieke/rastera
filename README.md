@@ -14,7 +14,7 @@
 import rastera
 
 uri = "s3://my-bucket/my-cog.tif"
-src = await rastera.open(uri)
+src = await rastera.open(uri, prefetch=32768, cache=True)
 
 # Full image
 array = await src.read()
@@ -24,8 +24,19 @@ array = await src.read()
 array = await src.read(
     bbox=(minx, miny, maxx, maxy),
     bbox_crs=32633,
+    band_indices=[1, 2, 3],
     target_crs=32632,
-    target_resolution=20
+    target_resolution=20,
+    snap_to_grid=True,
+    use_overviews=False,
+)
+
+# Read by pixel window (no reprojection)
+array = await src.read(
+    window=rastera.Window(col_off=0, row_off=0, width=512, height=512),
+    band_indices=[1],
+    target_resolution=20,
+    use_overviews=False,
 )
 ```
 
@@ -35,7 +46,18 @@ array = await src.read(
 uris = ["s3://bucket/tile_a.tif", "s3://bucket/tile_b.tif", ...]
 sources = await rastera.open(uris)  # concurrent opens, shared connection pool
 
-array = await rastera.merge(sources, bbox=bbox, bbox_crs=32633, target_crs=32633, target_resolution=20)
+array = await rastera.merge(
+    sources,
+    bbox=bbox,
+    bbox_crs=32633,
+    band_indices=[1, 2, 3],
+    fill_value=0,
+    target_crs=32633,
+    target_resolution=20,
+    method="first",       # "first" or "last"
+    snap_to_grid=True,
+    use_overviews=False,
+)
 ```
 
 ### COG header cache via geoparquet index
@@ -49,7 +71,7 @@ import rastera
 uris = ["s3://bucket/tile_a.tif", "s3://bucket/tile_b.tif", ...]
 
 # Build once, save to disk
-gdf = await rastera.build_index(uris, region="us-west-2")
+gdf = await rastera.build_index(uris, prefetch=32768, concurrency=100, region="us-west-2")
 gdf.to_parquet("index.parquet")
 
 # Open from index (reusable across sessions, ~5-6x faster opens)
@@ -58,11 +80,3 @@ array = await rastera.merge(sources, bbox=bbox, bbox_crs=4326, target_crs=4326, 
 ```
 
 `rastera.open()` also keeps an in-memory LRU cache of parsed headers within the session (default 128 entries, configurable via `set_cache_size()`), so repeated opens of the same URI skip the network fetch even without an index.
-
-
-
-
-## TODO maybe
-
-- Bilinear / cubic / lanczos resampling (currently nearest-neighbor only)
-- Basic raster stats (min, max, mean, histogram)
