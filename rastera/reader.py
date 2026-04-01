@@ -13,7 +13,7 @@ from urllib.parse import urlparse
 
 import numpy as np
 from affine import Affine
-from async_geotiff import Array, GeoTIFF, Window
+from async_geotiff import RasterArray, GeoTIFF, Window
 from async_tiff.store import from_url
 from pyproj import CRS, Transformer
 
@@ -127,7 +127,7 @@ class AsyncGeoTIFF:
         target_resolution: float | None = None,
         snap_to_grid: bool = True,
         use_overviews: bool = False,
-    ) -> Array:
+    ) -> RasterArray:
         """Read image data, optionally reprojecting and resampling.
 
         Args:
@@ -157,7 +157,7 @@ class AsyncGeoTIFF:
                 per-pixel regression.
 
         Returns:
-            An ``async_geotiff.Array`` containing pixel data and spatial metadata.
+            An ``async_geotiff.RasterArray`` containing pixel data and spatial metadata.
         """
         gt = self._geotiff
         band_indices = normalize_band_indices(band_indices, gt.count)
@@ -219,7 +219,7 @@ class AsyncGeoTIFF:
         band_indices: Sequence[int] | None,
         target_resolution: float,
         use_overviews: bool,
-    ) -> Array:
+    ) -> RasterArray:
         """Read a pixel window and resample to *target_resolution*."""
         overview = (
             self._best_overview_for_resolution(target_resolution)
@@ -253,7 +253,7 @@ class AsyncGeoTIFF:
         needs_reproject: bool,
         needs_resample: bool,
         use_overviews: bool,
-    ) -> Array:
+    ) -> RasterArray:
         """Read with reprojection and/or resampling."""
         gt = self._geotiff
         src_crs = self._crs_epsg
@@ -346,7 +346,7 @@ class AsyncGeoTIFF:
         band_indices: Sequence[int] | None = None,
         overview: Any | None = None,
         snap_to_grid: bool = True,
-    ) -> Array:
+    ) -> RasterArray:
         """Read at native resolution/CRS, optionally from an overview."""
         # TODO: async_geotiff's Window has no stride/step support, so we
         # always read at full tile resolution even when the output is much
@@ -454,7 +454,7 @@ def set_cache_size(n: int) -> None:
 
 @dataclass(frozen=True, slots=True)
 class _CrsNodata:
-    """Stub standing in for ``_geotiff`` on constructed Array objects."""
+    """Stub standing in for ``_geotiff`` on constructed RasterArray objects."""
 
     crs: CRS
     nodata: float | None
@@ -483,9 +483,9 @@ def _make_output_array(
     height: int,
     geotiff,
     mask: np.ndarray | None = None,
-) -> Array:
-    """Construct an Array for rastera output."""
-    return Array(
+) -> RasterArray:
+    """Construct a RasterArray for rastera output."""
+    return RasterArray(
         data=data,
         mask=mask,
         width=width,

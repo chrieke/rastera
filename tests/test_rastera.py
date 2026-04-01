@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import numpy as np
 import pytest
 from affine import Affine
-from async_geotiff import Array, Window
+from async_geotiff import RasterArray, Window
 
 import rastera
 from rastera.reader import AsyncGeoTIFF, _extract_key, _geotiff_cache, set_cache_size, clear_cache
@@ -18,7 +18,7 @@ from tests.conftest import make_mock_geotiff
 
 
 def _make_read_result(shape, dtype=np.uint16, fill=1, transform=None, geotiff=None):
-    """Create a mock async-geotiff Array result."""
+    """Create a mock async-geotiff RasterArray result."""
     data = np.full(shape, fill, dtype=dtype)
     if transform is None:
         transform = Affine(1, 0, 0, 0, -1, shape[1])
@@ -27,7 +27,7 @@ def _make_read_result(shape, dtype=np.uint16, fill=1, transform=None, geotiff=No
         geotiff.nodata = None
         geotiff.crs = MagicMock()
         geotiff.crs.to_epsg.return_value = 32632
-    return Array(
+    return RasterArray(
         data=data,
         mask=None,
         width=shape[2],
@@ -147,12 +147,12 @@ class TestRead:
         result = _make_read_result((1, 16, 16), dtype=np.uint16, geotiff=gt)
         gt.read = AsyncMock(return_value=result)
 
-        arr = await obj.read()
-        assert arr.data.shape == (1, 16, 16)
-        assert arr.data.dtype == np.uint16
-        assert arr.width == 16
-        assert arr.height == 16
-        np.testing.assert_array_equal(arr.data, 1)
+        raster_array = await obj.read()
+        assert raster_array.data.shape == (1, 16, 16)
+        assert raster_array.data.dtype == np.uint16
+        assert raster_array.width == 16
+        assert raster_array.height == 16
+        np.testing.assert_array_equal(raster_array.data, 1)
 
     @pytest.mark.asyncio
     async def test_read_with_window(self):
@@ -163,9 +163,9 @@ class TestRead:
         gt.read = AsyncMock(return_value=result)
 
         window = Window(col_off=4, row_off=4, width=16, height=16)
-        arr = await obj.read(window=window)
-        assert arr.data.shape == (2, 16, 16)
-        np.testing.assert_array_equal(arr.data, 42)
+        raster_array = await obj.read(window=window)
+        assert raster_array.data.shape == (2, 16, 16)
+        np.testing.assert_array_equal(raster_array.data, 42)
 
     @pytest.mark.asyncio
     async def test_read_band_indices(self):
@@ -173,18 +173,18 @@ class TestRead:
         obj = AsyncGeoTIFF("s3://b/k.tif", gt)
 
         data = np.arange(3 * 16 * 16, dtype=np.uint16).reshape(3, 16, 16)
-        result = Array(
+        result = RasterArray(
             data=data, mask=None, width=16, height=16, count=3,
             transform=Affine(1, 0, 0, 0, -1, 16),
             _alpha_band_idx=None, _geotiff=gt,
         )
         gt.read = AsyncMock(return_value=result)
 
-        arr = await obj.read(band_indices=[1, 3])
-        assert arr.data.shape == (2, 16, 16)
+        raster_array = await obj.read(band_indices=[1, 3])
+        assert raster_array.data.shape == (2, 16, 16)
         # band_indices [1, 3] → 0-based [0, 2]
-        np.testing.assert_array_equal(arr.data[0], data[0])
-        np.testing.assert_array_equal(arr.data[1], data[2])
+        np.testing.assert_array_equal(raster_array.data[0], data[0])
+        np.testing.assert_array_equal(raster_array.data[1], data[2])
 
     @pytest.mark.asyncio
     async def test_read_band_index_zero_raises(self):

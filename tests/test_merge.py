@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock, MagicMock
 import numpy as np
 import pytest
 from affine import Affine
-from async_geotiff import Array
+from async_geotiff import RasterArray
 
 from rastera.geo import BBox
 from rastera.merge import merge_cogs, _mosaic_grid_from_bbox, _require_compatible_merge_inputs
@@ -63,13 +63,13 @@ def _make_cog(
 
 
 def _make_array(data, transform, geotiff=None, nodata=None):
-    """Build an Array for test returns."""
+    """Build a RasterArray for test returns."""
     if geotiff is None:
         geotiff = MagicMock()
         geotiff.nodata = float(nodata) if nodata is not None else None
         geotiff.crs = MagicMock()
         geotiff.crs.to_epsg.return_value = 32632
-    return Array(
+    return RasterArray(
         data=data,
         mask=None,
         width=data.shape[2],

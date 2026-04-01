@@ -6,7 +6,7 @@ from typing import Literal
 
 import numpy as np
 from affine import Affine
-from async_geotiff import Array
+from async_geotiff import RasterArray
 from pyproj import CRS, Transformer
 
 from .reader import AsyncGeoTIFF, _CrsNodata, _grid_for_bbox, _make_output_array
@@ -34,7 +34,7 @@ async def merge_cogs(
     method: Literal["first", "last"] = "first",
     snap_to_grid: bool = True,
     use_overviews: bool = False,
-) -> Array:
+) -> RasterArray:
     """
     Merge a bbox that may span multiple GeoTIFFs and return a single stitched array.
 
@@ -68,7 +68,7 @@ async def merge_cogs(
             per-pixel regression.
 
     Returns:
-        An ``async_geotiff.Array`` containing the merged mosaic.
+        An ``async_geotiff.RasterArray`` containing the merged mosaic.
     """
     if not cogs:
         raise ValueError("merge requires at least one AsyncGeoTIFF")
@@ -144,7 +144,7 @@ async def merge_cogs(
 
     async def _read_native_bands(
         cog: AsyncGeoTIFF, sb: BBox
-    ) -> Array:
+    ) -> RasterArray:
         indices = normalize_band_indices(band_indices, cog._geotiff.count)
         return await cog._read_native(bbox=sb, band_indices=indices)
 
@@ -175,7 +175,7 @@ async def _merge_reprojected(
     target_resolution: float,
     method: Literal["first", "last"] = "first",
     use_overviews: bool = False,
-) -> Array:
+) -> RasterArray:
     """Path B: merge with reprojection — supports mixed-CRS inputs."""
     base = cogs[0]
     base_gt = base._geotiff
@@ -200,7 +200,7 @@ async def _merge_reprojected(
 
     async def _read_and_reproject(
         cog: AsyncGeoTIFF, sb: BBox
-    ) -> Array:
+    ) -> RasterArray:
         # Compute an output-aligned sub-grid for this COG's contribution.
         subgrid = _output_subgrid(out_transform, out_w, out_h, sb)
         if subgrid is None:
@@ -290,7 +290,7 @@ async def _gather_and_paste(
     dtype: np.dtype,
     nodata: int | float | None,
     fill_value: int | float,
-    read_fn: Callable[[AsyncGeoTIFF, BBox], Awaitable[Array]],
+    read_fn: Callable[[AsyncGeoTIFF, BBox], Awaitable[RasterArray]],
     method: Literal["first", "last"] = "first",
 ) -> np.ndarray:
     """Read contributing COGs sequentially and paste into a single output array.

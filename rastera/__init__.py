@@ -3,14 +3,14 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import Any, Literal, overload
 
-from async_geotiff import Array, Window
+from async_geotiff import RasterArray, Window
 from async_tiff.store import S3Store
 
 from .merge import merge_cogs
 from .reader import AsyncGeoTIFF, clear_cache, open_many, set_cache_size
 
 __all__ = [
-    "Array",
+    "RasterArray",
     "AsyncGeoTIFF",
     "S3Store",
     "Window",
@@ -96,7 +96,7 @@ async def merge(
     method: Literal["first", "last"] = "first",
     snap_to_grid: bool = True,
     use_overviews: bool = False,
-) -> Array:
+) -> RasterArray:
     """
     Rasterio-style helper: read a bbox mosaic from multiple already-open sources.
 

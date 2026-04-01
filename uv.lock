@@ -21,7 +21,7 @@ wheels = [
 
 [[package]]
 name = "async-geotiff"
-version = "0.3.0"
+version = "0.4.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "affine" },
@@ -29,11 +29,10 @@ dependencies = [
     { name = "defusedxml" },
     { name = "numpy" },
     { name = "pyproj" },
-    { name = "types-defusedxml" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/9b/d4/b0c5dabce167f96cdee96d84535e9415a22b522ec84e2bc7b7c5d95b65fb/async_geotiff-0.3.0.tar.gz", hash = "sha256:ced56de707a04d8f36022972a47443fbc0d5ea67069191668792208d2404f154", size = 24263, upload-time = "2026-03-03T23:13:39.331Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/12/03/68a66597ef21b4e59ee284fbe75393fb84df5f11343d63ef6c0248f4db36/async_geotiff-0.4.0.tar.gz", hash = "sha256:2386cc72e1e66cb36fdb296c6ef3100ba4c5e086950f0ce691f1a86d164fda7b", size = 26058, upload-time = "2026-03-30T19:49:49.491Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/d4/7b/2e1289b52c25e60df6f3089eda85964a4477092142205b64a01dbf29ed63/async_geotiff-0.3.0-py3-none-any.whl", hash = "sha256:20a25488abc313539d6ec3089d69000e93fab30cd54c5e3de5d1746ac7b6b752", size = 30918, upload-time = "2026-03-03T23:13:38.218Z" },
+    { url = "https://files.pythonhosted.org/packages/f3/64/9b88762c3103d2749689ccd013715f03e7a578426973eb4ec24776c05018/async_geotiff-0.4.0-py3-none-any.whl", hash = "sha256:0cf262441775e48f6acabe45706dcf2a0268edcd7f52108c88dc2efb1eb76b2a", size = 33287, upload-time = "2026-03-30T19:49:48.21Z" },
 ]
 
 [[package]]
@@ -516,7 +515,7 @@ index = [
 [package.metadata]
 requires-dist = [
     { name = "affine", specifier = ">=2.4.0" },
-    { name = "async-geotiff", specifier = ">=0.3.0" },
+    { name = "async-geotiff", specifier = ">=0.4.0" },
     { name = "geopandas", marker = "extra == 'index'", specifier = ">=1.0.0" },
     { name = "numpy", specifier = ">=2.2.6" },
     { name = "obstore", marker = "extra == 'index'", specifier = ">=0.9.0" },
@@ -591,15 +590,6 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/94/e7/b2c673351809dca68a0e064b6af791aa332cf192da575fd474ed7d6f16a2/six-1.17.0.tar.gz", hash = "sha256:ff70335d468e7eb6ec65b95b99d3a2836546063f63acc5171de367e834932a81", size = 34031, upload-time = "2024-12-04T17:35:28.174Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/b7/ce/149a00dd41f10bc29e5921b496af8b574d8413afcd5e30dfa0ed46c2cc5e/six-1.17.0-py2.py3-none-any.whl", hash = "sha256:4721f391ed90541fddacab5acf947aa0d3dc7d27b2e1e8eda2be8970586c3274", size = 11050, upload-time = "2024-12-04T17:35:26.475Z" },
-]
-
-[[package]]
-name = "types-defusedxml"
-version = "0.7.0.20250822"
-source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/7d/4a/5b997ae87bf301d1796f72637baa4e0e10d7db17704a8a71878a9f77f0c0/types_defusedxml-0.7.0.20250822.tar.gz", hash = "sha256:ba6c395105f800c973bba8a25e41b215483e55ec79c8ca82b6fe90ba0bc3f8b2", size = 10590, upload-time = "2025-08-22T03:02:59.547Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/13/73/8a36998cee9d7c9702ed64a31f0866c7f192ecffc22771d44dbcc7878f18/types_defusedxml-0.7.0.20250822-py3-none-any.whl", hash = "sha256:5ee219f8a9a79c184773599ad216123aedc62a969533ec36737ec98601f20dcf", size = 13430, upload-time = "2025-08-22T03:02:58.466Z" },
 ]
 
 [[package]]
