@@ -124,15 +124,22 @@ def _apply_boto3_credentials(
         store_kwargs.setdefault("skip_signature", True)
 
 
-def _build_store(uri: str, **store_kwargs: Any) -> Any:
-    """Build an object store rooted at the bucket/host level."""
+def _build_store_with(uri: str, from_url_fn, **store_kwargs: Any) -> Any:
+    """Build an object store rooted at the bucket/host level.
+
+    Accepts any ``from_url`` callable (e.g. ``async_tiff.store.from_url``
+    or ``obstore.store.from_url``) so the same logic serves both backends.
+    """
     local_path = _resolve_local_path(uri)
     if local_path is not None:
-        return from_url(local_path.parent.as_uri(), **store_kwargs)
+        return from_url_fn(local_path.parent.as_uri(), **store_kwargs)
     _apply_s3_defaults(store_kwargs, uri)
-    # Root the store at the bucket, not the full object path
-    bucket_url = _bucket_url(uri)
-    return from_url(bucket_url, **store_kwargs)
+    return from_url_fn(_bucket_url(uri), **store_kwargs)
+
+
+def _build_store(uri: str, **store_kwargs: Any) -> Any:
+    """Build an async-tiff object store rooted at the bucket/host level."""
+    return _build_store_with(uri, from_url, **store_kwargs)
 
 
 def _bucket_url(uri: str) -> str:

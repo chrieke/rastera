@@ -89,6 +89,11 @@ async def merge_cogs(
     crs_matches_target = target_crs == base._crs_epsg
     res_matches_target = math.isclose(target_resolution, base_gt.res[0], rel_tol=1e-6)
 
+    # Note: use_overviews is intentionally NOT included here.  The native
+    # fast path is only reached when res_matches_target is True, meaning
+    # the target resolution equals the native resolution.  Since overviews
+    # are always coarser than native, _best_overview_for_resolution would
+    # return None anyway — so use_overviews is correctly a no-op here.
     needs_reproject = (
         not all_same_crs
         or not all_same_res
@@ -123,7 +128,7 @@ async def merge_cogs(
     native_bbox = transform_bbox(bbox, bbox_crs, native_crs)
 
     if snap_to_grid:
-        window_transform, win_width, win_height, _out_bounds = _mosaic_grid_from_bbox(
+        window_transform, win_width, win_height = _mosaic_grid_from_bbox(
             base_transform=base_gt.transform,
             bbox=native_bbox,
         )
@@ -404,7 +409,7 @@ def _output_subgrid(
 
 def _mosaic_grid_from_bbox(
     *, base_transform: Affine, bbox: BBox
-) -> tuple[Affine, int, int, BBox]:
+) -> tuple[Affine, int, int]:
     """
     Create a pixel-aligned mosaic grid for `bbox` on the `base_transform` grid.
 
@@ -433,8 +438,7 @@ def _mosaic_grid_from_bbox(
         raise ValueError("bbox does not cover any pixels on the base grid")
 
     transform = base_transform * Affine.translation(col_min, row_min)
-    bounds = bounds_from_transform(transform, width, height)
-    return transform, width, height, bounds
+    return transform, width, height
 
 
 def _require_compatible_merge_inputs(cogs: Sequence[AsyncGeoTIFF]) -> None:

@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import Sequence
-from typing import Any
+from typing import Any, cast
 
 import geopandas as gpd
 import obstore
@@ -18,8 +18,7 @@ from .reader import (
     get_cached_geotiff,
 )
 from .store import (
-    _apply_s3_defaults,
-    _bucket_url,
+    _build_store_with,
     _extract_key,
     _obstore_key,
     _resolve_local_path,
@@ -266,7 +265,7 @@ class HeaderCacheStore:
             for idx, data in zip(uncached_indices, fetched):
                 results[idx] = bytes(data)
 
-        return results  # type: ignore[return-value]
+        return cast(list[bytes], results)
 
 
 def _read_geoparquet(
@@ -316,16 +315,8 @@ def _filter_gdf(
 
 
 def _build_obstore(uri: str, **store_kwargs: Any) -> Any:
-    """Build an obstore-compatible object store for the given URI.
-
-    For S3/GCS/AZ URIs, the store is rooted at the bucket level.
-    For HTTP and local paths, the store is rooted at the file URL.
-    """
-    local_path = _resolve_local_path(uri)
-    if local_path is not None:
-        return obstore_from_url(local_path.parent.as_uri(), **store_kwargs)
-    _apply_s3_defaults(store_kwargs, uri)
-    return obstore_from_url(_bucket_url(uri), **store_kwargs)
+    """Build an obstore-compatible object store for the given URI."""
+    return _build_store_with(uri, obstore_from_url, **store_kwargs)
 
 
 def _empty_geodataframe() -> gpd.GeoDataFrame:

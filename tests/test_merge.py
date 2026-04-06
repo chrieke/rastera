@@ -8,7 +8,7 @@ import pytest
 from affine import Affine
 from async_geotiff import RasterArray
 
-from rastera.geo import BBox
+from rastera.geo import BBox, bounds_from_transform
 from rastera.merge import (
     _mosaic_grid_from_bbox,
     _require_compatible_merge_inputs,
@@ -112,12 +112,13 @@ class TestMosaicGridFromBbox:
     def test_aligned_bbox(self):
         base_transform = Affine(10, 0, 0, 0, -10, 1000)
         bbox = BBox(100, 500, 300, 800)
-        transform, w, h, bounds = _mosaic_grid_from_bbox(
+        transform, w, h = _mosaic_grid_from_bbox(
             base_transform=base_transform,
             bbox=bbox,
         )
         assert w == 20
         assert h == 30
+        bounds = bounds_from_transform(transform, w, h)
         assert bounds.minx == 100.0
         assert bounds.maxy == 800.0
 
@@ -125,7 +126,7 @@ class TestMosaicGridFromBbox:
         base_transform = Affine(10, 0, 0, 0, -10, 1000)
         # A tiny bbox within a single pixel still produces a 1x1 grid
         bbox = BBox(5, 5, 6, 6)
-        _, w, h, _ = _mosaic_grid_from_bbox(base_transform=base_transform, bbox=bbox)
+        _, w, h = _mosaic_grid_from_bbox(base_transform=base_transform, bbox=bbox)
         assert w >= 1
         assert h >= 1
 

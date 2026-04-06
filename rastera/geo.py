@@ -68,6 +68,8 @@ def normalize_band_indices(
     """
     if band_indices is None:
         return list(range(n_bands))
+    if len(band_indices) == 0:
+        raise ValueError("band_indices must not be empty (use None for all bands)")
     for b in band_indices:
         if b < 1:
             raise ValueError(
