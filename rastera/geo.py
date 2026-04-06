@@ -330,7 +330,7 @@ def _coarse_grid_transform(
     transformer: Transformer,
     step: int = _WARP_GRID_STEP,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Transform dest pixels to source pixel coords via coarse-grid interpolation.
+    """Transform dst pixels to src pixel coords via coarse-grid interpolation.
 
     Instead of transforming every destination pixel through pyproj, transforms a
     coarse grid (every ``step`` pixels) and bilinearly interpolates the rest.

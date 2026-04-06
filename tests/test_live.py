@@ -1,3 +1,5 @@
+from typing import Any
+
 import pytest
 
 import rastera
@@ -18,11 +20,12 @@ async def test_read_full_image():
 
     raster_array = await src.read()
 
-    assert raster_array.data.ndim == 3  # type: ignore[reportUnknownMemberType]
-    assert raster_array.data.shape[0] >= 1  # type: ignore[reportUnknownMemberType]
-    assert raster_array.data.shape[1] > 0  # type: ignore[reportUnknownMemberType]
-    assert raster_array.data.shape[2] > 0  # type: ignore[reportUnknownMemberType]
-    assert raster_array.data.mean() != 0  # type: ignore[reportUnknownMemberType]
+    data: Any = raster_array.data  # type: ignore[reportUnknownMemberType]
+    assert data.ndim == 3
+    assert data.shape[0] >= 1
+    assert data.shape[1] > 0
+    assert data.shape[2] > 0
+    assert data.mean() != 0
 
 
 @live
@@ -32,11 +35,12 @@ async def test_read_bbox():
 
     raster_array = await src.read(bbox=BBOX, bbox_crs=32633)
 
-    assert raster_array.data.ndim == 3  # type: ignore[reportUnknownMemberType]
-    assert raster_array.data.shape[0] >= 1  # type: ignore[reportUnknownMemberType]
+    data: Any = raster_array.data  # type: ignore[reportUnknownMemberType]
+    assert data.ndim == 3
+    assert data.shape[0] >= 1
     # Should be a subset, not the full 10980x10980
-    assert raster_array.data.shape[1] < 10980  # type: ignore[reportUnknownMemberType]
-    assert raster_array.data.shape[2] < 10980  # type: ignore[reportUnknownMemberType]
-    assert raster_array.width == raster_array.data.shape[2]  # type: ignore[reportUnknownMemberType]
-    assert raster_array.height == raster_array.data.shape[1]  # type: ignore[reportUnknownMemberType]
-    assert raster_array.data.mean() != 0  # type: ignore[reportUnknownMemberType]
+    assert data.shape[1] < 10980
+    assert data.shape[2] < 10980
+    assert raster_array.width == data.shape[2]
+    assert raster_array.height == data.shape[1]
+    assert data.mean() != 0

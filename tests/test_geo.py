@@ -183,9 +183,12 @@ class TestResampleNearest:
         dst_t = Affine(20, 0, 0, 0, -20, 40)
         out = resample_nearest(arr, src_t, dst_t, 2, 2)
         assert out.shape == (1, 2, 2)
-        # Pixel centers at (10,30), (30,30), (10,10), (30,10) → src pixels (1,1),(3,1),(1,3),(3,3)
-        # Actually pixel centers: col+0.5 → col 0.5*20=10, 1.5*20=30; row 0.5*20 → y=40-10=30, y=40-30=10
-        # src col for x=10: 10/10=1, x=30: 30/10=3; src row for y=30: (40-30)/10=1, y=10: (40-10)/10=3
+        # Pixel centers at (10,30), (30,30), (10,10), (30,10)
+        # → src pixels (1,1),(3,1),(1,3),(3,3)
+        # col+0.5 → col 0.5*20=10, 1.5*20=30
+        # row 0.5*20 → y=40-10=30, y=40-30=10
+        # src col for x=10: 1, x=30: 3
+        # src row for y=30: 1, y=10: 3
         assert out[0, 0, 0] == arr[0, 1, 1]
         assert out[0, 0, 1] == arr[0, 1, 3]
         assert out[0, 1, 0] == arr[0, 3, 1]
@@ -226,7 +229,7 @@ class TestResampleNearest:
             src_arr, src_t, dst_t, 10, 10, nodata=0, transformer=transformer
         )
         assert out.shape == (1, 10, 10)
-        # Some pixels should have data (1.0), some may be nodata (0) depending on coverage
+        # Some pixels should have data (1.0), some may be nodata (0)
         assert np.any(out == 1.0) or np.any(out == 0)
 
     def test_coarse_grid_matches_brute_force(self):

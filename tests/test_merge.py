@@ -247,14 +247,14 @@ class TestMergeCogs:
             mosaic_method="last",
             snap_to_grid=True,
         )
-        # The overlap region (cols 5-9) should have cog2's value (last writer wins with mosaic_method="last")
+        # Overlap region (cols 5-9): cog2 wins (mosaic_method="last")
         assert result.data.shape == (1, 10, 15)  # type: ignore[reportUnknownMemberType]
         assert np.all(result.data[0, :, :5] == 1)  # type: ignore[reportUnknownMemberType]  # cog1 only
         assert np.all(result.data[0, :, 10:] == 2)  # type: ignore[reportUnknownMemberType]  # cog2 only
         assert np.all(result.data[0, :, 5:10] == 2)  # type: ignore[reportUnknownMemberType]  # overlap -> cog2 wins
 
     async def test_nodata_skipped_in_overlap(self):
-        """Nodata pixels in a later COG should not overwrite valid data from earlier COGs."""
+        """Nodata pixels should not overwrite valid data."""
         NODATA = 0
         cog1 = _make_cog(width=10, height=10, scale=1.0, bands=1, nodata=NODATA)
         cog2 = _make_cog(
@@ -391,7 +391,7 @@ class TestMergeReprojected:
     """Tests for _merge_reprojected, triggered by target_crs or target_resolution."""
 
     async def test_merge_with_target_crs(self):
-        """Setting target_crs different from native CRS triggers the reprojected path."""
+        """target_crs != native CRS triggers reprojected path."""
         cog = _make_cog(width=10, height=10, scale=1.0, bands=1, crs=32632)
 
         # Return native-CRS data; the merge code resamples into the target grid.
@@ -410,7 +410,7 @@ class TestMergeReprojected:
         cog._read_native.assert_called()
 
     async def test_merge_with_target_resolution(self):
-        """Setting target_resolution different from native triggers the reprojected path."""
+        """target_resolution != native triggers reprojected path."""
         cog = _make_cog(width=10, height=10, scale=1.0, bands=1)
 
         # Return native-resolution data; merge code resamples to target_resolution.

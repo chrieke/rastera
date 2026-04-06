@@ -241,13 +241,15 @@ class HeaderCacheStore:
         uncached_starts: list[int] = []
         uncached_ends: list[int] = []
 
-        for i, s in enumerate(starts):
-            if ends is not None:
-                e = ends[i]
-            elif lengths is not None:
-                e = s + lengths[i]
-            else:
+        if ends is None:
+            if lengths is None:
                 raise ValueError("Either ends or lengths must be provided")
+            resolved_ends = [s + length for s, length in zip(starts, lengths)]
+        else:
+            resolved_ends = list(ends)
+
+        for i, s in enumerate(starts):
+            e = resolved_ends[i]
             if cached is not None and e <= len(cached):
                 results[i] = cached[s:e]
             else:

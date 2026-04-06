@@ -165,7 +165,6 @@ async def merge(
         indices = normalize_band_indices(band_indices, cog._geotiff.count)
         return await cog._read_native(bbox=sb, band_indices=indices)
 
-    assert base_gt.dtype is not None
     out_data = await _gather_and_paste(
         contributing=sub_bboxes,
         dst_transform=window_transform,
@@ -220,6 +219,7 @@ async def _merge_reprojected(
             contributing.append((cog, sub_bbox))
 
     async def _read_and_reproject(cog: AsyncGeoTIFF, sb: BBox) -> RasterArray:
+        assert cog._crs_epsg is not None
         # Compute an output-aligned sub-grid for this COG's contribution.
         subgrid = _output_subgrid(out_transform, out_w, out_h, sb)
         if subgrid is None:
@@ -236,7 +236,6 @@ async def _merge_reprojected(
         # larger than sb due to integer pixel rounding).
         read_bbox = bounds_from_transform(sub_transform, sub_w, sub_h)
 
-        assert cog._crs_epsg is not None
         needs_reproject = cog._crs_epsg != out_crs
         if needs_reproject:
             read_bbox = transform_bbox(read_bbox, out_crs, cog._crs_epsg)
@@ -256,7 +255,6 @@ async def _merge_reprojected(
         if use_overviews:
             src_res = res
             if needs_reproject:
-                assert cog._crs_epsg is not None
                 cog_bounds_target = transform_bbox(
                     BBox(*cog._geotiff.bounds), cog._crs_epsg, out_crs
                 )
@@ -288,7 +286,6 @@ async def _merge_reprojected(
         geotiff_ref = _CrsNodata(CRS.from_epsg(out_crs), cog._nodata)
         return _make_output_array(out_data, sub_transform, sub_w, sub_h, geotiff_ref)
 
-    assert base_gt.dtype is not None
     out_data = await _gather_and_paste(
         contributing=contributing,
         dst_transform=out_transform,
@@ -341,7 +338,9 @@ async def _gather_and_paste(
         return out_array
 
     filled = (
-        np.zeros((dst_height, dst_width), dtype=bool) if mosaic_method == "first" else None
+        np.zeros((dst_height, dst_width), dtype=bool)
+        if mosaic_method == "first"
+        else None
     )
 
     for cog, sub_bbox in contributing:

@@ -126,7 +126,7 @@ class TestOpen:
 
     @pytest.mark.asyncio
     async def test_open_multi_uri_cross_bucket_raises(self):
-        """Passing URIs from different buckets without an explicit store should raise."""
+        """Cross-bucket URIs without explicit store should raise."""
         with pytest.raises(ValueError, match="same bucket/host"):
             await rastera.open(
                 [
@@ -162,12 +162,12 @@ class TestRead:
         result = _make_read_result((1, 16, 16), dtype=np.uint16, geotiff=gt)
         gt.read = AsyncMock(return_value=result)
 
-        raster_array = await obj.read()
-        assert raster_array.data.shape == (1, 16, 16)  # type: ignore[reportUnknownMemberType]
-        assert raster_array.data.dtype == np.uint16  # type: ignore[reportUnknownMemberType]
-        assert raster_array.width == 16
-        assert raster_array.height == 16
-        np.testing.assert_array_equal(raster_array.data, 1)  # type: ignore[reportUnknownMemberType]
+        arr = await obj.read()
+        assert arr.data.shape == (1, 16, 16)  # type: ignore[reportUnknownMemberType]
+        assert arr.data.dtype == np.uint16  # type: ignore[reportUnknownMemberType]
+        assert arr.width == 16
+        assert arr.height == 16
+        np.testing.assert_array_equal(arr.data, 1)  # type: ignore[reportUnknownMemberType]
 
     @pytest.mark.asyncio
     async def test_read_with_window(self):
@@ -180,9 +180,9 @@ class TestRead:
         gt.read = AsyncMock(return_value=result)
 
         window = Window(col_off=4, row_off=4, width=16, height=16)
-        raster_array = await obj.read(window=window)
-        assert raster_array.data.shape == (2, 16, 16)  # type: ignore[reportUnknownMemberType]
-        np.testing.assert_array_equal(raster_array.data, 42)  # type: ignore[reportUnknownMemberType]
+        arr = await obj.read(window=window)
+        assert arr.data.shape == (2, 16, 16)  # type: ignore[reportUnknownMemberType]
+        np.testing.assert_array_equal(arr.data, 42)  # type: ignore[reportUnknownMemberType]
 
     @pytest.mark.asyncio
     async def test_read_band_indices(self):
@@ -204,11 +204,11 @@ class TestRead:
         )
         gt.read = AsyncMock(return_value=result)
 
-        raster_array = await obj.read(band_indices=[1, 3])
-        assert raster_array.data.shape == (2, 16, 16)  # type: ignore[reportUnknownMemberType]
+        arr = await obj.read(band_indices=[1, 3])
+        assert arr.data.shape == (2, 16, 16)  # type: ignore[reportUnknownMemberType]
         # band_indices [1, 3] → 0-based [0, 2]
-        np.testing.assert_array_equal(raster_array.data[0], data[0])  # type: ignore[reportUnknownMemberType]
-        np.testing.assert_array_equal(raster_array.data[1], data[2])  # type: ignore[reportUnknownMemberType]
+        np.testing.assert_array_equal(arr.data[0], data[0])  # type: ignore[reportUnknownMemberType]
+        np.testing.assert_array_equal(arr.data[1], data[2])  # type: ignore[reportUnknownMemberType]
 
     @pytest.mark.asyncio
     async def test_read_band_index_zero_raises(self):
