@@ -24,7 +24,7 @@ from .geo import (
 from .reader import AsyncGeoTIFF, _CrsNodata, _grid_for_bbox, _make_output_array
 
 
-async def merge_cogs(
+async def merge(
     cogs: Sequence[AsyncGeoTIFF],
     *,
     bbox: BBox | tuple[float, float, float, float],

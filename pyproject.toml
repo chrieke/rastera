@@ -61,6 +61,15 @@ pythonVersion = "3.11"
 strictListInference = true
 strictSetInference = true
 strictDictionaryInference = true
+analyzeUnannotatedFunctions = true
+reportUnknownMemberType = "error"
+reportUntypedFunctionDecorator = "error"
+reportUntypedClassDecorator = "error"
+reportMissingParameterType = "error"
+reportMatchNotExhaustive = "error"
+reportUnnecessaryTypeIgnoreComment = "error"
+reportMissingTypeArgument = "error"
+reportDeprecated = "error"
 
 [tool.setuptools]
 packages = ["rastera"]

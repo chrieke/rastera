@@ -1,4 +1,4 @@
-"""Unit tests for merge_cogs and helpers."""
+"""Unit tests for merge and helpers."""
 
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -13,7 +13,7 @@ from rastera.merge import (
     _mosaic_grid_from_bbox,
     _require_compatible_merge_inputs,
     _resolve_target_crs,
-    merge_cogs,
+    merge,
 )
 
 # ── Helpers ──────────────────────────────────────────────────────────────
@@ -158,7 +158,7 @@ class TestRequireCompatibleMergeInputs:
         _require_compatible_merge_inputs([cog1, cog2])
 
 
-# ── merge_cogs ───────────────────────────────────────────────────────────
+# ── merge ───────────────────────────────────────────────────────────
 
 
 class TestMergeCogs:
@@ -173,7 +173,7 @@ class TestMergeCogs:
         )
         cog._read_native = AsyncMock(return_value=read_result)
 
-        result = await merge_cogs(
+        result = await merge(
             [cog],
             bbox=BBox(0, 0, 10, 10),
             bbox_crs=32632,
@@ -187,7 +187,7 @@ class TestMergeCogs:
 
     async def test_no_cogs_raises(self):
         with pytest.raises(ValueError, match="at least one"):
-            await merge_cogs(
+            await merge(
                 [],
                 bbox=BBox(0, 0, 10, 10),
                 bbox_crs=32632,
@@ -199,7 +199,7 @@ class TestMergeCogs:
         """When a COG doesn't intersect the bbox, the output should be fill_value."""
         cog = _make_cog(width=10, height=10, scale=1.0, origin_x=100, origin_y=110)
         # bbox is at (0,0)-(10,10), cog is at (100,100)-(110,110) — no overlap
-        result = await merge_cogs(
+        result = await merge(
             [cog],
             bbox=BBox(0, 0, 10, 10),
             bbox_crs=32632,
@@ -232,7 +232,7 @@ class TestMergeCogs:
             )
         )
 
-        result = await merge_cogs(
+        result = await merge(
             [cog1, cog2],
             bbox=BBox(0, 0, 15, 10),
             bbox_crs=32632,
@@ -275,7 +275,7 @@ class TestMergeCogs:
             )
         )
 
-        result = await merge_cogs(
+        result = await merge(
             [cog1, cog2],
             bbox=BBox(0, 0, 15, 10),
             bbox_crs=32632,
@@ -330,7 +330,7 @@ class TestMergeCogs:
             )
         )
 
-        result = await merge_cogs(
+        result = await merge(
             [cog1, cog2],
             bbox=BBox(0, 0, 10, 10),
             bbox_crs=32632,
@@ -365,7 +365,7 @@ class TestMergeCogs:
             )
         )
 
-        result = await merge_cogs(
+        result = await merge(
             [cog1, cog2],
             bbox=BBox(0, 0, 10, 10),
             bbox_crs=32632,
@@ -379,7 +379,7 @@ class TestMergeCogs:
         assert np.all(result.data == 0)
 
 
-# ── merge_cogs: reprojected path ────────────────────────────────────────
+# ── merge: reprojected path ────────────────────────────────────────
 
 
 class TestMergeReprojected:
@@ -394,7 +394,7 @@ class TestMergeReprojected:
         native_result = _make_array(native_arr, Affine(1, 0, 0, 0, -1, 10))
         cog._read_native = AsyncMock(return_value=native_result)
 
-        await merge_cogs(
+        await merge(
             [cog],
             bbox=BBox(0, 0, 10, 10),
             bbox_crs=32632,
@@ -413,7 +413,7 @@ class TestMergeReprojected:
         native_result = _make_array(native_arr, Affine(1.0, 0, 0, 0, -1.0, 10))
         cog._read_native = AsyncMock(return_value=native_result)
 
-        result = await merge_cogs(
+        result = await merge(
             [cog],
             bbox=BBox(0, 0, 10, 10),
             bbox_crs=32632,
@@ -439,7 +439,7 @@ class TestMergeReprojected:
         cog1._read_native = AsyncMock(return_value=_make_array(arr1, native_transform))
         cog2._read_native = AsyncMock(return_value=_make_array(arr2, native_transform))
 
-        result = await merge_cogs(
+        result = await merge(
             [cog1, cog2],
             bbox=BBox(0, 0, 10, 10),
             bbox_crs=32632,

@@ -6,7 +6,7 @@ from collections import OrderedDict
 from collections.abc import Sequence
 from dataclasses import dataclass
 from dataclasses import replace as dc_replace
-from typing import Any
+from typing import Any, overload
 
 import numpy as np
 from affine import Affine
@@ -407,7 +407,7 @@ class AsyncGeoTIFF:
         )
 
 
-async def open_many(
+async def _open_many(
     uris: Sequence[str],
     *,
     store: Any = None,
@@ -436,6 +436,59 @@ async def open_many(
                 for u in uris
             )
         )
+    )
+
+
+@overload
+async def open(
+    uri: str,
+    *,
+    store: Any = None,
+    prefetch: int = 32768,
+    cache: bool = True,
+    **store_kwargs,
+) -> AsyncGeoTIFF: ...
+
+
+@overload
+async def open(
+    uri: Sequence[str],
+    *,
+    store: Any = None,
+    prefetch: int = 32768,
+    cache: bool = True,
+    **store_kwargs,
+) -> list[AsyncGeoTIFF]: ...
+
+
+async def open(
+    uri: str | Sequence[str],
+    *,
+    store: Any = None,
+    prefetch: int = 32768,
+    cache: bool = True,
+    **store_kwargs,
+) -> AsyncGeoTIFF | list[AsyncGeoTIFF]:
+    """Open one or more GeoTIFFs from any supported URI.
+
+    When a list of URIs is passed, files are opened concurrently with a
+    shared object store for connection reuse.
+
+    Args:
+        uri: A single URI or a list of URIs.
+        store: Optional pre-constructed store for connection reuse.
+        prefetch: Number of bytes to prefetch when opening the TIFF.
+        cache: When True, cache parsed TIFF headers in memory so that
+            subsequent opens of the same URI skip the header fetch.
+        **store_kwargs: Extra kwargs forwarded to ``async_tiff.store.from_url``
+            (e.g. ``skip_signature``, ``region``, ``request_payer``).
+    """
+    if isinstance(uri, str):
+        return await AsyncGeoTIFF.open(
+            uri, store=store, prefetch=prefetch, cache=cache, **store_kwargs
+        )
+    return await _open_many(
+        uri, store=store, prefetch=prefetch, cache=cache, **store_kwargs
     )
 
 
