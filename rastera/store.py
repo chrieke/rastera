@@ -153,6 +153,9 @@ def _bucket_url(uri: str) -> str:
     if parsed.scheme in {"http", "https"}:
         # https://bucket.s3.region.amazonaws.com/key -> https://bucket.s3.region.amazonaws.com
         return f"{parsed.scheme}://{parsed.netloc}"
+    local_path = _resolve_local_path(uri)
+    if local_path is not None:
+        return local_path.parent.as_uri()
     return uri
 
 
