@@ -58,7 +58,7 @@ def _detect_region(uri: str) -> str | None:
 def _extract_key(uri: str) -> str:
     """Extract the object key from a URI, for use with a pre-constructed store."""
     parsed = urlparse(uri)
-    if parsed.scheme == "s3":
+    if parsed.scheme in {"s3", "gs", "az"}:
         return parsed.path.lstrip("/")
     if parsed.scheme in {"http", "https"}:
         host = parsed.netloc
@@ -67,7 +67,9 @@ def _extract_key(uri: str) -> str:
         # Path-style: https://s3.<region>.amazonaws.com/<bucket>/<key>
         parts = parsed.path.lstrip("/").split("/", 1)
         return parts[1] if len(parts) == 2 else ""
-    # Local path or other scheme — use path as-is
+    local_path = _resolve_local_path(uri)
+    if local_path is not None:
+        return local_path.name
     return parsed.path or uri
 
 

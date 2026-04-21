@@ -136,11 +136,15 @@ class TestExtractKey:
             == "path/to/file.tif"
         )
 
-    def test_local_path(self):
-        assert _extract_key("/data/file.tif") == "/data/file.tif"
+    def test_local_path(self, tmp_path):
+        f = tmp_path / "file.tif"
+        f.write_bytes(b"")
+        assert _extract_key(str(f)) == "file.tif"
 
-    def test_file_scheme(self):
-        assert _extract_key("file:///data/file.tif") == "/data/file.tif"
+    def test_file_scheme(self, tmp_path):
+        f = tmp_path / "file.tif"
+        f.write_bytes(b"")
+        assert _extract_key(f.as_uri()) == "file.tif"
 
 
 # ── transform_bbox ───────────────────────────────────────────────────────

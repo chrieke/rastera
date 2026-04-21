@@ -12,6 +12,7 @@ from rastera.store import (
     _detect_region,
     _extract_key,
     _is_s3_uri,
+    _obstore_key,
     _resolve_local_path,
 )
 
@@ -130,8 +131,19 @@ class TestExtractKey:
         uri = "https://s3.us-east-1.amazonaws.com/bucket/path/file.tif"
         assert _extract_key(uri) == "path/file.tif"
 
-    def test_local_path(self):
-        assert _extract_key("/tmp/data/file.tif") == "/tmp/data/file.tif"
+    def test_local_path_returns_filename(self, tmp_path):
+        f = tmp_path / "file.tif"
+        f.write_bytes(b"")
+        assert _extract_key(str(f)) == "file.tif"
+
+    def test_file_uri_returns_filename(self, tmp_path):
+        f = tmp_path / "file.tif"
+        f.write_bytes(b"")
+        assert _extract_key(f.as_uri()) == "file.tif"
+
+    def test_matches_obstore_key_for_cloud_schemes(self):
+        for uri in ["s3://b/k/a.tif", "gs://b/k/a.tif", "az://c/k/a.tif"]:
+            assert _extract_key(uri) == _obstore_key(uri) == "k/a.tif"
 
 
 # ── _apply_s3_defaults ──────────────────────────────────────────────────
