@@ -155,6 +155,16 @@ class TestApplyS3Defaults:
         _apply_s3_defaults(kwargs, "https://example.com/file.tif")
         assert kwargs == {}
 
+    def test_non_s3_uri_strips_skip_signature(self):
+        kwargs: dict[str, Any] = {"skip_signature": False}
+        _apply_s3_defaults(kwargs, "https://example.com/file.tif")
+        assert "skip_signature" not in kwargs
+
+    def test_local_uri_strips_skip_signature(self):
+        kwargs: dict[str, Any] = {"skip_signature": False}
+        _apply_s3_defaults(kwargs, "/tmp/foo.tif")
+        assert "skip_signature" not in kwargs
+
     def test_s3_uri_sets_skip_signature(self):
         kwargs: dict[str, Any] = {}
         _apply_s3_defaults(kwargs, "s3://bucket/key")
@@ -209,3 +219,27 @@ class TestBuildStoreWith:
         # Should be called with the bucket URL, not the full object path
         call_args = mock_from_url.call_args
         assert call_args[0][0] == "s3://bucket"
+
+    def test_local_uri_strips_skip_signature(self):
+        captured: dict = {}
+
+        def fake_from_url(url, **kwargs):
+            captured["url"] = url
+            captured["kwargs"] = kwargs
+            return object()
+
+        _build_store_with("/tmp/foo.tif", fake_from_url, skip_signature=False)
+        assert "skip_signature" not in captured["kwargs"]
+
+    def test_non_s3_https_uri_strips_skip_signature(self):
+        captured: dict = {}
+
+        def fake_from_url(url, **kwargs):
+            captured["url"] = url
+            captured["kwargs"] = kwargs
+            return object()
+
+        _build_store_with(
+            "https://example.com/file.tif", fake_from_url, skip_signature=False
+        )
+        assert "skip_signature" not in captured["kwargs"]

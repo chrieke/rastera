@@ -82,8 +82,15 @@ def _apply_s3_defaults(store_kwargs: dict[str, Any], uri: str) -> None:
     ``skip_signature=False`` — this will automatically set up a
     ``Boto3CredentialProvider`` so that AWS SSO, profiles, and all other
     boto3-supported credential sources work transparently.
+
+    For non-S3 URIs, ``skip_signature`` is stripped so it does not leak
+    through to backends that would reject it (e.g. LocalFileSystem).
     """
     if not _is_s3_uri(uri):
+        # skip_signature is S3-only and would be rejected by non-S3
+        # backends (e.g. LocalFileSystem). Other cross-backend kwargs
+        # like region/credential_provider/config are left alone.
+        store_kwargs.pop("skip_signature", None)
         return
     region = _detect_region(uri)
     if region is not None:
@@ -132,10 +139,10 @@ def _build_store_with(uri: str, from_url_fn: Any, **store_kwargs: Any) -> Any:
     Accepts any ``from_url`` callable (e.g. ``async_tiff.store.from_url``
     or ``obstore.store.from_url``) so the same logic serves both backends.
     """
+    _apply_s3_defaults(store_kwargs, uri)
     local_path = _resolve_local_path(uri)
     if local_path is not None:
         return from_url_fn(local_path.parent.as_uri(), **store_kwargs)
-    _apply_s3_defaults(store_kwargs, uri)
     return from_url_fn(_bucket_url(uri), **store_kwargs)
 
 

@@ -589,13 +589,13 @@ dependencies = [
     { name = "affine" },
     { name = "async-geotiff" },
     { name = "numpy" },
+    { name = "obstore" },
     { name = "pyproj" },
 ]
 
 [package.optional-dependencies]
 index = [
     { name = "geopandas" },
-    { name = "obstore" },
     { name = "pyarrow" },
 ]
 
@@ -613,7 +613,7 @@ requires-dist = [
     { name = "async-geotiff", specifier = ">=0.4.0" },
     { name = "geopandas", marker = "extra == 'index'", specifier = ">=1.0.0" },
     { name = "numpy", specifier = ">=2.2.6" },
-    { name = "obstore", marker = "extra == 'index'", specifier = ">=0.9.0" },
+    { name = "obstore", specifier = ">=0.9.0" },
     { name = "pyarrow", marker = "extra == 'index'", specifier = ">=18.0.0" },
     { name = "pyproj", specifier = ">=3.7.1" },
 ]
