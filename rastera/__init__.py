@@ -19,7 +19,6 @@ __all__ = [
 
 try:
     import geopandas  # noqa: F401
-    import obstore  # noqa: F401
     import pyarrow  # noqa: F401
 except ImportError:
     pass

@@ -12,11 +12,12 @@ dependencies = [
     "affine>=2.4.0",
     "async-geotiff>=0.4.0",
     "numpy>=2.2.6",
+    "obstore>=0.9.0",
     "pyproj>=3.7.1",
 ]
 
 [project.optional-dependencies]
-index = ["geopandas>=1.0.0", "obstore>=0.9.0", "pyarrow>=18.0.0"]
+index = ["geopandas>=1.0.0", "pyarrow>=18.0.0"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
