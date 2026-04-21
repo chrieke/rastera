@@ -78,8 +78,22 @@ class TestBucketUrl:
         uri = "https://bucket.s3.us-east-1.amazonaws.com/key/file.tif"
         assert _bucket_url(uri) == "https://bucket.s3.us-east-1.amazonaws.com"
 
-    def test_fallback(self):
-        assert _bucket_url("/local/path") == "/local/path"
+    def test_local_path_returns_parent_uri(self, tmp_path):
+        f = tmp_path / "a.tif"
+        f.write_bytes(b"")
+        assert _bucket_url(str(f)) == tmp_path.resolve().as_uri()
+
+    def test_local_siblings_share_bucket(self, tmp_path):
+        a = tmp_path / "a.tif"
+        b = tmp_path / "b.tif"
+        a.write_bytes(b"")
+        b.write_bytes(b"")
+        assert _bucket_url(str(a)) == _bucket_url(str(b))
+
+    def test_file_uri_returns_parent_uri(self, tmp_path):
+        f = tmp_path / "a.tif"
+        f.write_bytes(b"")
+        assert _bucket_url(f.as_uri()) == tmp_path.resolve().as_uri()
 
 
 # ── _resolve_local_path ─────────────────────────────────────────────────

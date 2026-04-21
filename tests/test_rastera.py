@@ -135,6 +135,25 @@ class TestOpen:
                 ]
             )
 
+    @pytest.mark.asyncio
+    @patch("rastera.reader.GeoTIFF")
+    @patch("rastera.store.from_url")
+    async def test_open_many_accepts_sibling_local_paths(
+        self, mock_from_url: Any, mock_geotiff_cls: Any, tmp_path
+    ):
+        """Sibling local paths share a parent-dir bucket and must not be rejected."""
+        a = tmp_path / "a.tif"
+        b = tmp_path / "b.tif"
+        a.write_bytes(b"")
+        b.write_bytes(b"")
+        mock_from_url.return_value = MagicMock()
+        mock_geotiff_cls.open = AsyncMock(return_value=make_mock_geotiff())
+
+        srcs = await rastera.open([str(a), str(b)], cache=False)
+
+        assert len(srcs) == 2
+        mock_from_url.assert_called_once_with(tmp_path.resolve().as_uri())
+
 
 # ── meta_overrides ──────────────────────────────────────────────────────
 
