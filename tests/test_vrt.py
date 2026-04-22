@@ -542,6 +542,27 @@ class TestDispatch:
         assert result is sentinel
 
     @pytest.mark.asyncio
+    async def test_open_many_forwards_store_kwargs_to_vrt(self):
+        """List-open must forward store_kwargs so _open_vrt can rebuild its
+        obstore with the caller's credentials/region, not empty defaults."""
+        sentinel = MagicMock(spec=_VRTDataset)
+        with (
+            patch(
+                "rastera.vrt._open_vrt", new=AsyncMock(return_value=sentinel)
+            ) as mock_open_vrt,
+            patch("rastera.reader._build_store"),
+        ):
+            await rastera.open(
+                ["s3://bucket/a.vrt", "s3://bucket/b.vrt"],
+                skip_signature=False,
+                region="eu-north-1",
+            )
+        assert mock_open_vrt.await_count == 2
+        for call in mock_open_vrt.await_args_list:
+            assert call.kwargs["skip_signature"] is False
+            assert call.kwargs["region"] == "eu-north-1"
+
+    @pytest.mark.asyncio
     async def test_non_vrt_does_not_dispatch(self):
         """Non-`.vrt` URIs never reach _open_vrt."""
         gt = make_mock_geotiff()

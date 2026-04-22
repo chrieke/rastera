@@ -478,6 +478,7 @@ async def _open_many(
                     prefetch=prefetch,
                     cache=cache,
                     meta_overrides=meta_overrides,
+                    **store_kwargs,
                 )
                 for u in uris
             )
