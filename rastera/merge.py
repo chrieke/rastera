@@ -94,7 +94,7 @@ async def merge(
     base_gt = base._geotiff
 
     # Validate + resolve count; keep original band_indices for cog.read() calls.
-    n_out_bands = len(normalize_band_indices(band_indices, base_gt.count))
+    n_out_bands = len(normalize_band_indices(band_indices, base.count))
 
     # Decide whether we need the reprojected merge path.
     all_same_crs = all(cog._crs_epsg == base._crs_epsg for cog in cogs[1:])
@@ -162,7 +162,7 @@ async def merge(
             sub_bboxes.append((cog, sub_bbox))
 
     async def _read_native_bands(cog: AsyncGeoTIFF, sb: BBox) -> RasterArray:
-        indices = normalize_band_indices(band_indices, cog._geotiff.count)
+        indices = normalize_band_indices(band_indices, cog.count)
         return await cog._read_native(bbox=sb, band_indices=indices)
 
     out_data = await _gather_and_paste(
@@ -262,7 +262,7 @@ async def _merge_reprojected(
                 src_res = res * (cog_bounds_native.width / cog_bounds_target.width)
             overview = cog._best_overview_for_resolution(src_res)
 
-        indices = normalize_band_indices(band_indices, cog._geotiff.count)
+        indices = normalize_band_indices(band_indices, cog.count)
         native = await cog._read_native(
             bbox=read_bbox,
             band_indices=indices,
@@ -477,7 +477,7 @@ def _require_compatible_merge_inputs(cogs: Sequence[AsyncGeoTIFF]) -> None:
         t = cog._geotiff.transform
         if cog._crs_epsg != base._crs_epsg:
             raise ValueError("All GeoTIFFs must share the same CRS EPSG")
-        if cog._geotiff.count != base._geotiff.count:
+        if cog.count != base.count:
             raise ValueError("All GeoTIFFs must share the same band count")
         if not math.isclose(float(t.a), scale_x):
             raise ValueError("All GeoTIFFs must share the same pixel width")

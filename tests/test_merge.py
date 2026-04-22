@@ -83,6 +83,7 @@ def _make_cog(
     cog._crs_epsg = crs
     cog._nodata = nodata
     cog.overviews = []
+    cog.count = bands
     cog.read = AsyncMock()
     return cog
 

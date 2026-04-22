@@ -63,6 +63,11 @@ class AsyncGeoTIFF:
             (o.width, o.height) for o in geotiff.overviews
         ]
 
+    @property
+    def count(self) -> int:
+        """Number of bands exposed by this dataset."""
+        return self._geotiff.count
+
     def _best_overview_for_resolution(self, target_resolution: float):
         """Return the Overview whose resolution is closest to *target_resolution*
         without being coarser. Returns None to use full resolution."""
@@ -106,6 +111,18 @@ class AsyncGeoTIFF:
             **store_kwargs: Extra keyword arguments forwarded to ``from_url``
                 (e.g. ``region``, ``skip_signature``, ``request_payer``).
         """
+        if uri.lower().endswith(".vrt"):
+            from .vrt import _open_vrt
+
+            return await _open_vrt(
+                uri,
+                store=store,
+                prefetch=prefetch,
+                cache=cache,
+                meta_overrides=meta_overrides,
+                **store_kwargs,
+            )
+
         if cache:
             gt = get_cached_geotiff(uri)
             if gt is not None:

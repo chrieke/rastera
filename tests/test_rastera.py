@@ -204,9 +204,7 @@ class TestMetaOverrides:
         mock_from_url.return_value = MagicMock()
         mock_geotiff_cls.open = AsyncMock(return_value=gt)
 
-        obj = await rastera.open(
-            "s3://bucket/key.tif", meta_overrides={"crs": 3006}
-        )
+        obj = await rastera.open("s3://bucket/key.tif", meta_overrides={"crs": 3006})
         assert isinstance(obj, AsyncGeoTIFF)
         assert obj._crs_epsg == 3006
 

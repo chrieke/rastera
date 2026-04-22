@@ -6,7 +6,7 @@
 - Optional persisted header cache (geoparquet) for ~6x faster opens
 - Built on [async-geotiff](https://github.com/developmentseed/async-geotiff) handling GeoTIFF parsing, async tile fetching, request coalescing, and Rust-native decompression
 
-**Note:** Only COGs & tiled GeoTIFFs are supported. Stripped (non-tiled) TIFFs will not work.
+**Note:** Only COGs & tiled GeoTIFFs are supported. Stripped (non-tiled) TIFFs will not work. Limited VRT support (single source band stacks, all sources spatially aligned).
 
 ### Read a single COG
 
