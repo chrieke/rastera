@@ -73,5 +73,5 @@ reportUnnecessaryTypeIgnoreComment = "error"
 reportMissingTypeArgument = "error"
 reportDeprecated = "error"
 
-[tool.setuptools]
-packages = ["rastera"]
+[tool.setuptools.packages.find]
+include = ["rastera*"]
