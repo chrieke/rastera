@@ -123,6 +123,22 @@ class AsyncGeoTIFF:
                 **store_kwargs,
             )
 
+        if uri.lower().endswith(".xml"):
+            from .formats.dimap import _maybe_open_dimap
+
+            dimap_ds = await _maybe_open_dimap(
+                uri,
+                store=store,
+                prefetch=prefetch,
+                cache=cache,
+                meta_overrides=meta_overrides,
+                **store_kwargs,
+            )
+            if dimap_ds is not None:
+                return dimap_ds
+            # Non-DIMAP .xml falls through — the normal TIFF open below
+            # will surface the "unexpected magic bytes" error.
+
         if cache:
             gt = get_cached_geotiff(uri)
             if gt is not None:

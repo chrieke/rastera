@@ -11,8 +11,8 @@ from async_geotiff import RasterArray
 
 import rastera
 from rastera.reader import AsyncGeoTIFF
+from rastera.store import _fetch_descriptor_bytes
 from rastera.vrt import (
-    _fetch_vrt_bytes,
     _open_vrt,
     _parse_vrt_xml,
     _resolve_source_uri,
@@ -208,7 +208,7 @@ class TestOpenVRT:
 
         with (
             patch(
-                "rastera.vrt._fetch_vrt_bytes",
+                "rastera.vrt._fetch_descriptor_bytes",
                 new=AsyncMock(return_value=RGBNIR_VRT),
             ),
             patch.object(AsyncGeoTIFF, "open", side_effect=fake_open) as mock_open,
@@ -236,7 +236,7 @@ class TestOpenVRT:
 
         with (
             patch(
-                "rastera.vrt._fetch_vrt_bytes",
+                "rastera.vrt._fetch_descriptor_bytes",
                 new=AsyncMock(return_value=RGBNIR_VRT),
             ),
             patch.object(AsyncGeoTIFF, "open", side_effect=fake_open) as mock_open,
@@ -249,6 +249,73 @@ class TestOpenVRT:
         assert ds._crs_epsg == 3006
         for src, _ in ds._band_sources:
             assert src._crs_epsg == 3006
+
+    @pytest.mark.asyncio
+    async def test_vrt_with_dimap_source_routes_through_detection(self):
+        """When a VRT's <SourceFilename> points to a DIMAP .XML, the chain
+        VRT → AsyncGeoTIFF.open → .xml branch → _maybe_open_dimap must
+        just work — no special casing in _open_vrt_source."""
+        from tests.formats.test_dimap import PNEO_DIMAP  # small DIMAP fixture
+
+        vrt_with_xml_source = RGBNIR_VRT.replace(
+            b"/vsis3/bucket/rgb.tif", b"/vsis3/bucket/DIM_PNEO.XML"
+        ).replace(
+            b"/vsis3/bucket/nir.tif", b"/vsis3/bucket/DIM_PNEO.XML"
+        )
+
+        from tests.formats.test_dimap import _patch_sniff
+
+        with (
+            patch(
+                "rastera.vrt._fetch_descriptor_bytes",
+                new=AsyncMock(return_value=vrt_with_xml_source),
+            ),
+            patch(
+                "rastera.formats.dimap._fetch_descriptor_bytes",
+                new=AsyncMock(return_value=PNEO_DIMAP),
+            ),
+            _patch_sniff(),
+        ):
+            ds = await _open_vrt("s3://bucket/v.vrt")
+
+        assert isinstance(ds, _VRTDataset)
+        # Both VRT sources resolved to the same DIMAP descriptor → one
+        # _DIMAPDataset instance shared across all four VRT bands.
+        assert len({id(src) for src, _ in ds._band_sources}) == 1
+        from rastera.formats.dimap import _DIMAPDataset
+        assert isinstance(ds._band_sources[0][0], _DIMAPDataset)
+
+    @pytest.mark.asyncio
+    async def test_non_tiff_source_raises_informative_error(self):
+        """A VRT source that isn't a TIFF (e.g. an Airbus DIMAP .XML) must
+        produce an error that names both URIs and hints at the cause —
+        not the bare async_tiff ``unexpected magic bytes`` message."""
+
+        class AsyncTiffException(Exception):
+            pass
+
+        # Match what async_tiff does at runtime: the exception's __module__
+        # claims "async_tiff" even though the class is not importable from
+        # there. _open_vrt_source keys off that combo.
+        AsyncTiffException.__module__ = "async_tiff"
+
+        async def fake_open(uri: str, **_: Any) -> AsyncGeoTIFF:
+            raise AsyncTiffException('General error: unexpected magic bytes b"<?"')
+
+        with (
+            patch(
+                "rastera.vrt._fetch_descriptor_bytes",
+                new=AsyncMock(return_value=RGBNIR_VRT),
+            ),
+            patch.object(AsyncGeoTIFF, "open", side_effect=fake_open),
+            pytest.raises(ValueError) as exc_info,
+        ):
+            await _open_vrt("s3://bucket/v.vrt")
+
+        msg = str(exc_info.value)
+        assert "s3://bucket/v.vrt" in msg
+        assert "rgb.tif" in msg or "nir.tif" in msg
+        assert "DIMAP" in msg
 
 
 class TestVRTRead:
@@ -576,7 +643,7 @@ class TestDispatch:
         mock_open_vrt.assert_not_called()
 
 
-# ── _fetch_vrt_bytes for local paths ────────────────────────────────────────
+# ── _fetch_descriptor_bytes for local paths ─────────────────────────────────
 
 
 class TestFetchLocal:
@@ -584,5 +651,5 @@ class TestFetchLocal:
     async def test_local_file(self, tmp_path: Path):
         vrt = tmp_path / "x.vrt"
         vrt.write_bytes(RGBNIR_VRT)
-        data = await _fetch_vrt_bytes(str(vrt))
+        data = await _fetch_descriptor_bytes(str(vrt))
         assert data == RGBNIR_VRT

@@ -5,8 +5,15 @@
 - `read` and `merge` (multi-file, cross-crs) with `target_crs`, `target_resolution`, `bbox`, `window`
 - Optional persisted header cache (geoparquet) for ~6x faster opens
 - Built on [async-geotiff](https://github.com/developmentseed/async-geotiff) handling GeoTIFF parsing, async tile fetching, request coalescing, and Rust-native decompression
+- Limited VRT & DIMAP support
 
-**Note:** Only COGs & tiled GeoTIFFs are supported. Stripped (non-tiled) TIFFs will not work. Limited VRT support (single source band stacks, all sources spatially aligned).
+**Note:** Only COGs & tiled GeoTIFFs are supported. Stripped (non-tiled) TIFFs will not work.
+
+**VRT TODO — band-level features ignored.** The VRT parser currently reads only `<SourceFilename>` + `<SourceBand>` and inherits everything else from the first source. The following are silently dropped:
+
+- `<VRTRasterBand>`: `NoDataValue`, `ColorInterp`, `Description`, `dataType`
+- `<SimpleSource>`: `NODATA`, `SrcRect`, `DstRect`
+- `<ComplexSource>` (any variant): rejected with `NotImplementedError`
 
 ### Read a single COG
 

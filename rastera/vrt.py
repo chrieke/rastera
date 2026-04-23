@@ -12,23 +12,18 @@ favour of the first source's metadata. More complex VRT features
 from __future__ import annotations
 
 import asyncio
-import posixpath
 import xml.etree.ElementTree as ET
 from collections.abc import Sequence
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse, urlunparse
 
 import numpy as np
-import obstore
 from async_geotiff import RasterArray, Window
-from obstore.store import from_url as obstore_from_url
 from pyproj import CRS
 
 from .geo import BBox, normalize_band_indices
 from .reader import AsyncGeoTIFF, MetaOverrides, _make_output_array
-from .store import _build_store_with, _obstore_key, _resolve_local_path
+from .store import _fetch_descriptor_bytes, _join_relative_uri
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,14 +53,15 @@ async def _open_vrt(
     ``store_kwargs`` — because the async-tiff and obstore store types are
     not interchangeable.
     """
-    xml_bytes = await _fetch_vrt_bytes(uri, **store_kwargs)
+    xml_bytes = await _fetch_descriptor_bytes(uri, **store_kwargs)
     bands = _parse_vrt_xml(xml_bytes, uri)
 
     unique_uris = list(dict.fromkeys(b.source_uri for b in bands))
     sources = await asyncio.gather(
         *(
-            AsyncGeoTIFF.open(
+            _open_vrt_source(
                 u,
+                uri,
                 store=store,
                 prefetch=prefetch,
                 cache=cache,
@@ -253,33 +249,41 @@ def _resolve_source_uri(filename: str, relative_to_vrt: bool, vrt_uri: str) -> s
         return f"{scheme}://{bucket}/{key}"
 
     if relative_to_vrt:
-        return _join_relative(vrt_uri, filename)
+        return _join_relative_uri(vrt_uri, filename)
 
     return filename
 
 
-def _join_relative(vrt_uri: str, relative: str) -> str:
-    """Resolve *relative* against the VRT URI's parent directory."""
-    local = _resolve_local_path(vrt_uri)
-    if local is not None:
-        return str((local.parent / relative).resolve())
+async def _open_vrt_source(
+    source_uri: str, vrt_uri: str, **open_kwargs: Any
+) -> AsyncGeoTIFF:
+    """Open one VRT source, rewrapping async_tiff failures with VRT context.
 
-    parsed = urlparse(vrt_uri)
-    parent = posixpath.dirname(parsed.path)
-    joined = posixpath.normpath(posixpath.join(parent, relative))
-    return urlunparse(parsed._replace(path=joined))
-
-
-async def _fetch_vrt_bytes(uri: str, **store_kwargs: Any) -> bytes:
-    """Fetch the full VRT object via obstore."""
-    local = _resolve_local_path(uri)
-    if local is not None:
-        return Path(local).read_bytes()
-
-    store = _build_store_with(uri, obstore_from_url, **store_kwargs)
-    key = _obstore_key(uri)
-    result = await obstore.get_async(store, key)
-    return bytes(await result.bytes_async())
+    ``AsyncGeoTIFF.open`` already routes recognized descriptor formats
+    (currently DIMAP) into their own readers. Anything else that isn't
+    a TIFF lands here as a bare ``AsyncTiffException`` that names
+    neither the source URI nor the VRT — we catch that by class name
+    (it is not importable from ``async_tiff``) and re-raise with
+    context so the user learns which VRT + which source failed.
+    """
+    try:
+        return await AsyncGeoTIFF.open(source_uri, **open_kwargs)
+    except Exception as e:
+        cls = type(e)
+        if cls.__module__ != "async_tiff" or cls.__name__ != "AsyncTiffException":
+            raise
+        msg = str(e)
+        hint = ""
+        if "magic bytes" in msg and ("<" in msg or "xml" in msg.lower()):
+            hint = (
+                " Source looks like XML, not a TIFF — possibly an "
+                "unrecognized GDAL descriptor format (rastera currently "
+                "auto-detects DIMAP only)."
+            )
+        raise ValueError(
+            f"VRT {vrt_uri!r} references source {source_uri!r} that could "
+            f"not be opened as a TIFF: {msg}.{hint}"
+        ) from e
 
 
 async def _dispatch_source_reads(
@@ -316,13 +320,13 @@ async def _dispatch_source_reads(
     )
 
     first = results[0]
-    first_data: np.ndarray[Any, Any] = first.data  # type: ignore[reportUnknownMemberType]
+    first_data: np.ndarray[Any, Any] = first.data
     out_data = np.empty(
         (len(vrt_indices), first.height, first.width),
         dtype=first_data.dtype,
     )
     for (_, entries), result in zip(group_list, results):
-        res_data: np.ndarray[Any, Any] = result.data  # type: ignore[reportUnknownMemberType]
+        res_data: np.ndarray[Any, Any] = result.data
         if res_data.shape[1:] != first_data.shape[1:]:
             raise ValueError(
                 "VRT sub-reads returned mismatched shapes; sources may not "

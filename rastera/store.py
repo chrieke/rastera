@@ -21,12 +21,15 @@ back to unsigned access silently.
 
 from __future__ import annotations
 
+import posixpath
 import re
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlunparse
 
+import obstore
 from async_tiff.store import from_url  # type: ignore[reportMissingImports]
+from obstore.store import from_url as obstore_from_url
 
 _DEFAULT_REGION = "us-west-2"
 _S3_REGION_RE = re.compile(r"[./]s3[.-]([a-z0-9-]+)\.amazonaws\.com")
@@ -174,6 +177,36 @@ def _resolve_local_path(uri: str) -> Path | None:
     if parsed.scheme not in ("", "file") or _is_s3_uri(uri):
         return None
     return Path(parsed.path if parsed.scheme == "file" else uri).resolve()
+
+
+async def _fetch_descriptor_bytes(uri: str, **store_kwargs: Any) -> bytes:
+    """Fetch a full XML descriptor object (VRT or DIMAP) via obstore,
+    with a filesystem fast-path for local paths. Shared by the VRT and
+    DIMAP readers — both just GET the whole document once at open time."""
+    local = _resolve_local_path(uri)
+    if local is not None:
+        return Path(local).read_bytes()
+    store = _build_store_with(uri, obstore_from_url, **store_kwargs)
+    key = _obstore_key(uri)
+    result = await obstore.get_async(store, key)
+    return bytes(await result.bytes_async())
+
+
+def _join_relative_uri(base_uri: str, relative: str) -> str:
+    """Resolve *relative* against *base_uri*'s parent directory. Local
+    paths are joined via pathlib; remote URIs via posix path normalization.
+
+    Callers that need to recognize absolute paths or URIs should do that
+    check themselves before invoking — this helper always treats its
+    input as relative.
+    """
+    local = _resolve_local_path(base_uri)
+    if local is not None:
+        return str((local.parent / relative).resolve())
+    parsed = urlparse(base_uri)
+    parent = posixpath.dirname(parsed.path)
+    joined = posixpath.normpath(posixpath.join(parent, relative))
+    return urlunparse(parsed._replace(path=joined))
 
 
 def _obstore_key(uri: str) -> str:
