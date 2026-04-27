@@ -12,6 +12,7 @@ from pyproj import CRS, Transformer
 
 from .geo import (
     BBox,
+    WindowOutOfRangeError,
     _affine_apply,
     _normalize_crs,
     bounds_from_transform,
@@ -344,7 +345,12 @@ async def _gather_and_paste(
     )
 
     for cog, sub_bbox in contributing:
-        arr = await read_fn(cog, sub_bbox)
+        try:
+            arr = await read_fn(cog, sub_bbox)
+        except WindowOutOfRangeError:
+            # Sub-pixel sliver: BBox.intersect accepted the overlap but the
+            # rounded read window is zero. No pixel contribution; skip.
+            continue
 
         slices = compute_paste_slices(
             src=arr,

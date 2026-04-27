@@ -8,7 +8,7 @@ import pytest
 from affine import Affine
 from async_geotiff import RasterArray
 
-from rastera.geo import BBox, bounds_from_transform
+from rastera.geo import BBox, WindowOutOfRangeError, bounds_from_transform
 from rastera.merge import (
     _mosaic_grid_from_bbox,
     _require_compatible_merge_inputs,
@@ -383,6 +383,47 @@ class TestMergeCogs:
         )
         # nodata=None with mosaic_method="last", so cog2's zeros overwrite cog1's 42s
         assert np.all(result.data == 0)  # type: ignore[reportUnknownMemberType]
+
+    async def test_subpixel_sliver_contributor_does_not_raise(self):
+        """A COG that overlaps the request bbox by < 0.5 px must not abort
+        the merge. Repro for the production failure where _read_native raises
+        ValueError("BBox does not intersect image") on a sub-pixel sliver.
+        """
+        # Two aligned COGs side by side: main covers x=[0,10], right covers
+        # x=[10,20]. Request bbox spills 0.1 m into the right COG, so
+        # BBox.intersect accepts the (10, 0, 10.1, 10) sliver but
+        # window_from_bbox rounds it to a 0-width window and raises.
+        main = _make_cog(width=10, height=10, scale=1.0, bands=1)
+        right = _make_cog(width=10, height=10, scale=1.0, bands=1, origin_x=10.0)
+
+        main_arr = np.ones((1, 10, 10), dtype=np.uint16) * 7
+        main._read_native = AsyncMock(
+            return_value=_make_array(
+                main_arr,
+                transform=Affine(1, 0, 0, 0, -1, 10),
+                geotiff=main._geotiff,
+            )
+        )
+        right._read_native = AsyncMock(
+            side_effect=WindowOutOfRangeError("BBox does not intersect image")
+        )
+
+        # Put `right` first so the sliver is read before main fills the output
+        # (otherwise mosaic_method="first" short-circuits and never reads right).
+        result = await merge(
+            [right, main],
+            bbox=BBox(0, 0, 10.1, 10),
+            bbox_crs=32632,
+            band_indices=[1],
+            target_crs=32632,
+            target_resolution=1.0,
+            snap_to_grid=True,
+        )
+        assert result.data.shape[0] == 1  # type: ignore[reportUnknownMemberType]
+        assert result.data.shape[1] == 10  # type: ignore[reportUnknownMemberType]
+        assert np.all(result.data[0, :, :10] == 7)  # type: ignore[reportUnknownMemberType]
+        right._read_native.assert_called_once()
+        main._read_native.assert_called_once()
 
 
 # ── merge: reprojected path ────────────────────────────────────────

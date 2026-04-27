@@ -6,6 +6,7 @@ from affine import Affine
 
 from rastera.geo import (
     BBox,
+    WindowOutOfRangeError,
     compute_paste_slices,
     resample_nearest,
     transform_bbox,
@@ -69,8 +70,16 @@ class TestWindow:
 
     def test_from_bbox_no_intersect(self):
         p = make_meta()
-        with pytest.raises(ValueError, match="does not intersect"):
+        with pytest.raises(WindowOutOfRangeError, match="does not intersect"):
             window_from_bbox(p, BBox(2000, 2000, 3000, 3000))  # type: ignore[reportArgumentType]
+
+    def test_from_bbox_subpixel_overlap_raises(self):
+        # make_meta(): 100x100 grid at 10 m/px, x in [0, 1000].
+        # bbox spans 0.1 m on x (= 0.01 px) — floor(0.01 + 0.5) = 0,
+        # so the rounded window has zero width and window_from_bbox must raise.
+        p = make_meta()
+        with pytest.raises(WindowOutOfRangeError, match="does not intersect"):
+            window_from_bbox(p, BBox(999.9, 0, 1000.0, 1000))  # type: ignore[reportArgumentType]
 
     def test_from_bbox_clamps(self):
         p = make_meta()
