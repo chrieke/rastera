@@ -10,6 +10,7 @@ from affine import Affine
 from async_geotiff import RasterArray
 from pyproj import CRS, Transformer
 
+from . import config
 from .geo import (
     BBox,
     WindowOutOfRangeError,
@@ -317,17 +318,18 @@ async def _gather_and_paste(
     read_fn: Callable[[AsyncGeoTIFF, BBox], Awaitable[RasterArray]],
     mosaic_method: Literal["first", "last"] = "first",
 ) -> np.ndarray:
-    """Read contributing COGs sequentially and paste into a single output array.
+    """Read contributing COGs and paste into a single output array.
 
     Results are pasted in input order. Overlap is resolved by ``mosaic_method``:
     ``"first"`` keeps the first valid pixel, ``"last"`` lets later COGs
     overwrite earlier ones.
 
-    TODO: consider reading all COGs concurrently via asyncio.gather and
-    pasting in order afterwards.  No threading issues (single event loop),
-    but higher peak memory since all tile data lives in memory at once.
-    The current sequential approach allows early exit for mosaic_method="first"
-    when all pixels are filled.
+    Sequential by default: async-geotiff already parallelizes COG-block reads
+    within each contributing TIFF, so an outer fan-out here multiplies the
+    in-flight HTTP request count without adding throughput on a saturated
+    link. Set ``rastera.set_concurrency(merge=N>1)`` to opt into outer
+    parallelism. For ``mosaic_method="first"`` reads run in batches of N so
+    the ``filled.all()`` early exit still triggers between batches.
     """
     out_array = np.full(
         (n_bands, dst_height, dst_width),
@@ -344,50 +346,55 @@ async def _gather_and_paste(
         else None
     )
 
-    for cog, sub_bbox in contributing:
-        try:
-            arr = await read_fn(cog, sub_bbox)
-        except WindowOutOfRangeError:
-            # Sub-pixel sliver: BBox.intersect accepted the overlap but the
-            # rounded read window is zero. No pixel contribution; skip.
-            continue
-
-        slices = compute_paste_slices(
-            src=arr,
-            dst_transform=dst_transform,
-            dst_width=dst_width,
-            dst_height=dst_height,
+    n = config._merge_concurrency
+    for i in range(0, len(contributing), n):
+        batch = contributing[i : i + n]
+        arrays = await config._gather_bounded(
+            n, [_read_or_skip(read_fn, cog, sub) for cog, sub in batch]
         )
-        if slices is None:
-            continue
-        dst_rows, dst_cols, src_rows, src_cols = slices
-        src_data: np.ndarray[Any, Any] = arr.data[:, src_rows, src_cols]  # type: ignore[reportUnknownMemberType]
+        for (cog, sub_bbox), arr in zip(batch, arrays):
+            if arr is None:
+                continue
 
-        if nodata is not None:
-            if isinstance(nodata, float) and math.isnan(nodata):
-                valid = ~np.isnan(src_data)
-            else:
-                valid = src_data != nodata
-            src_valid = np.any(valid, axis=0)
-        else:
-            src_valid = None
+            slices = compute_paste_slices(
+                src=arr,
+                dst_transform=dst_transform,
+                dst_width=dst_width,
+                dst_height=dst_height,
+            )
+            if slices is None:
+                continue
+            dst_rows, dst_cols, src_rows, src_cols = slices
+            src_data: np.ndarray[Any, Any] = arr.data[:, src_rows, src_cols]  # type: ignore[reportUnknownMemberType]
 
-        if mosaic_method == "first":
-            assert filled is not None
-            unfilled = ~filled[dst_rows, dst_cols]
-            if src_valid is not None:
-                paste_mask = unfilled & src_valid
+            if nodata is not None:
+                if isinstance(nodata, float) and math.isnan(nodata):
+                    valid = ~np.isnan(src_data)
+                else:
+                    valid = src_data != nodata
+                src_valid = np.any(valid, axis=0)
             else:
-                paste_mask = unfilled
-            np.copyto(out_array[:, dst_rows, dst_cols], src_data, where=paste_mask)
-            filled[dst_rows, dst_cols] |= paste_mask
-            if filled.all():
-                break
-        else:
-            if src_valid is not None:
-                np.copyto(out_array[:, dst_rows, dst_cols], src_data, where=src_valid)
+                src_valid = None
+
+            if mosaic_method == "first":
+                assert filled is not None
+                unfilled = ~filled[dst_rows, dst_cols]
+                if src_valid is not None:
+                    paste_mask = unfilled & src_valid
+                else:
+                    paste_mask = unfilled
+                np.copyto(out_array[:, dst_rows, dst_cols], src_data, where=paste_mask)
+                filled[dst_rows, dst_cols] |= paste_mask
             else:
-                out_array[:, dst_rows, dst_cols] = src_data
+                if src_valid is not None:
+                    np.copyto(
+                        out_array[:, dst_rows, dst_cols], src_data, where=src_valid
+                    )
+                else:
+                    out_array[:, dst_rows, dst_cols] = src_data
+
+        if mosaic_method == "first" and filled is not None and filled.all():
+            return out_array
 
     return out_array
 
@@ -521,3 +528,18 @@ def _resolve_target_crs(
             return counts.most_common(1)[0][0]
     msg = "No CRS found in any input GeoTIFF; pass target_crs explicitly."
     raise ValueError(msg)
+
+
+async def _read_or_skip(
+    read_fn: Callable[[AsyncGeoTIFF, BBox], Awaitable[RasterArray]],
+    cog: AsyncGeoTIFF,
+    sub_bbox: BBox,
+) -> RasterArray | None:
+    """Run *read_fn* and return ``None`` on the sub-pixel sliver case
+    (BBox.intersect accepted the overlap but the rounded read window
+    is zero), so callers can filter rather than wrap each call in
+    try/except."""
+    try:
+        return await read_fn(cog, sub_bbox)
+    except WindowOutOfRangeError:
+        return None

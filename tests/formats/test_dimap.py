@@ -1,5 +1,6 @@
 """Unit tests for DIMAP parser."""
 
+import asyncio
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -116,10 +117,20 @@ class TestParseDIMAP:
         tile of that group — this is what the read dispatcher needs."""
         layout = _parse_dimap_xml(PNEO_DIMAP)
         assert [b.band_id for b in layout.bands] == [
-            "R", "G", "B", "NIR", "RE", "DB",
+            "R",
+            "G",
+            "B",
+            "NIR",
+            "RE",
+            "DB",
         ]
         assert [(b.group_index, b.source_band) for b in layout.bands] == [
-            (0, 1), (0, 2), (0, 3), (1, 1), (1, 2), (1, 3),
+            (0, 1),
+            (0, 2),
+            (0, 3),
+            (1, 1),
+            (1, 2),
+            (1, 3),
         ]
 
     def test_parses_tile_paths_per_group(self):
@@ -243,8 +254,12 @@ class TestTileDecomposition:
 
     def test_window_contained_in_one_tile(self):
         layout = _grid_layout(
-            width=800, height=1000, tile_w=400, tile_h=500,
-            tile_rows=2, tile_cols=2,
+            width=800,
+            height=1000,
+            tile_w=400,
+            tile_h=500,
+            tile_rows=2,
+            tile_cols=2,
         )
         reads = _tile_decomposition(
             layout, Window(col_off=50, row_off=60, width=100, height=80)
@@ -259,15 +274,22 @@ class TestTileDecomposition:
 
     def test_window_spans_all_four_tiles(self):
         layout = _grid_layout(
-            width=800, height=1000, tile_w=400, tile_h=500,
-            tile_rows=2, tile_cols=2,
+            width=800,
+            height=1000,
+            tile_w=400,
+            tile_h=500,
+            tile_rows=2,
+            tile_cols=2,
         )
         # Centered window that straddles both the vertical and horizontal seam.
         reads = _tile_decomposition(
             layout, Window(col_off=350, row_off=450, width=100, height=100)
         )
         assert {(r.tile_row, r.tile_col) for r in reads} == {
-            (1, 1), (1, 2), (2, 1), (2, 2),
+            (1, 1),
+            (1, 2),
+            (2, 1),
+            (2, 2),
         }
         # Upper-left piece: 50x50, pasted at (0,0).
         ul = next(r for r in reads if (r.tile_row, r.tile_col) == (1, 1))
@@ -288,8 +310,12 @@ class TestTileDecomposition:
         """Sanity: the per-tile dst slices cover every output pixel exactly
         once. If this fails the mosaic has seams or double-writes."""
         layout = _grid_layout(
-            width=1200, height=1500, tile_w=400, tile_h=500,
-            tile_rows=3, tile_cols=3,
+            width=1200,
+            height=1500,
+            tile_w=400,
+            tile_h=500,
+            tile_rows=3,
+            tile_cols=3,
         )
         win = Window(col_off=100, row_off=200, width=900, height=1100)
         reads = _tile_decomposition(layout, win)
@@ -304,8 +330,12 @@ class TestTileDecomposition:
         those with nodata. This is how PNEO mosaics with non-multiple dims
         terminate cleanly at the right/bottom."""
         layout = _grid_layout(
-            width=750, height=1000, tile_w=400, tile_h=500,
-            tile_rows=2, tile_cols=2,
+            width=750,
+            height=1000,
+            tile_w=400,
+            tile_h=500,
+            tile_rows=2,
+            tile_cols=2,
         )
         reads = _tile_decomposition(
             layout, Window(col_off=700, row_off=0, width=200, height=500)
@@ -314,16 +344,20 @@ class TestTileDecomposition:
         assert [(r.tile_row, r.tile_col) for r in reads] == [(1, 2)]
         (r,) = reads
         assert r.src_window.col_off == 300  # 700 - (2-1)*400
-        assert r.src_window.width == 50     # 750 - 700
-        assert r.dst_cols == slice(0, 50)   # remaining 150 px stay nodata
+        assert r.src_window.width == 50  # 750 - 700
+        assert r.dst_cols == slice(0, 50)  # remaining 150 px stay nodata
 
     def test_non_multiple_mosaic_dims_edge_tile_clipped(self):
         """Airbus DIMAPs sometimes declare NCOLS/NROWS that aren't exact
         multiples of the tile size; the edge tile is physically smaller.
         Make sure src_window never references past the real tile extent."""
         layout = _grid_layout(
-            width=950, height=1100, tile_w=400, tile_h=500,
-            tile_rows=3, tile_cols=3,
+            width=950,
+            height=1100,
+            tile_w=400,
+            tile_h=500,
+            tile_rows=3,
+            tile_cols=3,
         )
         # Full-mosaic read.
         reads = _tile_decomposition(
@@ -338,24 +372,39 @@ def _two_group_layout() -> _DIMAPLayout:
     """A 2x2 tile grid with two 3-band groups (RGB + NED), matching PNEO's
     shape but at a test-friendly size. Six virtual bands across two groups."""
     return _DIMAPLayout(
-        width=800, height=1000, crs_epsg=32633,
+        width=800,
+        height=1000,
+        crs_epsg=32633,
         transform=Affine(0.3, 0.0, 369516.0, 0.0, -0.3, 6447186.0),
         dtype=np.dtype("uint16"),
-        tile_rows=2, tile_cols=2, tile_width=400, tile_height=500,
+        tile_rows=2,
+        tile_cols=2,
+        tile_width=400,
+        tile_height=500,
         groups=(
-            _DIMAPBandGroup(tile_paths={
-                (1, 1): "RGB_R1C1.TIF", (1, 2): "RGB_R1C2.TIF",
-                (2, 1): "RGB_R2C1.TIF", (2, 2): "RGB_R2C2.TIF",
-            }),
-            _DIMAPBandGroup(tile_paths={
-                (1, 1): "NED_R1C1.TIF", (1, 2): "NED_R1C2.TIF",
-                (2, 1): "NED_R2C1.TIF", (2, 2): "NED_R2C2.TIF",
-            }),
+            _DIMAPBandGroup(
+                tile_paths={
+                    (1, 1): "RGB_R1C1.TIF",
+                    (1, 2): "RGB_R1C2.TIF",
+                    (2, 1): "RGB_R2C1.TIF",
+                    (2, 2): "RGB_R2C2.TIF",
+                }
+            ),
+            _DIMAPBandGroup(
+                tile_paths={
+                    (1, 1): "NED_R1C1.TIF",
+                    (1, 2): "NED_R1C2.TIF",
+                    (2, 1): "NED_R2C1.TIF",
+                    (2, 2): "NED_R2C2.TIF",
+                }
+            ),
         ),
         bands=(
-            _DIMAPBand("R", "Red", 0, 1), _DIMAPBand("G", "Green", 0, 2),
+            _DIMAPBand("R", "Red", 0, 1),
+            _DIMAPBand("G", "Green", 0, 2),
             _DIMAPBand("B", "Blue", 0, 3),
-            _DIMAPBand("NIR", "NIR", 1, 1), _DIMAPBand("RE", "RedEdge", 1, 2),
+            _DIMAPBand("NIR", "NIR", 1, 1),
+            _DIMAPBand("RE", "RedEdge", 1, 2),
             _DIMAPBand("DB", "DeepBlue", 1, 3),
         ),
     )
@@ -378,11 +427,14 @@ def _mock_tile_ds(fill_fn: Any) -> AsyncGeoTIFF:
         geotiff = MagicMock()
         geotiff.nodata = None
         return RasterArray(
-            data=data, mask=None,
-            width=window.width, height=window.height,
+            data=data,
+            mask=None,
+            width=window.width,
+            height=window.height,
             count=data.shape[0],
             transform=Affine(0.3, 0, 0, 0, -0.3, 0),
-            _alpha_band_idx=None, _geotiff=geotiff,
+            _alpha_band_idx=None,
+            _geotiff=geotiff,
         )
 
     ds._read_native = _read_native
@@ -416,7 +468,8 @@ class TestDIMAPRead:
             return _mock_tile_ds(
                 lambda bands, w: np.full(
                     (len(bands), w.height, w.width),
-                    100 + bands[0], dtype=np.uint16,
+                    100 + bands[0],
+                    dtype=np.uint16,
                 )
             )
 
@@ -435,15 +488,17 @@ class TestDIMAPRead:
         band 1 (group 0, src_band 1). Output must be [DB, R] — NOT sorted
         by group index. This is the test that catches "bands written in
         group-discovery order" bugs."""
+
         def factory(g: int, r: int, c: int) -> AsyncGeoTIFF:
             # Tag each value with (group*100 + source_band) so the test
             # can assert exactly which band came from which group.
             return _mock_tile_ds(
-                lambda bands, w: np.stack([
-                    np.full((w.height, w.width), g * 100 + (b + 1),
-                            dtype=np.uint16)
-                    for b in bands
-                ])
+                lambda bands, w: np.stack(
+                    [
+                        np.full((w.height, w.width), g * 100 + (b + 1), dtype=np.uint16)
+                        for b in bands
+                    ]
+                )
             )
 
         ds = self._make_ds(factory)
@@ -462,6 +517,7 @@ class TestDIMAPRead:
     async def test_cross_tile_stitch(self):
         """Window that straddles the seam between tile (1,1) and (1,2)
         for a single group → two tile reads, correctly pasted."""
+
         # left half fills with 10, right half with 20; stitched mosaic
         # must have exactly that split at the seam.
         def factory(g: int, r: int, c: int) -> AsyncGeoTIFF:
@@ -485,9 +541,85 @@ class TestDIMAPRead:
         np.testing.assert_array_equal(data[0, :, 20:], 20)
 
     @pytest.mark.asyncio
+    async def test_full_extent_all_groups_sequential(self):
+        """Full-extent read across both groups (4 tiles × 2 groups = 8 tile
+        reads) must complete and return correctly stitched output. Tracks
+        peak in-flight count across an `await asyncio.sleep(0)` yield to
+        assert outer dispatch stays sequential — protects against a future
+        regression that reintroduces outer asyncio.gather and re-creates
+        the HTTP burst that motivated the sequential design."""
+        read_order: list[tuple[int, int, int]] = []
+        in_flight = 0
+        max_in_flight = 0
+
+        def factory(g: int, r: int, c: int) -> AsyncGeoTIFF:
+            ds = MagicMock(spec=AsyncGeoTIFF)
+
+            async def _read_native(
+                *, window: Window, band_indices: list[int], **_: Any
+            ) -> RasterArray:
+                nonlocal in_flight, max_in_flight
+                in_flight += 1
+                max_in_flight = max(max_in_flight, in_flight)
+                # Yield to the loop so any concurrently-scheduled tile
+                # reads get a chance to enter and bump in_flight.
+                await asyncio.sleep(0)
+                read_order.append((g, r, c))
+                in_flight -= 1
+                # Tag each pixel with (group, tile_row, tile_col, src_band)
+                # so we can assert correct paste positions afterwards.
+                data = np.stack(
+                    [
+                        np.full(
+                            (window.height, window.width),
+                            g * 1000 + r * 100 + c * 10 + (b + 1),
+                            dtype=np.uint16,
+                        )
+                        for b in band_indices
+                    ]
+                )
+                geotiff = MagicMock()
+                geotiff.nodata = None
+                return RasterArray(
+                    data=data,
+                    mask=None,
+                    width=window.width,
+                    height=window.height,
+                    count=data.shape[0],
+                    transform=Affine(0.3, 0, 0, 0, -0.3, 0),
+                    _alpha_band_idx=None,
+                    _geotiff=geotiff,
+                )
+
+            ds._read_native = _read_native
+            return ds
+
+        ds = self._make_ds(factory)
+        arr = await ds._read_native(band_indices=list(range(6)))
+        data: np.ndarray[Any, Any] = arr.data  # type: ignore[reportUnknownMemberType]
+
+        layout = _two_group_layout()
+        assert data.shape == (6, layout.height, layout.width)
+        # 8 distinct tile reads (4 tiles × 2 groups), each exactly once.
+        assert len(read_order) == 8
+        assert set(read_order) == {
+            (g, r, c) for g in (0, 1) for r in (1, 2) for c in (1, 2)
+        }
+        # Outer dispatch must be sequential: only one tile read in flight
+        # at a time across the asyncio.sleep(0) yield point.
+        assert max_in_flight == 1
+        # Spot-check a corner pixel from each (group, tile) lands in the
+        # right output slot. RGB band 0 (group 0, src_band 1) at tile (2,2)
+        # → tag 0*1000 + 2*100 + 2*10 + 1 = 221.
+        assert data[0, layout.height - 1, layout.width - 1] == 221
+        # NED band 5 (group 1, src_band 3) at tile (1,1) → 1*1000 + 100 + 10 + 3 = 1113.
+        assert data[5, 0, 0] == 1113
+
+    @pytest.mark.asyncio
     async def test_window_past_mosaic_edge_fills_nodata(self):
         """Window extending past the mosaic's right edge → the out-of-extent
         pixels must be filled with nodata (0 by default)."""
+
         def factory(g: int, r: int, c: int) -> AsyncGeoTIFF:
             return _mock_tile_ds(
                 lambda bands, w: np.full(
@@ -504,26 +636,32 @@ class TestDIMAPRead:
         data: np.ndarray[Any, Any] = arr.data  # type: ignore[reportUnknownMemberType]
         assert data.shape == (1, 10, 100)
         np.testing.assert_array_equal(data[0, :, :50], 42)  # inside mosaic
-        np.testing.assert_array_equal(data[0, :, 50:], 0)   # nodata fill
+        np.testing.assert_array_equal(data[0, :, 50:], 0)  # nodata fill
 
     @pytest.mark.asyncio
     async def test_read_rejects_use_overviews(self):
         """DIMAP per-tile overviews cannot safely mix across tiles; the
         public ``read`` must refuse rather than silently produce shape-
         mismatched output."""
-        ds = self._make_ds(lambda g, r, c: _mock_tile_ds(
-            lambda bands, w: np.zeros((len(bands), w.height, w.width),
-                                      dtype=np.uint16)
-        ))
+        ds = self._make_ds(
+            lambda g, r, c: _mock_tile_ds(
+                lambda bands, w: np.zeros(
+                    (len(bands), w.height, w.width), dtype=np.uint16
+                )
+            )
+        )
         with pytest.raises(NotImplementedError, match="use_overviews"):
             await ds.read(use_overviews=True)
 
     @pytest.mark.asyncio
     async def test_read_native_rejects_overview(self):
-        ds = self._make_ds(lambda g, r, c: _mock_tile_ds(
-            lambda bands, w: np.zeros((len(bands), w.height, w.width),
-                                      dtype=np.uint16)
-        ))
+        ds = self._make_ds(
+            lambda g, r, c: _mock_tile_ds(
+                lambda bands, w: np.zeros(
+                    (len(bands), w.height, w.width), dtype=np.uint16
+                )
+            )
+        )
         with pytest.raises(NotImplementedError, match="overview"):
             await ds._read_native(overview=MagicMock())
 
@@ -657,19 +795,22 @@ class TestResolveTileURI:
     in case a future delivery uses them."""
 
     def test_relative_href_resolves_against_s3_dimap(self):
-        assert _resolve_tile_uri(
-            "RGB_R1C1.TIF", "s3://bucket/prod/DIM_PNEO.XML"
-        ) == "s3://bucket/prod/RGB_R1C1.TIF"
+        assert (
+            _resolve_tile_uri("RGB_R1C1.TIF", "s3://bucket/prod/DIM_PNEO.XML")
+            == "s3://bucket/prod/RGB_R1C1.TIF"
+        )
 
     def test_absolute_uri_href_passthrough(self):
-        assert _resolve_tile_uri(
-            "s3://other/tile.tif", "s3://bucket/DIM_PNEO.XML"
-        ) == "s3://other/tile.tif"
+        assert (
+            _resolve_tile_uri("s3://other/tile.tif", "s3://bucket/DIM_PNEO.XML")
+            == "s3://other/tile.tif"
+        )
 
     def test_absolute_path_href_passthrough(self):
-        assert _resolve_tile_uri(
-            "/mnt/data/tile.tif", "/mnt/data/DIM_PNEO.XML"
-        ) == "/mnt/data/tile.tif"
+        assert (
+            _resolve_tile_uri("/mnt/data/tile.tif", "/mnt/data/DIM_PNEO.XML")
+            == "/mnt/data/tile.tif"
+        )
 
 
 class TestCRSParsing:
@@ -710,11 +851,12 @@ class TestReadDefaults:
 
         async def _get_tile(g: int, r: int, c: int) -> AsyncGeoTIFF:
             return _mock_tile_ds(
-                lambda bands, w, g=g: np.stack([
-                    np.full((w.height, w.width), g * 100 + (b + 1),
-                            dtype=np.uint16)
-                    for b in bands
-                ])
+                lambda bands, w, g=g: np.stack(
+                    [
+                        np.full((w.height, w.width), g * 100 + (b + 1), dtype=np.uint16)
+                        for b in bands
+                    ]
+                )
             )
 
         ds._get_tile = _get_tile  # type: ignore[assignment]
@@ -736,8 +878,10 @@ class TestReadDefaults:
         first_tile = MagicMock(spec=AsyncGeoTIFF)
         first_tile._nodata = 65535
         ds = _DIMAPDataset(
-            "/fake/DIM.xml", _two_group_layout(),
-            first_tile=first_tile, first_tile_key=(0, 1, 1),
+            "/fake/DIM.xml",
+            _two_group_layout(),
+            first_tile=first_tile,
+            first_tile_key=(0, 1, 1),
         )
 
         async def _get_tile(g: int, r: int, c: int) -> AsyncGeoTIFF:
@@ -755,3 +899,57 @@ class TestReadDefaults:
         data: np.ndarray[Any, Any] = arr.data  # type: ignore[reportUnknownMemberType]
         np.testing.assert_array_equal(data[0, :, :50], 42)
         np.testing.assert_array_equal(data[0, :, 50:], 65535)
+
+
+# ── concurrency: dimap ─────────────────────────────────────────────
+
+
+@pytest.fixture
+def _reset_dimap_concurrency():
+    yield
+    import rastera
+
+    rastera.set_concurrency(merge=1, vrt=1, dimap=1)
+
+
+class TestDIMAPConcurrencyInvariance:
+    """Output across (group, tile) fan-out must match the n=1 baseline."""
+
+    def _make_ds(self) -> _DIMAPDataset:
+        layout = _two_group_layout()
+        ds = _DIMAPDataset("/fake/DIM.xml", layout)
+
+        async def _get_tile(g: int, r: int, c: int) -> AsyncGeoTIFF:
+            # Distinct, deterministic value per (group, row, col, src_band).
+            return _mock_tile_ds(
+                lambda bands, w, g=g, r=r, c=c: np.stack(
+                    [
+                        np.full(
+                            (w.height, w.width),
+                            g * 1000 + r * 100 + c * 10 + (b + 1),
+                            dtype=np.uint16,
+                        )
+                        for b in bands
+                    ]
+                )
+            )
+
+        ds._get_tile = _get_tile  # type: ignore[assignment]
+        return ds
+
+    @pytest.mark.parametrize("n", [1, 2, 8])
+    async def test_pixel_equal_across_n(self, n, _reset_dimap_concurrency):
+        import rastera
+
+        rastera.set_concurrency(dimap=1)
+        baseline = await self._make_ds()._read_native(
+            window=Window(col_off=0, row_off=0, width=800, height=1000),
+            band_indices=[0, 2, 4, 5],
+        )
+
+        rastera.set_concurrency(dimap=n)
+        result = await self._make_ds()._read_native(
+            window=Window(col_off=0, row_off=0, width=800, height=1000),
+            band_indices=[0, 2, 4, 5],
+        )
+        np.testing.assert_array_equal(result.data, baseline.data)

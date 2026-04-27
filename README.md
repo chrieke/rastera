@@ -89,6 +89,8 @@ raster_array = await rastera.merge(sources, bbox=bbox, bbox_crs=4326, target_crs
 
 `rastera.open()` also keeps an in-memory LRU cache of parsed headers within the session (default 128 entries, configurable via `set_cache_size()`), so repeated opens of the same URI skip the network fetch even without an index.
 
+By default the read path runs the *outer* fan-out across `merge` contributors, VRT sources, and DIMAP tiles sequentially — async-geotiff already parallelizes block range requests inside each source, so stacking outer concurrency on top tends to multiply the in-flight HTTP request count without adding throughput on a saturated link. Use `rastera.set_concurrency(merge=N, vrt=N, dimap=N)` to opt into outer fan-out per dispatcher; see the `set_concurrency` docstring for the per-knob trade-offs.
+
 ### Linting & type checking
 
 ```bash
