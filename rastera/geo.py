@@ -90,6 +90,10 @@ def bounds_from_transform(transform: Affine, width: int, height: int) -> BBox:
     return BBox(minx=min(x0, x1), miny=min(y0, y1), maxx=max(x0, x1), maxy=max(y0, y1))
 
 
+class WindowOutOfRangeError(ValueError):
+    """A bbox rounds to a zero-sized pixel window."""
+
+
 def window_from_bbox(
     meta: HasTransform,
     bbox: BBox | tuple[float, float, float, float],
@@ -128,7 +132,7 @@ def window_from_bbox(
 
     if width <= 0 or height <= 0:
         msg = "BBox does not intersect image"
-        raise ValueError(msg)
+        raise WindowOutOfRangeError(msg)
 
     return Window(col_off=col_off, row_off=row_off, width=width, height=height)
 
