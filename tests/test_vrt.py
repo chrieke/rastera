@@ -259,9 +259,7 @@ class TestOpenVRT:
 
         vrt_with_xml_source = RGBNIR_VRT.replace(
             b"/vsis3/bucket/rgb.tif", b"/vsis3/bucket/DIM_PNEO.XML"
-        ).replace(
-            b"/vsis3/bucket/nir.tif", b"/vsis3/bucket/DIM_PNEO.XML"
-        )
+        ).replace(b"/vsis3/bucket/nir.tif", b"/vsis3/bucket/DIM_PNEO.XML")
 
         from tests.formats.test_dimap import _patch_sniff
 
@@ -283,6 +281,7 @@ class TestOpenVRT:
         # _DIMAPDataset instance shared across all four VRT bands.
         assert len({id(src) for src, _ in ds._band_sources}) == 1
         from rastera.formats.dimap import _DIMAPDataset
+
         assert isinstance(ds._band_sources[0][0], _DIMAPDataset)
 
     @pytest.mark.asyncio
@@ -533,12 +532,22 @@ class TestMergeOnVRT:
         from rastera.merge import merge
 
         vrt_a = _vrt_with_one_source(
-            "s3://b/a.vrt", "s3://b/a.tif",
-            origin_x=0.0, width=10, height=10, scale=1.0, fill=1,
+            "s3://b/a.vrt",
+            "s3://b/a.tif",
+            origin_x=0.0,
+            width=10,
+            height=10,
+            scale=1.0,
+            fill=1,
         )
         vrt_b = _vrt_with_one_source(
-            "s3://b/b.vrt", "s3://b/b.tif",
-            origin_x=5.0, width=10, height=10, scale=1.0, fill=2,
+            "s3://b/b.vrt",
+            "s3://b/b.tif",
+            origin_x=5.0,
+            width=10,
+            height=10,
+            scale=1.0,
+            fill=2,
         )
 
         result = await merge(
@@ -569,12 +578,22 @@ class TestMergeOnVRT:
         # Natively 1.0 m/px, request 10.0 m/px to trigger the reprojected
         # path, and give each source a coarse overview so merge selects it.
         vrt_a = _vrt_with_one_source(
-            "s3://b/a.vrt", "s3://b/a.tif",
-            origin_x=0.0, width=10, height=10, scale=1.0, fill=1,
+            "s3://b/a.vrt",
+            "s3://b/a.tif",
+            origin_x=0.0,
+            width=10,
+            height=10,
+            scale=1.0,
+            fill=1,
         )
         vrt_b = _vrt_with_one_source(
-            "s3://b/b.vrt", "s3://b/b.tif",
-            origin_x=5.0, width=10, height=10, scale=1.0, fill=2,
+            "s3://b/b.vrt",
+            "s3://b/b.tif",
+            origin_x=5.0,
+            width=10,
+            height=10,
+            scale=1.0,
+            fill=2,
         )
         for vrt in (vrt_a, vrt_b):
             ov = MagicMock()
@@ -653,3 +672,45 @@ class TestFetchLocal:
         vrt.write_bytes(RGBNIR_VRT)
         data = await _fetch_descriptor_bytes(str(vrt))
         assert data == RGBNIR_VRT
+
+
+# ── concurrency: vrt ─────────────────────────────────────────────
+
+
+@pytest.fixture
+def _reset_vrt_concurrency():
+    yield
+    rastera.set_concurrency(merge=1, vrt=1, dimap=1)
+
+
+class TestVRTConcurrencyInvariance:
+    def _make_ds(self) -> _VRTDataset:
+        gt_rgb = make_mock_geotiff(count=3)
+        gt_nir = make_mock_geotiff(count=1)
+        rgb_src = AsyncGeoTIFF("s3://bucket/rgb.tif", gt_rgb)
+        nir_src = AsyncGeoTIFF("s3://bucket/nir.tif", gt_nir)
+        bands = [
+            _VRTBand("s3://bucket/rgb.tif", 1),
+            _VRTBand("s3://bucket/rgb.tif", 2),
+            _VRTBand("s3://bucket/rgb.tif", 3),
+            _VRTBand("s3://bucket/nir.tif", 1),
+        ]
+        rgb_src.read = AsyncMock(return_value=_read_result((3, 8, 8), fill=10))
+        nir_src.read = AsyncMock(return_value=_read_result((1, 8, 8), fill=99))
+        return _VRTDataset(
+            "s3://bucket/x.vrt",
+            bands,
+            {
+                "s3://bucket/rgb.tif": rgb_src,
+                "s3://bucket/nir.tif": nir_src,
+            },
+        )
+
+    @pytest.mark.parametrize("n", [1, 2, 8])
+    async def test_pixel_equal_across_n(self, n, _reset_vrt_concurrency):
+        rastera.set_concurrency(vrt=1)
+        baseline = await self._make_ds().read()
+
+        rastera.set_concurrency(vrt=n)
+        result = await self._make_ds().read()
+        np.testing.assert_array_equal(result.data, baseline.data)

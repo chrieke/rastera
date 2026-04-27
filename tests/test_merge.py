@@ -528,3 +528,92 @@ class TestResolveTargetCrs:
         cogs = [_make_cog(crs=4326)]
         assert _resolve_target_crs(cogs, "most_common") == 4326
         assert _resolve_target_crs(cogs, "first") == 4326
+
+
+# ── concurrency: merge ─────────────────────────────────────────────
+
+
+@pytest.fixture
+def _reset_merge_concurrency():
+    yield
+    import rastera
+
+    rastera.set_concurrency(merge=1, vrt=1, dimap=1)
+
+
+def _make_strip_cog(origin_x: float, value: int):
+    """A 10×10 single-band COG at (origin_x, 0..10) returning *value*."""
+    cog = _make_cog(width=10, height=10, scale=1.0, bands=1, origin_x=origin_x)
+    arr = np.ones((1, 10, 10), dtype=np.uint16) * value
+    cog._read_native = AsyncMock(
+        return_value=_make_array(
+            arr, Affine(1, 0, origin_x, 0, -1, 10), geotiff=cog._geotiff
+        )
+    )
+    return cog
+
+
+class TestMergeConcurrencyInvariance:
+    @pytest.mark.parametrize("n", [1, 2, 8])
+    @pytest.mark.parametrize("mosaic_method", ["first", "last"])
+    async def test_pixel_equal_across_n(
+        self, n, mosaic_method, _reset_merge_concurrency
+    ):
+        """Output must match the n=1 baseline pixel-for-pixel for any n."""
+        import rastera
+
+        # 5 side-by-side strips with distinct values, no overlap.
+        rastera.set_concurrency(merge=1)
+        cogs = [_make_strip_cog(i * 10.0, value=i + 1) for i in range(5)]
+        baseline = await merge(
+            cogs,
+            bbox=BBox(0, 0, 50, 10),
+            bbox_crs=32632,
+            band_indices=[1],
+            target_crs=32632,
+            target_resolution=1.0,
+            mosaic_method=mosaic_method,
+            snap_to_grid=True,
+        )
+
+        rastera.set_concurrency(merge=n)
+        cogs = [_make_strip_cog(i * 10.0, value=i + 1) for i in range(5)]
+        result = await merge(
+            cogs,
+            bbox=BBox(0, 0, 50, 10),
+            bbox_crs=32632,
+            band_indices=[1],
+            target_crs=32632,
+            target_resolution=1.0,
+            mosaic_method=mosaic_method,
+            snap_to_grid=True,
+        )
+        assert np.array_equal(result.data, baseline.data)
+
+    async def test_first_mode_still_early_exits(self, _reset_merge_concurrency):
+        """With mosaic_method='first', first batch fully fills output → later
+        batches should not be read at all."""
+        import rastera
+
+        rastera.set_concurrency(merge=4)
+
+        # 12 fully-overlapping COGs at the same location with distinct values.
+        # The first batch (size 4) covers the full output, so the early-exit
+        # check between batches should prevent later batches from being read.
+        cogs = [_make_strip_cog(0.0, value=i + 1) for i in range(12)]
+
+        await merge(
+            cogs,
+            bbox=BBox(0, 0, 10, 10),
+            bbox_crs=32632,
+            band_indices=[1],
+            target_crs=32632,
+            target_resolution=1.0,
+            mosaic_method="first",
+            snap_to_grid=True,
+        )
+
+        # First batch (4 COGs) should be read; subsequent 8 should not.
+        called = [c._read_native.await_count for c in cogs]
+        assert called[:4] == [1, 1, 1, 1]
+        assert called[4:] == [0] * 8

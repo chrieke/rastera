@@ -72,6 +72,7 @@ async def test_pneo_vrt_open_and_window_read():
     # Small windowed read to avoid downloading the whole product; the
     # exact offsets are arbitrary but chosen to straddle a tile seam.
     from async_geotiff import Window
+
     arr = await src.read(
         window=Window(col_off=15000, row_off=20000, width=512, height=512),
         band_indices=[1, 2, 3, 4],
@@ -99,6 +100,7 @@ async def test_pneo_vrt_reproject_to_wgs84():
     native_bbox = (cx - half, cy - half, cx + half, cy + half)
 
     from rastera.geo import BBox, transform_bbox
+
     wgs_bbox = transform_bbox(BBox(*native_bbox), src._crs_epsg, 4326)
 
     arr = await src.read(

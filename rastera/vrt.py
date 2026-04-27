@@ -11,9 +11,8 @@ favour of the first source's metadata. More complex VRT features
 
 from __future__ import annotations
 
-import asyncio
 import xml.etree.ElementTree as ET
-from collections.abc import Sequence
+from collections.abc import Awaitable, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -21,6 +20,7 @@ import numpy as np
 from async_geotiff import RasterArray, Window
 from pyproj import CRS
 
+from . import config
 from .geo import BBox, normalize_band_indices
 from .reader import AsyncGeoTIFF, MetaOverrides, _make_output_array
 from .store import _fetch_descriptor_bytes, _join_relative_uri
@@ -57,21 +57,20 @@ async def _open_vrt(
     bands = _parse_vrt_xml(xml_bytes, uri)
 
     unique_uris = list(dict.fromkeys(b.source_uri for b in bands))
-    sources = await asyncio.gather(
-        *(
-            _open_vrt_source(
-                u,
-                uri,
-                store=store,
-                prefetch=prefetch,
-                cache=cache,
-                meta_overrides=meta_overrides,
-                **store_kwargs,
-            )
-            for u in unique_uris
+    # Sequential opens: header reads only, but kept consistent with the
+    # rest of the rastera read path (see _dispatch_source_reads and
+    # rastera/formats/dimap.py) which avoids stacking concurrent fan-out.
+    sources_map: dict[str, AsyncGeoTIFF] = {}
+    for u in unique_uris:
+        sources_map[u] = await _open_vrt_source(
+            u,
+            uri,
+            store=store,
+            prefetch=prefetch,
+            cache=cache,
+            meta_overrides=meta_overrides,
+            **store_kwargs,
         )
-    )
-    sources_map = dict(zip(unique_uris, sources))
     return _VRTDataset(uri, bands, sources_map, meta_overrides=meta_overrides)
 
 
@@ -114,9 +113,7 @@ class _VRTDataset(AsyncGeoTIFF):
         if use_overviews:
             # Each source would pick its own overview level independently,
             # which can yield mismatched output shapes across sources.
-            raise NotImplementedError(
-                "use_overviews is not supported on VRT datasets"
-            )
+            raise NotImplementedError("use_overviews is not supported on VRT datasets")
         # Public entry: band_indices are 1-based (or None).
         vrt_indices = normalize_band_indices(band_indices, len(self._band_sources))
         return await _dispatch_source_reads(
@@ -310,23 +307,27 @@ async def _dispatch_source_reads(
         entry[1].append((out_idx, src_band + source_band_offset))
 
     group_list = list(groups.values())
-    results = await asyncio.gather(
-        *(
-            getattr(src, method_name)(
-                band_indices=[b for _, b in entries], **read_kwargs
-            )
-            for src, entries in group_list
-        )
+    # Sequential by default: each source read already fans out internally
+    # (and DIMAP sources fan out further per-tile), so stacking outer
+    # concurrency multiplies the HTTP burst without adding throughput on
+    # saturated links. Set ``rastera.set_concurrency(vrt=N>1)`` to opt
+    # into outer fan-out across distinct sources.
+    coros: list[Awaitable[RasterArray]] = [
+        getattr(src, method_name)(band_indices=[b for _, b in entries], **read_kwargs)
+        for src, entries in group_list
+    ]
+    results: list[RasterArray] = await config._gather_bounded(
+        config._vrt_concurrency, coros
     )
 
     first = results[0]
-    first_data: np.ndarray[Any, Any] = first.data
+    first_data: np.ndarray[Any, Any] = first.data  # type: ignore[reportUnknownMemberType]
     out_data = np.empty(
         (len(vrt_indices), first.height, first.width),
         dtype=first_data.dtype,
     )
     for (_, entries), result in zip(group_list, results):
-        res_data: np.ndarray[Any, Any] = result.data
+        res_data: np.ndarray[Any, Any] = result.data  # type: ignore[reportUnknownMemberType]
         if res_data.shape[1:] != first_data.shape[1:]:
             raise ValueError(
                 "VRT sub-reads returned mismatched shapes; sources may not "

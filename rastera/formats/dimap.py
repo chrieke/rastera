@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import xml.etree.ElementTree as ET
-from collections.abc import Sequence
+from collections.abc import Awaitable, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -22,6 +22,7 @@ from affine import Affine
 from async_geotiff import RasterArray, Window
 from pyproj import CRS
 
+from .. import config
 from ..geo import BBox, ensure_bbox, window_from_bbox
 from ..reader import AsyncGeoTIFF, MetaOverrides, _make_output_array
 from ..store import _fetch_descriptor_bytes, _join_relative_uri
@@ -184,9 +185,7 @@ class _DIMAPDataset(AsyncGeoTIFF):
         # inherit that tile's TIFF-level nodata so the mosaic pre-fill
         # and per-tile reads agree on the sentinel. Otherwise fall back
         # to 0 — the Airbus convention for integer products.
-        nodata: int | float | None = (
-            first_tile._nodata if first_tile is not None else 0
-        )
+        nodata: int | float | None = first_tile._nodata if first_tile is not None else 0
         virtual = _virtual_geotiff_for(layout, nodata=nodata)
         super().__init__(uri, virtual, meta_overrides=meta_overrides)  # type: ignore[arg-type]
         self._layout = layout
@@ -197,9 +196,7 @@ class _DIMAPDataset(AsyncGeoTIFF):
             **(store_kwargs or {}),
         }
         # Single-flight lazy tile opens keyed by (group_idx, tile_row, tile_col).
-        self._tile_tasks: dict[
-            tuple[int, int, int], asyncio.Future[AsyncGeoTIFF]
-        ] = {}
+        self._tile_tasks: dict[tuple[int, int, int], asyncio.Future[AsyncGeoTIFF]] = {}
         if first_tile is not None:
             # Prime the cache so the first read doesn't re-fetch this tile.
             assert first_tile_key is not None
@@ -225,8 +222,9 @@ class _DIMAPDataset(AsyncGeoTIFF):
     ) -> RasterArray:
         """Stitch the requested window from per-tile, per-group TIFF reads.
 
-        Reads all needed tiles concurrently. Output bands are written back
-        in the *caller's* requested order, so non-contiguous selections
+        Tiles are read sequentially; async-geotiff handles concurrency at
+        the COG-block level inside each tile read. Output bands are written
+        back in the *caller's* requested order, so non-contiguous selections
         like ``[5, 0]`` round-trip correctly instead of getting sorted
         into group order.
         """
@@ -266,33 +264,34 @@ class _DIMAPDataset(AsyncGeoTIFF):
 
         tile_reads = _tile_decomposition(layout, window)
 
+        # Sequential by default: async-geotiff already parallelizes COG-block
+        # range requests inside each tile read, so an outer fan-out across
+        # (group, tile) pairs multiplies the HTTP burst by N_tiles × N_groups
+        # — which saturated pools and tripped cloud rate limits on large
+        # reads. Set ``rastera.set_concurrency(dimap=N>1)`` to opt into
+        # outer fan-out. Each (group, tile) job writes to a disjoint slice
+        # of ``out`` so completion order doesn't matter.
         async def _read_one(
             group_idx: int, tr: _TileRead, src_bands_0: list[int]
-        ) -> tuple[_TileRead, np.ndarray]:
+        ) -> RasterArray:
             tile_ds = await self._get_tile(group_idx, tr.tile_row, tr.tile_col)
-            result = await tile_ds._read_native(
+            return await tile_ds._read_native(
                 window=tr.src_window, band_indices=src_bands_0
             )
-            return tr, result.data
 
-        jobs: list[
-            tuple[int, _TileRead, list[int], list[int]]
-        ] = []
+        metadata: list[tuple[list[int], _TileRead]] = []
+        coros: list[Awaitable[RasterArray]] = []
         for group_idx, entries in per_group.items():
             out_positions = [e[0] for e in entries]
             src_bands_0 = [e[1] - 1 for e in entries]
             for tr in tile_reads:
-                jobs.append((group_idx, tr, out_positions, src_bands_0))
+                metadata.append((out_positions, tr))
+                coros.append(_read_one(group_idx, tr, src_bands_0))
 
-        results = await asyncio.gather(
-            *(_read_one(g, tr, sb) for g, tr, _, sb in jobs)
-        )
-
-        for (_, _, out_positions, _), (tr, data) in zip(jobs, results):
-            # data has shape (len(src_bands_0), tile_h, tile_w); paste each
-            # band into its caller-requested output slot.
+        results = await config._gather_bounded(config._dimap_concurrency, coros)
+        for (out_positions, tr), result in zip(metadata, results):
             for i, pos in enumerate(out_positions):
-                out[pos, tr.dst_rows, tr.dst_cols] = data[i]
+                out[pos, tr.dst_rows, tr.dst_cols] = result.data[i]
 
         out_transform = layout.transform * Affine.translation(
             window.col_off, window.row_off
@@ -315,9 +314,7 @@ class _DIMAPDataset(AsyncGeoTIFF):
         key = (group_idx, tile_row, tile_col)
         fut = self._tile_tasks.get(key)
         if fut is None:
-            fut = asyncio.ensure_future(
-                self._open_tile(group_idx, tile_row, tile_col)
-            )
+            fut = asyncio.ensure_future(self._open_tile(group_idx, tile_row, tile_col))
             self._tile_tasks[key] = fut
         return await fut
 
@@ -371,9 +368,7 @@ async def _maybe_open_dimap(
         "cache": cache,
         **store_kwargs,
     }
-    first_key, first_tile = await _sniff_first_tile(
-        layout, uri, tile_open_kwargs
-    )
+    first_key, first_tile = await _sniff_first_tile(layout, uri, tile_open_kwargs)
     return _DIMAPDataset(
         uri,
         layout,
@@ -476,9 +471,7 @@ def _parse_band_groups(
 
         index_list = df_group.find("Raster_Display/Raster_Index_List")
         if index_list is None:
-            raise ValueError(
-                f"DIMAP: group {group_index} has no <Raster_Index_List>"
-            )
+            raise ValueError(f"DIMAP: group {group_index} has no <Raster_Index_List>")
         group_bands = [
             _DIMAPBand(
                 band_id=_require_text(ri, "BAND_ID"),
@@ -530,9 +523,7 @@ def _parse_dtype(encoding: ET.Element) -> np.dtype:
             )
         prefix = "uint" if sign == "UNSIGNED" else "int"
         if nbits not in (8, 16, 32, 64):
-            raise NotImplementedError(
-                f"DIMAP unsupported integer NBITS={nbits}"
-            )
+            raise NotImplementedError(f"DIMAP unsupported integer NBITS={nbits}")
         return np.dtype(f"{prefix}{nbits}")
     if dt == "FLOAT":
         if nbits not in (32, 64):
@@ -558,9 +549,7 @@ def _parse_crs_epsg(crs_root: ET.Element) -> int:
         try:
             return int(tail)
         except ValueError as e:
-            raise ValueError(
-                f"DIMAP: could not extract EPSG code from {code!r}"
-            ) from e
+            raise ValueError(f"DIMAP: could not extract EPSG code from {code!r}") from e
     raise NotImplementedError(
         "DIMAP Coordinate_Reference_System has neither Projected_CRS nor "
         "Geographic_CRS with an EPSG code"
@@ -616,9 +605,7 @@ class _TileRead:
     dst_cols: slice
 
 
-def _tile_decomposition(
-    layout: _DIMAPLayout, window: Window
-) -> list[_TileRead]:
+def _tile_decomposition(layout: _DIMAPLayout, window: Window) -> list[_TileRead]:
     """Decompose a mosaic window into per-tile read instructions.
 
     Tiles that do not intersect the window are omitted. The window may
