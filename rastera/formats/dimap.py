@@ -112,7 +112,8 @@ def _parse_dimap_xml(xml_bytes: bytes) -> _DIMAPLayout:
             f"DIMAP DATA_FILE_FORMAT={fmt!r}; only 'image/tiff' is supported"
         )
 
-    groups, bands = _parse_band_groups(data_access)
+    nbands = int(_require_text(dims, "NBANDS"))
+    groups, bands = _parse_band_groups(data_access, nbands)
 
     transform = _parse_transform(_require(root, "Geoposition"))
     dtype = _parse_dtype(_require(raster_data, "Raster_Encoding"))
@@ -450,6 +451,7 @@ def _parse_regular_tiling(dims: ET.Element) -> tuple[int, int, int, int]:
 
 def _parse_band_groups(
     data_access: ET.Element,
+    nbands: int,
 ) -> tuple[list[_DIMAPBandGroup], list[_DIMAPBand]]:
     groups: list[_DIMAPBandGroup] = []
     bands: list[_DIMAPBand] = []
@@ -479,7 +481,25 @@ def _parse_band_groups(
 
         index_list = df_group.find("Raster_Display/Raster_Index_List")
         if index_list is None:
-            raise ValueError(f"DIMAP: group {group_index} has no <Raster_Index_List>")
+            # Legacy PHR/SPOT shape: no per-band metadata, only top-level
+            # NBANDS. Synthesize generic bands mapped 1:1 to the tile TIFF
+            # channels. Multi-group without index lists stays an error
+            # because there's no signal for cross-group band allocation.
+            if len(data_file_groups) > 1:
+                raise ValueError(
+                    f"DIMAP: group {group_index} has no <Raster_Index_List> "
+                    f"(only supported for single-group DIMAPs)"
+                )
+            bands.extend(
+                _DIMAPBand(
+                    band_id=f"B{i}",
+                    band_name="",
+                    group_index=group_index,
+                    source_band=i + 1,
+                )
+                for i in range(nbands)
+            )
+            continue
         group_bands = [
             _DIMAPBand(
                 band_id=_require_text(ri, "BAND_ID"),

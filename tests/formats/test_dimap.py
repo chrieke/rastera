@@ -92,6 +92,66 @@ PNEO_DIMAP = b"""<Dimap_Document>
 </Dimap_Document>"""
 
 
+# Legacy PHR/SPOT shape: one <Data_Files> group, no <Raster_Index_List>,
+# bands declared only via top-level <NBANDS>. <Band_Display_Order> is
+# included for fidelity to the real format — the parser ignores it.
+PHR_DIMAP = b"""<Dimap_Document>
+  <Coordinate_Reference_System>
+    <Projected_CRS>
+      <PROJECTED_CRS_NAME>WGS 84 / UTM zone 33N</PROJECTED_CRS_NAME>
+      <PROJECTED_CRS_CODE>urn:ogc:def:crs:EPSG::32633</PROJECTED_CRS_CODE>
+    </Projected_CRS>
+  </Coordinate_Reference_System>
+  <Geoposition>
+    <Geoposition_Insert>
+      <ULXMAP unit="m">369516</ULXMAP>
+      <ULYMAP unit="m">6447186</ULYMAP>
+      <XDIM unit="m">0.5</XDIM>
+      <YDIM unit="m">0.5</YDIM>
+    </Geoposition_Insert>
+  </Geoposition>
+  <Raster_Data>
+    <Raster_Dimensions>
+      <NROWS>1000</NROWS>
+      <NCOLS>800</NCOLS>
+      <NBANDS>4</NBANDS>
+      <Tile_Set>
+        <NTILES>4</NTILES>
+        <Regular_Tiling>
+          <NTILES_SIZE ncols="400" nrows="500" />
+          <NTILES_COUNT ntiles_C="2" ntiles_R="2" />
+          <NTILES_OVERLAP ncols="0" nrows="0" />
+        </Regular_Tiling>
+      </Tile_Set>
+    </Raster_Dimensions>
+    <Raster_Encoding>
+      <DATA_TYPE>INTEGER</DATA_TYPE>
+      <NBITS>16</NBITS>
+      <SIGN>UNSIGNED</SIGN>
+    </Raster_Encoding>
+    <Raster_Display>
+      <Band_Display_Order>
+        <RED_CHANNEL>B2</RED_CHANNEL>
+        <GREEN_CHANNEL>B1</GREEN_CHANNEL>
+        <BLUE_CHANNEL>B0</BLUE_CHANNEL>
+        <ALPHA_CHANNEL>B3</ALPHA_CHANNEL>
+      </Band_Display_Order>
+    </Raster_Display>
+    <Data_Access>
+      <DATA_FILE_ORGANISATION>BAND_COMPOSITE</DATA_FILE_ORGANISATION>
+      <DATA_FILE_FORMAT>image/tiff</DATA_FILE_FORMAT>
+      <DATA_FILE_TILES>true</DATA_FILE_TILES>
+      <Data_Files>
+        <Data_File tile_R="1" tile_C="1"><DATA_FILE_PATH href="IMG_R1C1.TIF" /></Data_File>
+        <Data_File tile_R="1" tile_C="2"><DATA_FILE_PATH href="IMG_R1C2.TIF" /></Data_File>
+        <Data_File tile_R="2" tile_C="1"><DATA_FILE_PATH href="IMG_R2C1.TIF" /></Data_File>
+        <Data_File tile_R="2" tile_C="2"><DATA_FILE_PATH href="IMG_R2C2.TIF" /></Data_File>
+      </Data_Files>
+    </Data_Access>
+  </Raster_Data>
+</Dimap_Document>"""
+
+
 def _modified(xml: bytes, old: bytes, new: bytes) -> bytes:
     """Produce a variant of the fixture by substring replacement. Fails the
     test immediately if *old* isn't found, so stale tests can't silently
@@ -237,6 +297,94 @@ class TestParseDIMAP:
       <NBITS>32</NBITS>""",
         )
         assert _parse_dimap_xml(xml).dtype == np.dtype("float32")
+
+
+class TestSingleGroupDIMAP:
+    """Legacy PHR / SPOT shape: one <Data_Files> group with no
+    <Raster_Index_List>. Bands are synthesized from top-level <NBANDS>,
+    mapped 1:1 to TIFF channels."""
+
+    def test_synthesizes_bands_from_nbands(self):
+        layout = _parse_dimap_xml(PHR_DIMAP)
+        assert len(layout.groups) == 1
+        assert len(layout.bands) == 4
+        assert [b.source_band for b in layout.bands] == [1, 2, 3, 4]
+        assert all(b.group_index == 0 for b in layout.bands)
+        assert [b.band_id for b in layout.bands] == ["B0", "B1", "B2", "B3"]
+        assert all(b.band_name == "" for b in layout.bands)
+
+    def test_layout_geometry_matches_fixture(self):
+        layout = _parse_dimap_xml(PHR_DIMAP)
+        assert (layout.width, layout.height) == (800, 1000)
+        assert (layout.tile_rows, layout.tile_cols) == (2, 2)
+        assert layout.crs_epsg == 32633
+        assert layout.dtype == np.dtype("uint16")
+
+    def test_multi_group_without_index_list_still_raises(self):
+        """Duplicating the <Data_Files> block produces a 2-group DIMAP
+        with no per-group <Raster_Index_List>. That shape is ambiguous —
+        there's no signal for how output bands map across groups — so the
+        parser must keep raising rather than silently double the bands."""
+        two_group = _modified(
+            PHR_DIMAP,
+            b"      </Data_Files>\n    </Data_Access>",
+            b"""      </Data_Files>
+      <Data_Files>
+        <Data_File tile_R="1" tile_C="1"><DATA_FILE_PATH href="IMG2_R1C1.TIF" /></Data_File>
+        <Data_File tile_R="1" tile_C="2"><DATA_FILE_PATH href="IMG2_R1C2.TIF" /></Data_File>
+        <Data_File tile_R="2" tile_C="1"><DATA_FILE_PATH href="IMG2_R2C1.TIF" /></Data_File>
+        <Data_File tile_R="2" tile_C="2"><DATA_FILE_PATH href="IMG2_R2C2.TIF" /></Data_File>
+      </Data_Files>
+    </Data_Access>""",
+        )
+        with pytest.raises(ValueError, match="Raster_Index_List"):
+            _parse_dimap_xml(two_group)
+
+    @pytest.mark.asyncio
+    async def test_full_read_via_mocked_tiles(self):
+        """End-to-end open + window read: route the PHR fixture through
+        ``_maybe_open_dimap`` (the production entry point), then stitch
+        a 4-band mosaic from mocked tile reads. Catches regressions
+        where the single-group fallback parses but the resulting layout
+        doesn't drive the mosaic stitcher correctly."""
+        with (
+            patch(
+                "rastera.formats.dimap._fetch_descriptor_bytes",
+                new=AsyncMock(return_value=PHR_DIMAP),
+            ),
+            _patch_sniff(),
+        ):
+            ds = await _maybe_open_dimap("s3://bucket/DIM_PHR.XML")
+        assert ds is not None
+        assert ds.count == 4
+
+        async def _get_tile(g: int, r: int, c: int) -> AsyncGeoTIFF:
+            # Tag each pixel with (tile_col * 10 + src_band) so the assertions
+            # can pin both the source tile and source band of every output
+            # pixel — covers band ordering AND cross-tile paste positions.
+            return _mock_tile_ds(
+                lambda bands, w, col=c: np.stack(
+                    [
+                        np.full((w.height, w.width), col * 10 + (b + 1), dtype=np.uint16)
+                        for b in bands
+                    ]
+                )
+            )
+
+        ds._get_tile = _get_tile  # type: ignore[assignment]
+        # Span the seam between tile col 1 and col 2 (col 380..420) so the
+        # read decomposes into two tile reads.
+        arr = await ds._read_native(
+            window=Window(col_off=380, row_off=0, width=40, height=10),
+            band_indices=[0, 1, 2, 3],
+        )
+        data: np.ndarray[Any, Any] = arr.data  # type: ignore[reportUnknownMemberType]
+        assert data.shape == (4, 10, 40)
+        # Band i (i in 0..3) → src_band i+1; left half from tile_col=1 → tag 10+(i+1);
+        # right half from tile_col=2 → tag 20+(i+1).
+        for i in range(4):
+            np.testing.assert_array_equal(data[i, :, :20], 10 + (i + 1))
+            np.testing.assert_array_equal(data[i, :, 20:], 20 + (i + 1))
 
 
 def _grid_layout(
