@@ -20,10 +20,10 @@ from .geo import (
     compute_paste_slices,
     ensure_bbox,
     normalize_band_indices,
-    resample_nearest,
     transform_bbox,
 )
 from .reader import AsyncGeoTIFF, _CrsNodata, _grid_for_bbox, _make_output_array
+from .resampling import ResamplingMethod, resample
 
 
 async def merge(
@@ -39,6 +39,7 @@ async def merge(
     crs_method: Literal["most_common", "first"] = "most_common",
     snap_to_grid: bool = True,
     use_overviews: bool = False,
+    resampling: ResamplingMethod = "nearest",
 ) -> RasterArray:
     """
     Merge a bbox that may span multiple GeoTIFFs and return a single stitched array.
@@ -66,9 +67,9 @@ async def merge(
         snap_to_grid: When True (default), the output grid snaps to the
             source pixel grid for exact 1:1 copies (no resampling); the
             bbox may shift by up to 1 pixel. When False, the output bbox
-            matches the requested bbox exactly and nearest-neighbor
-            resampling selects source pixels, matching rasterio/GDAL
-            behaviour.
+            matches the requested bbox exactly and resampling selects
+            source pixels according to ``resampling``, matching
+            rasterio/GDAL behaviour.
         use_overviews: When True, reads from pre-computed COG overview
             levels to save bandwidth. Overview pixels are resampled
             aggregates, not original measurements — expect reduced
@@ -77,6 +78,16 @@ async def merge(
             or coarse segmentation; avoid for tasks requiring precise
             pixel values such as spectral index computation or
             per-pixel regression.
+        resampling: Method used when reprojecting or changing resolution.
+            One of ``"nearest"`` (default; fast, exact, blocky),
+            ``"bilinear"`` (separable linear kernel, smooth, no
+            overshoot), or ``"cubic"`` (Keys cubic, sharper than
+            bilinear, can overshoot the source value range). For
+            bilinear/cubic the kernel widens proportionally when
+            downsampling to act as an anti-aliasing low-pass filter,
+            matching GDAL's warp behaviour. Bilinear and cubic use
+            GDAL-style kernel renormalization around nodata; see
+            :func:`rastera.resampling.resample` for the precise rules.
 
     Returns:
         An ``async_geotiff.RasterArray`` containing the merged mosaic.
@@ -132,13 +143,14 @@ async def merge(
             target_resolution=target_resolution,
             mosaic_method=mosaic_method,
             use_overviews=use_overviews,
+            resampling=resampling,
         )
 
     # --- Native merge fast path (no resampling needed) ---
     # All COGs share the same CRS and resolution as the target.
     # snap_to_grid=True: output grid snaps to source pixel grid (1:1 copy).
     # snap_to_grid=False: output grid matches bbox exactly; paste rounds to
-    #   nearest pixel, avoiding the resample_nearest overhead.
+    #   nearest pixel, avoiding the resample() overhead.
     _require_compatible_merge_inputs(cogs)
 
     native_crs = base._crs_epsg
@@ -196,6 +208,7 @@ async def _merge_reprojected(
     target_resolution: float,
     mosaic_method: Literal["first", "last"] = "first",
     use_overviews: bool = False,
+    resampling: ResamplingMethod = "nearest",
 ) -> RasterArray:
     """Path B: merge with reprojection — supports mixed-CRS inputs."""
     base = cogs[0]
@@ -275,7 +288,7 @@ async def _merge_reprojected(
         if needs_reproject:
             transformer = Transformer.from_crs(out_crs, cog._crs_epsg, always_xy=True)
 
-        out_data = resample_nearest(
+        out_data = resample(
             native.data,  # type: ignore[reportUnknownMemberType]
             src_transform=native.transform,
             dst_transform=sub_transform,
@@ -283,6 +296,7 @@ async def _merge_reprojected(
             dst_height=sub_h,
             nodata=cog._nodata,
             transformer=transformer,
+            method=resampling,
         )
 
         geotiff_ref = _CrsNodata(CRS.from_epsg(out_crs), cog._nodata)

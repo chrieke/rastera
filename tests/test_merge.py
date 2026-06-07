@@ -472,6 +472,48 @@ class TestMergeReprojected:
         assert result.res[0] == pytest.approx(2.0)  # type: ignore[reportUnknownMemberType]
         cog._read_native.assert_called()
 
+    async def test_merge_resampling_bilinear(self):
+        """merge with resampling='bilinear' produces expected shape and dtype."""
+        cog = _make_cog(width=10, height=10, scale=1.0, bands=1)
+        native_arr = np.ones((1, 10, 10), dtype=np.uint16) * 7
+        native_result = _make_array(native_arr, Affine(1.0, 0, 0, 0, -1.0, 10))
+        cog._read_native = AsyncMock(return_value=native_result)
+
+        result = await merge(
+            [cog],
+            bbox=BBox(0, 0, 10, 10),
+            bbox_crs=32632,
+            band_indices=[1],
+            target_crs=32632,
+            target_resolution=2.0,
+            resampling="bilinear",
+        )
+        assert result.res[0] == pytest.approx(2.0)  # type: ignore[reportUnknownMemberType]
+        assert result.data.dtype == np.uint16  # type: ignore[reportUnknownMemberType]
+        # Constant input → bilinear output is the same constant.
+        assert np.all(result.data == 7)  # type: ignore[reportUnknownMemberType]
+
+    async def test_merge_resampling_cubic(self):
+        """merge with resampling='cubic' produces expected shape and dtype."""
+        cog = _make_cog(width=10, height=10, scale=1.0, bands=1)
+        native_arr = np.ones((1, 10, 10), dtype=np.uint16) * 7
+        native_result = _make_array(native_arr, Affine(1.0, 0, 0, 0, -1.0, 10))
+        cog._read_native = AsyncMock(return_value=native_result)
+
+        result = await merge(
+            [cog],
+            bbox=BBox(0, 0, 10, 10),
+            bbox_crs=32632,
+            band_indices=[1],
+            target_crs=32632,
+            target_resolution=2.0,
+            resampling="cubic",
+        )
+        assert result.res[0] == pytest.approx(2.0)  # type: ignore[reportUnknownMemberType]
+        assert result.data.dtype == np.uint16  # type: ignore[reportUnknownMemberType]
+        # Constant input → cubic output is the same constant (kernel sums to 1).
+        assert np.all(result.data == 7)  # type: ignore[reportUnknownMemberType]
+
     async def test_merge_method_first_reprojected(self):
         """mosaic_method='first' in reprojected path keeps the first COG's pixels."""
         # Two fully overlapping COGs, different values. mosaic_method="first" should

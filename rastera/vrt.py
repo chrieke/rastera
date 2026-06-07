@@ -32,6 +32,7 @@ from pyproj import CRS
 from . import config
 from .geo import BBox, normalize_band_indices
 from .reader import AsyncGeoTIFF, MetaOverrides, _make_output_array
+from .resampling import ResamplingMethod
 from .store import _fetch_descriptor_bytes, _join_relative_uri
 
 
@@ -151,6 +152,7 @@ class _VRTDataset(AsyncGeoTIFF):
         target_resolution: float | None = None,
         snap_to_grid: bool = True,
         use_overviews: bool = False,
+        resampling: ResamplingMethod = "nearest",
     ) -> RasterArray:
         if use_overviews:
             # Each source would pick its own overview level independently,
@@ -173,6 +175,7 @@ class _VRTDataset(AsyncGeoTIFF):
                 target_resolution=target_resolution,
                 snap_to_grid=snap_to_grid,
                 use_overviews=False,
+                resampling=resampling,
             ),
         )
 
@@ -255,6 +258,7 @@ class _VRTProcessedDataset(AsyncGeoTIFF):
         target_resolution: float | None = None,
         snap_to_grid: bool = True,
         use_overviews: bool = False,
+        resampling: ResamplingMethod = "nearest",
     ) -> RasterArray:
         if use_overviews:
             # Overview reads through the LUT aren't tested yet; same
@@ -275,6 +279,7 @@ class _VRTProcessedDataset(AsyncGeoTIFF):
             target_resolution=target_resolution,
             snap_to_grid=snap_to_grid,
             use_overviews=False,
+            resampling=resampling,
         )
         return self._apply_luts(src_result, out_indices_0)
 

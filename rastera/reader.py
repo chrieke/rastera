@@ -19,10 +19,10 @@ from .geo import (
     _normalize_crs,
     ensure_bbox,
     normalize_band_indices,
-    resample_nearest,
     transform_bbox,
     window_from_bbox,
 )
+from .resampling import ResamplingMethod, resample
 from .store import (
     _apply_s3_defaults,
     _bucket_url,
@@ -176,6 +176,7 @@ class AsyncGeoTIFF:
         target_resolution: float | None = None,
         snap_to_grid: bool = True,
         use_overviews: bool = False,
+        resampling: ResamplingMethod = "nearest",
     ) -> RasterArray:
         """Read image data, optionally reprojecting and resampling.
 
@@ -195,9 +196,9 @@ class AsyncGeoTIFF:
             snap_to_grid: When True (default), the output grid snaps to
                 the source pixel grid for exact 1:1 copies (no resampling);
                 the bbox may shift by up to 1 pixel. When False, the output
-                bbox matches the requested bbox exactly and nearest-neighbor
-                resampling selects source pixels, matching rasterio/GDAL
-                behaviour.
+                bbox matches the requested bbox exactly and resampling
+                selects source pixels according to ``resampling``, matching
+                rasterio/GDAL behaviour.
             use_overviews: When True, reads from pre-computed COG overview
                 levels to save bandwidth. Overview pixels are resampled
                 aggregates, not original measurements — expect reduced
@@ -206,6 +207,18 @@ class AsyncGeoTIFF:
                 or coarse segmentation; avoid for tasks requiring precise
                 pixel values such as spectral index computation or
                 per-pixel regression.
+            resampling: Method used when reprojecting or changing
+                resolution. One of ``"nearest"`` (default; fast, exact,
+                blocky), ``"bilinear"`` (separable linear kernel,
+                smooth, no overshoot), or ``"cubic"`` (Keys cubic,
+                sharper than bilinear, can overshoot the source value
+                range). For bilinear/cubic the kernel widens
+                proportionally when downsampling to act as an
+                anti-aliasing low-pass filter, matching GDAL's warp
+                behaviour. Bilinear and cubic use GDAL-style kernel
+                renormalization around nodata; see
+                :func:`rastera.resampling.resample` for the precise
+                rules.
 
         Returns:
             An ``async_geotiff.RasterArray`` containing pixel data and spatial metadata.
@@ -230,7 +243,7 @@ class AsyncGeoTIFF:
         )
 
         # Native fast path: no reprojection or resampling needed, so read
-        # directly from the source without an extra copy through resample_nearest.
+        # directly from the source without an extra copy through resample().
         use_native = not needs_reproject and not needs_resample
 
         if bbox is not None and use_native:
@@ -258,6 +271,7 @@ class AsyncGeoTIFF:
                 band_indices=band_indices,
                 target_resolution=target_resolution,
                 use_overviews=use_overviews,
+                resampling=resampling,
             )
 
         return await self._read_resampled(
@@ -269,6 +283,7 @@ class AsyncGeoTIFF:
             needs_reproject=needs_reproject,
             needs_resample=needs_resample,
             use_overviews=use_overviews,
+            resampling=resampling,
         )
 
     async def _read_window_resampled(
@@ -277,6 +292,7 @@ class AsyncGeoTIFF:
         band_indices: Sequence[int] | None,
         target_resolution: float,
         use_overviews: bool,
+        resampling: ResamplingMethod,
     ) -> RasterArray:
         """Read a pixel window and resample to *target_resolution*."""
         overview = (
@@ -293,13 +309,14 @@ class AsyncGeoTIFF:
         out_transform, out_w, out_h = _grid_for_bbox(
             target_bbox, target_resolution, use_ceil=True
         )
-        out_data = resample_nearest(
+        out_data = resample(
             native.data,  # type: ignore[reportUnknownMemberType]
             src_transform=native.transform,
             dst_transform=out_transform,
             dst_width=out_w,
             dst_height=out_h,
             nodata=self._nodata,
+            method=resampling,
         )
         return _make_output_array(out_data, out_transform, out_w, out_h, self._geotiff)
 
@@ -313,6 +330,7 @@ class AsyncGeoTIFF:
         needs_reproject: bool,
         needs_resample: bool,
         use_overviews: bool,
+        resampling: ResamplingMethod,
     ) -> RasterArray:
         """Read with reprojection and/or resampling."""
         gt = self._geotiff
@@ -388,7 +406,7 @@ class AsyncGeoTIFF:
         if needs_reproject:
             transformer = Transformer.from_crs(out_crs, src_crs, always_xy=True)
 
-        out_data = resample_nearest(
+        out_data = resample(
             native.data,  # type: ignore[reportUnknownMemberType]
             src_transform=native.transform,
             dst_transform=out_transform,
@@ -396,6 +414,7 @@ class AsyncGeoTIFF:
             dst_height=out_h,
             nodata=self._nodata,
             transformer=transformer,
+            method=resampling,
         )
 
         geotiff_ref: GeoTIFF | _CrsNodata = (
@@ -415,7 +434,7 @@ class AsyncGeoTIFF:
         # async_geotiff's Window has no stride/step support, so reads
         # always pull every pixel in the requested window at the chosen
         # overview level; any further downsampling happens post-fetch in
-        # `_read_reprojected` / `resample_nearest`.
+        # `_read_reprojected` / `resample`.
 
         # Determine which readable to use (full-res GeoTIFF or an Overview)
         if overview is not None:
