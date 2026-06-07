@@ -64,12 +64,13 @@ async def merge(
         crs_method: Strategy for choosing the output CRS when *target_crs*
             is ``None``. ``"most_common"`` picks the CRS shared by the most
             inputs; ``"first"`` uses the CRS of the first input.
-        snap_to_grid: When True (default), the output grid snaps to the
-            source pixel grid for exact 1:1 copies (no resampling); the
-            bbox may shift by up to 1 pixel. When False, the output bbox
-            matches the requested bbox exactly and resampling selects
-            source pixels according to ``resampling``, matching
-            rasterio/GDAL behaviour.
+        snap_to_grid: When True (default), and when all inputs already
+            share the target CRS and resolution, the output grid snaps to
+            the source pixel grid for an exact 1:1 copy (no resampling);
+            the bbox may shift by up to 1 pixel. When False, or when any
+            input differs in CRS/resolution, the output bbox matches the
+            requested bbox exactly and resampling selects source pixels
+            according to ``resampling``, matching rasterio/GDAL behaviour.
         use_overviews: When True, reads from pre-computed COG overview
             levels to save bandwidth. Overview pixels are resampled
             aggregates, not original measurements — expect reduced
@@ -147,26 +148,18 @@ async def merge(
         )
 
     # --- Native merge fast path (no resampling needed) ---
-    # All COGs share the same CRS and resolution as the target.
-    # snap_to_grid=True: output grid snaps to source pixel grid (1:1 copy).
-    # snap_to_grid=False: output grid matches bbox exactly; paste rounds to
-    #   nearest pixel, avoiding the resample() overhead.
+    # Reached only when all COGs share the target CRS and resolution AND
+    # snap_to_grid is True — every other case routes to _merge_reprojected.
     _require_compatible_merge_inputs(cogs)
 
     native_crs = base._crs_epsg
     assert native_crs is not None
     native_bbox = transform_bbox(bbox, bbox_crs, native_crs)
 
-    if snap_to_grid:
-        window_transform, win_width, win_height = _mosaic_grid_from_bbox(
-            base_transform=base_gt.transform,
-            bbox=native_bbox,
-        )
-    else:
-        window_transform, win_width, win_height = _grid_for_bbox(
-            native_bbox,
-            target_resolution,
-        )
+    window_transform, win_width, win_height = _mosaic_grid_from_bbox(
+        base_transform=base_gt.transform,
+        bbox=native_bbox,
+    )
 
     # Get sub bboxes specific to the contributing image
     sub_bboxes: list[tuple[AsyncGeoTIFF, BBox]] = []
