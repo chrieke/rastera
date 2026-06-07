@@ -2,7 +2,8 @@
 
 **Async rasterio for COGs**, built on [async-geotiff](https://github.com/developmentseed/async-geotiff), no GDAL.
 
-- `read` and `merge` (multi-file, cross-crs) with `target_crs`, `target_resolution`, `bbox`, `window`
+- `read` and `merge` (multi-file, cross-crs) with `target_crs`, `target_resolution`, `bbox`, `window`, `resampling`
+- Resampling: `nearest` (default), `bilinear`, `cubic` — GDAL-matching kernels with anti-aliasing on downsample and nodata renormalization
 - Optional persisted header cache (geoparquet) for ~6x faster opens
 - Built on [async-geotiff](https://github.com/developmentseed/async-geotiff) handling GeoTIFF parsing, async tile fetching, request coalescing, and Rust-native decompression
 - Limited VRT & DIMAP support
@@ -34,6 +35,7 @@ raster_array = await src.read(
     band_indices=[1, 2, 3],
     target_crs=32632,
     target_resolution=20,
+    resampling="bilinear",  # "nearest" (default), "bilinear", or "cubic"
     snap_to_grid=True,
     use_overviews=False,
 )
@@ -61,6 +63,7 @@ raster_array = await rastera.merge(
     fill_value=0,
     target_crs=utm_crs,
     target_resolution=10,
+    resampling="cubic",  # "nearest" (default), "bilinear", or "cubic"
     mosaic_method="first",
     crs_method="most_common",
     snap_to_grid=True,
