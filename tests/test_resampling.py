@@ -269,6 +269,43 @@ class TestResampleBilinear:
             f"peak; got max={out.max()} (strict 2×2 would deposit ~1000)"
         )
 
+    def test_nodata_nan_sentinel(self):
+        """NaN-sentinel nodata: NaN samples must be excluded from kernel
+        renormalization (NaN != NaN, so naive `sample != nodata` would
+        treat them as valid) and must not leak through `NaN * 0 = NaN`.
+
+        Same setup as :meth:`test_nodata_renormalize` but with NaN
+        instead of -9999.  The codebase already supports NaN nodata in
+        ``merge.py``'s paste loop; the resampling kernel must too.
+        """
+        arr = np.array(
+            [[[10.0, np.nan], [10.0, 10.0]]],
+            dtype=np.float32,
+        )
+        src_t = Affine(10, 0, 0, 0, -10, 20)
+        dst_t = Affine(1, 0, 9.5, 0, -1, 10.5)
+        out = resample(
+            arr, src_t, dst_t, 1, 1, nodata=float("nan"), method="bilinear"
+        )
+        # Renormalized over the three valid 10.0 samples → 10.0 exactly,
+        # and no NaN leaks through.
+        assert not np.any(np.isnan(out)), f"output should be NaN-free, got {out}"
+        np.testing.assert_allclose(out, [[[10.0]]])
+
+    def test_nodata_nan_center_gate(self):
+        """NaN sample under the dst center → output is NaN (the GDAL
+        center-pixel gate must fire on NaN sentinels too)."""
+        arr = np.array(
+            [[[1.0, 1.0, 1.0], [1.0, np.nan, 1.0], [1.0, 1.0, 1.0]]],
+            dtype=np.float32,
+        )
+        src_t = Affine(10, 0, 0, 0, -10, 30)
+        dst_t = Affine(1, 0, 14.5, 0, -1, 15.5)  # center → src pixel (1, 1)
+        out = resample(
+            arr, src_t, dst_t, 1, 1, nodata=float("nan"), method="bilinear"
+        )
+        assert np.isnan(out[0, 0, 0]), f"expected NaN output, got {out}"
+
 
 # ── resample (cubic) ─────────────────────────────────────────────────────
 

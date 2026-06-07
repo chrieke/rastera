@@ -195,10 +195,11 @@ class AsyncGeoTIFF:
             target_resolution: Output pixel size in target CRS units.
             snap_to_grid: When True (default), the output grid snaps to
                 the source pixel grid for exact 1:1 copies (no resampling);
-                the bbox may shift by up to 1 pixel. When False, the output
-                bbox matches the requested bbox exactly and resampling
-                selects source pixels according to ``resampling``, matching
-                rasterio/GDAL behaviour.
+                the bbox may shift by up to 1 pixel. When False, the bbox
+                is rounded to the nearest source-pixel boundary instead of
+                snapping outward. Note: ``snap_to_grid`` alone does not
+                trigger interpolation — set ``target_resolution`` or
+                ``target_crs`` to invoke the ``resampling`` kernel.
             use_overviews: When True, reads from pre-computed COG overview
                 levels to save bandwidth. Overview pixels are resampled
                 aggregates, not original measurements — expect reduced

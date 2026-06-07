@@ -65,6 +65,10 @@ def resample(
     of the kernel window (negative cubic weights cause severe overshoot
     when valid/invalid samples alternate).
 
+    ``nodata`` may be a finite sentinel (e.g. -9999, 0) or NaN; NaN is
+    detected via ``np.isnan`` so the center gate and renormalization
+    behave identically across sentinel types.
+
     Args:
         src_array: (bands, h, w) source data.
         src_transform: Affine pixel→world for source.
@@ -206,6 +210,12 @@ def _resample_kernel(
     """
     n_bands, h, w = src_array.shape
 
+    # NaN-sentinel nodata needs `np.isnan` for detection (NaN != NaN means
+    # `==` and `!=` both miss it) and zeroing-out before multiply (NaN * 0
+    # propagates NaN into the accumulator).  This mirrors the NaN path in
+    # `merge.py`'s paste loop.
+    nodata_is_nan = nodata is not None and nodata != nodata
+
     # --- Compute float source coordinates for every destination pixel.
     # Same-CRS: keep coords 1D ``(W,)`` / ``(H,)`` — base/frac/center and
     # the separable kernel weights stay 1D, with the kernel loop forming
@@ -316,8 +326,15 @@ def _resample_kernel(
                 # Pixel is valid only if all bands are non-nodata AND the
                 # tap is in-bounds.  Per-band-uniform validity matches the
                 # single dataset-level nodata convention used throughout
-                # rastera.
-                valid = (sample != nodata).all(axis=0) & in_bounds  # (H, W)
+                # rastera.  NaN-sentinel: use `np.isnan` (NaN != NaN means
+                # `!=` would mark every NaN as valid) and zero-out NaN
+                # samples before the multiply.
+                if nodata_is_nan:
+                    is_nodata = np.isnan(sample)
+                    sample = np.where(is_nodata, 0.0, sample)
+                else:
+                    is_nodata = sample == nodata
+                valid = ~is_nodata.any(axis=0) & in_bounds  # (H, W)
                 contrib = w_xy * valid  # (H, W), bool→float promotion
                 acc_val += sample * contrib  # broadcast (B,H,W) * (H,W)
                 assert acc_wt is not None
@@ -358,7 +375,11 @@ def _resample_kernel(
                 ((center_row >= 0) & (center_row < h))[:, None]
                 & ((center_col >= 0) & (center_col < w))[None, :]
             )
-        center_bad = (center_sample == nodata).any(axis=0) | ~in_bounds_center
+        if nodata_is_nan:
+            center_is_nodata = np.isnan(center_sample).any(axis=0)
+        else:
+            center_is_nodata = (center_sample == nodata).any(axis=0)
+        center_bad = center_is_nodata | ~in_bounds_center
 
         invalid = center_bad | ~has_weight
 
