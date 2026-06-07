@@ -68,9 +68,11 @@ async def merge(
             share the target CRS and resolution, the output grid snaps to
             the source pixel grid for an exact 1:1 copy (no resampling);
             the bbox may shift by up to 1 pixel. When False, or when any
-            input differs in CRS/resolution, the output bbox matches the
-            requested bbox exactly and resampling selects source pixels
-            according to ``resampling``, matching rasterio/GDAL behaviour.
+            input differs in CRS/resolution, the output grid is anchored
+            at the requested ``(minx, maxy)`` with width/height rounded
+            to whole pixels (so the max edges can drift by <0.5 px) and
+            resampling selects source pixels according to ``resampling``,
+            matching rasterio/GDAL behaviour.
         use_overviews: When True, reads from pre-computed COG overview
             levels to save bandwidth. Overview pixels are resampled
             aggregates, not original measurements — expect reduced
