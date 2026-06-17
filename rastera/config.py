@@ -12,7 +12,7 @@ _dimap_concurrency: int = 1
 # ``set_warp_strategy`` for semantics.  Default is "auto": heavy cross-CRS
 # downsamples take the faster two-pass route, everything else (nearest of
 # any kind, and all same-CRS resamples) is unchanged.
-WarpStrategy = Literal["auto", "single_pass", "two_pass"]
+WarpStrategy = Literal["auto", "single_pass"]
 _warp_strategy: WarpStrategy = "auto"
 
 
@@ -91,19 +91,20 @@ def set_warp_strategy(strategy: WarpStrategy) -> None:
 
     - ``"auto"`` (default): take the two-pass route only above a conservative
       downsample scale (> 2.0), where the kernel blow-up clearly dominates the
-      small quality difference; single-pass otherwise.
+      small quality difference; single-pass otherwise.  Below ~1.75 two-pass is
+      break-even-to-slower (its fixed intermediate-allocation + near-unit
+      reproject cost is not yet repaid), so the conservative cutoff also avoids
+      a needless quality hit where there is no speed win.
     - ``"single_pass"``: always the single non-separable warp.  Bit-exact with
-      releases before two-pass existed.
-    - ``"two_pass"``: use two-pass whenever it applies (cross-CRS
-      bilinear/cubic with downsample scale > 1.5).
+      releases before two-pass existed.  Use this when exact reproducibility
+      against older output matters.
 
     Two-pass output is *not* bit-identical to single-pass: it applies two
     resampling kernels, so it is marginally softer at the highest spatial
     frequencies (measured RMS < 1 DN for typical imagery).  Low-frequency
-    content is unchanged.  Use ``"single_pass"`` when exact reproducibility
-    against older output matters.
+    content is unchanged.
     """
-    valid = ("auto", "single_pass", "two_pass")
+    valid = ("auto", "single_pass")
     if strategy not in valid:
         raise ValueError(f"warp strategy must be one of {valid}, got {strategy!r}")
     global _warp_strategy

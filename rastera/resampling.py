@@ -31,12 +31,12 @@ from .config import WarpStrategy
 
 ResamplingMethod = Literal["nearest", "bilinear", "cubic"]
 
-# Local downsample scale above which the two-pass cross-CRS strategy kicks in,
-# per strategy.  ``"two_pass"`` triggers whenever there is meaningful
-# downsampling; ``"auto"`` only where the widened-kernel cost clearly dominates
-# the small quality difference.  Below the threshold the single-pass warp is
-# used (and at scale <= 1 — upsampling — the two-pass split has no benefit).
-_TWO_PASS_SCALE_THRESHOLD = 1.5
+# Local downsample scale above which the ``"auto"`` strategy takes the two-pass
+# cross-CRS route.  Set conservatively: two-pass only clearly beats single-pass
+# above ~1.75 (below that its fixed intermediate-allocation + near-unit
+# reproject cost is not yet repaid), and the local scale here is an estimate,
+# so the cutoff leaves margin.  Below it (and at scale <= 1 — upsampling — where
+# the two-pass split has no benefit) the single-pass warp is used.
 _AUTO_SCALE_THRESHOLD = 2.0
 
 
@@ -97,8 +97,8 @@ def resample(
             ``None`` (default) reads the process-wide setting from
             :func:`rastera.set_warp_strategy`; pass an explicit value to
             override it for this call (useful in tests). See that function for
-            the ``"auto"`` / ``"two_pass"`` / ``"single_pass"`` semantics. No
-            effect on nearest (any CRS/scale), same-CRS, or upsampling.
+            the ``"auto"`` / ``"single_pass"`` semantics. No effect on nearest
+            (any CRS/scale), same-CRS, or upsampling.
     """
     if warp_strategy is None:
         warp_strategy = config._warp_strategy
@@ -757,12 +757,9 @@ def _finalize_kernel(
 def _two_pass_threshold(strategy: WarpStrategy) -> float | None:
     """Local downsample scale above which two-pass applies, or None to disable.
 
-    ``"two_pass"`` triggers on any meaningful downsample; ``"auto"`` only on
-    the stronger downsamples where the widened-kernel cost clearly dominates;
-    ``"single_pass"`` never triggers.
+    ``"auto"`` triggers only on the stronger downsamples where the
+    widened-kernel cost clearly dominates; ``"single_pass"`` never triggers.
     """
-    if strategy == "two_pass":
-        return _TWO_PASS_SCALE_THRESHOLD
     if strategy == "auto":
         return _AUTO_SCALE_THRESHOLD
     return None
