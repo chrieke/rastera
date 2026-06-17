@@ -1,6 +1,7 @@
 """Unit tests for the resample() function and its kernel/coord helpers."""
 
 import numpy as np
+import pytest
 from affine import Affine
 
 from rastera.resampling import resample
@@ -458,3 +459,153 @@ class TestResampleCubic:
             f"anti-aliased cubic 4× downsample should spread delta peak; "
             f"got max={out.max()} (strict 4×4 would deposit ~1000)"
         )
+
+
+# ── separable (same-CRS) two-pass accumulator ────────────────────────────
+
+
+def _bruteforce_kernel(src, src_t, dst_t, dw, dh, method, nodata):
+    """Non-separable per-tap reference for the same-CRS kernel.
+
+    A straightforward 2-D-loop transcription of the documented algorithm
+    (the implementation pre-dating the separable rewrite): shared geometry
+    and weight functions, full outer-product kernel, GDAL-style nodata
+    renormalization with the center gate and cubic per-dimension gate.  Used
+    to prove the separable two-pass produces identical output.
+    """
+    import math
+
+    from rastera.resampling import _bilinear_weights, _cubic_weights
+
+    nb, h, w = src.shape
+    nan = nodata is not None and nodata != nodata
+    c = ~src_t * dst_t
+    col_f = float(c.a) * (np.arange(dw) + 0.5) + float(c.c)
+    row_f = float(c.e) * (np.arange(dh) + 0.5) + float(c.f)
+    ccol = np.floor(col_f).astype(np.intp)
+    crow = np.floor(row_f).astype(np.intp)
+    bcol = np.floor(col_f - 0.5).astype(np.intp)
+    brow = np.floor(row_f - 0.5).astype(np.intp)
+    fcol = (col_f - 0.5) - bcol
+    frow = (row_f - 0.5) - brow
+    xf = max(1.0, abs(float(c.a)))
+    yf = max(1.0, abs(float(c.e)))
+    rad = 1 if method == "bilinear" else 2
+    xoff = tuple(range(1 - math.ceil(rad * xf), math.ceil(rad * xf) + 1))
+    yoff = tuple(range(1 - math.ceil(rad * yf), math.ceil(rad * yf) + 1))
+    wfn = _bilinear_weights if method == "bilinear" else _cubic_weights
+    wx = wfn(fcol, xoff, xf)
+    wy = wfn(frow, yoff, yf)
+
+    acc = np.zeros((nb, dh, dw))
+    wt = np.zeros((dh, dw))
+    rvc = np.zeros((len(yoff), dh, dw))
+    cvc = np.zeros((len(xoff), dh, dw))
+    for i, dy in enumerate(yoff):
+        sr = brow + dy
+        safer = np.clip(sr, 0, h - 1)
+        ibr = (sr >= 0) & (sr < h)
+        for j, dx in enumerate(xoff):
+            sc = bcol + dx
+            safec = np.clip(sc, 0, w - 1)
+            ibc = (sc >= 0) & (sc < w)
+            sample = src[:, safer[:, None], safec[None, :]]
+            wxy = wy[i][:, None] * wx[j][None, :]
+            ib = ibr[:, None] & ibc[None, :]
+            if nodata is not None:
+                isnd = np.isnan(sample) if nan else (sample == nodata)
+                if nan:
+                    sample = np.where(isnd, 0.0, sample)
+                valid = ~isnd.any(0) & ib
+                contrib = wxy * valid
+                acc += sample * contrib
+                wt += contrib
+                rvc[i] += valid
+                cvc[j] += valid
+            else:
+                acc += sample * wxy
+
+    if nodata is not None:
+        out = np.zeros_like(acc)
+        hw = wt > 0
+        np.divide(acc, wt, out=out, where=hw)
+        cs = src[:, np.clip(crow, 0, h - 1)[:, None], np.clip(ccol, 0, w - 1)[None, :]]
+        ibc2 = ((crow >= 0) & (crow < h))[:, None] & ((ccol >= 0) & (ccol < w))[None, :]
+        cisnd = np.isnan(cs).any(0) if nan else (cs == nodata).any(0)
+        invalid = (cisnd | ~ibc2) | ~hw
+        if method == "cubic":
+            invalid |= ~((rvc >= 2).any(0) & (cvc >= 2).any(0))
+        out[:, invalid] = float(nodata)
+    else:
+        out = acc
+    if np.issubdtype(src.dtype, np.integer):
+        info = np.iinfo(src.dtype)
+        np.clip(out, info.min, info.max, out=out)
+        np.round(out, out=out)
+    return out.astype(src.dtype)
+
+
+class TestSeparableEquivalence:
+    """The same-CRS path is a separable two-pass rewrite of the non-separable
+    2-D loop; it must produce identical output for integer dtypes (the float
+    accumulators round-trip to the same int).  Sizes are chosen so dst_h
+    spans multiple row-blocks, exercising the chunked accumulator.
+    """
+
+    @pytest.mark.parametrize("method", ["bilinear", "cubic"])
+    @pytest.mark.parametrize("scale", [0.5, 2.0, 4.0])
+    @pytest.mark.parametrize("nodata", [None, 0])
+    def test_matches_bruteforce(self, method, scale, nodata):
+        rng = np.random.default_rng(7)
+        # src_h tall enough that several scales push dst_h past the 256-row
+        # block size and trigger multi-block chunking.
+        src = rng.integers(1, 5000, size=(3, 700, 48)).astype(np.uint16)
+        if nodata is not None:
+            src[:, rng.random((700, 48)) < 0.2] = nodata
+        src_t = Affine(1, 0, 0, 0, -1, 700)
+        dh = int(round(700 / scale))
+        dw = int(round(48 / scale))
+        dst_t = Affine(scale, 0, 0, 0, -scale, 700)
+        out = resample(src, src_t, dst_t, dw, dh, nodata=nodata, method=method)
+        ref = _bruteforce_kernel(src, src_t, dst_t, dw, dh, method, nodata)
+        # Separable reorders the float summation, so integer output may differ
+        # by ≤1 LSB at rounding boundaries; a nodata-mask flip would differ by
+        # far more and still fail.
+        np.testing.assert_allclose(out, ref, atol=1)
+        if nodata is not None:
+            np.testing.assert_array_equal(out == nodata, ref == nodata)
+
+    @pytest.mark.parametrize("method", ["bilinear", "cubic"])
+    def test_anisotropic_downsample_no_int8_overflow(self, method):
+        """One axis downsampled hard enough to exceed 127 cubic kernel taps:
+        the per-dimension valid-sample count must not overflow (int32, not
+        int8), or pixels with plenty of valid neighbours are wrongly gated to
+        nodata.  Compared against the non-separable reference, which counts in
+        float64 (overflow-free)."""
+        rng = np.random.default_rng(11)
+        src = rng.integers(1, 2000, size=(3, 600, 80)).astype(np.uint16)
+        src[:, rng.random((600, 80)) < 0.18] = 0  # nodata holes
+        src_t = Affine(1, 0, 0, 0, -1, 600)
+        # 60× vertical downsample → 240 y-taps for cubic (> int8 max 127).
+        dst_t = Affine(8, 0, 0, 0, -8, 600)
+        out = resample(src, src_t, dst_t, 10, 75, nodata=0, method=method)
+        ref = _bruteforce_kernel(src, src_t, dst_t, 10, 75, method, 0)
+        np.testing.assert_array_equal(out == 0, ref == 0)  # identical nodata mask
+        np.testing.assert_allclose(out, ref, atol=1)
+
+    def test_block_size_invariance(self, monkeypatch):
+        """Chunking is purely an implementation detail: output must not depend
+        on the row-block size (catches block-boundary indexing bugs)."""
+        import rastera.resampling as r
+
+        rng = np.random.default_rng(3)
+        src = rng.integers(1, 5000, size=(2, 500, 64)).astype(np.uint16)
+        src[:, rng.random((500, 64)) < 0.2] = 0
+        src_t = Affine(1, 0, 0, 0, -1, 500)
+        dst_t = Affine(2, 0, 0, 0, -2, 500)
+        kw = dict(nodata=0, method="cubic")
+        monkeypatch.setattr(r, "_SEPARABLE_ROW_BLOCK", 1_000_000)
+        whole = resample(src, src_t, dst_t, 32, 250, **kw)
+        monkeypatch.setattr(r, "_SEPARABLE_ROW_BLOCK", 7)
+        tiny = resample(src, src_t, dst_t, 32, 250, **kw)
+        np.testing.assert_array_equal(whole, tiny)

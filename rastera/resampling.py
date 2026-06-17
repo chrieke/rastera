@@ -194,8 +194,15 @@ def _resample_kernel(
     See :func:`resample` for the user-facing semantics summary.
     Implementation notes:
 
-    - The neighbourhood is computed via a small nested Python loop with
-      vectorised numpy inside.  Kernel half-width per axis is
+    - Same-CRS reads use a separable two-pass accumulation
+      (:func:`_accumulate_separable`): ``O(taps_x + taps_y)`` instead of
+      ``O(taps_x · taps_y)``.  Cross-CRS warps are not separable (the
+      source sampling grid is not axis-aligned with the output) so they
+      keep the non-separable 2-D loop.  The two paths are numerically
+      equivalent: the separable reorder changes float summation only at
+      the ULP level, so integer output may differ by at most 1 LSB at
+      rounding boundaries.
+    - Kernel half-width per axis is
       ``base_radius · max(1, |dst_res / src_res|)`` (rounded up), where
       ``base_radius`` is 1 for bilinear and 2 for cubic.  Upsampling
       and identity reads use the default radii; downsampling expands.
@@ -286,127 +293,109 @@ def _resample_kernel(
     wx = weights_fn(frac_col, x_offsets, x_filter)
     wy = weights_fn(frac_row, y_offsets, y_filter)
 
-    # --- Accumulators.
-    acc_val = np.zeros((n_bands, dst_height, dst_width), dtype=np.float64)
-    acc_wt: np.ndarray | None = None
-    row_valid_counts: np.ndarray | None = None
-    col_valid_counts: np.ndarray | None = None
-    if nodata is not None:
-        acc_wt = np.zeros((dst_height, dst_width), dtype=np.float64)
-        if method == "cubic":
-            row_valid_counts = np.zeros(
-                (len(y_offsets), dst_height, dst_width), dtype=np.int8
-            )
-            col_valid_counts = np.zeros(
-                (len(x_offsets), dst_height, dst_width), dtype=np.int8
-            )
-
     # --- Accumulate kernel contributions.
-    for i, dy in enumerate(y_offsets):
-        src_row_idx = base_row + dy
-        safe_row = np.clip(src_row_idx, 0, h - 1)
-        in_bounds_row = (src_row_idx >= 0) & (src_row_idx < h)
-        wy_i = wy[i]
-        for j, dx in enumerate(x_offsets):
-            src_col_idx = base_col + dx
-            safe_col = np.clip(src_col_idx, 0, w - 1)
-            in_bounds_col = (src_col_idx >= 0) & (src_col_idx < w)
-            wx_j = wx[j]
+    per_dim_ok: np.ndarray | None = None
+    if coords_2d:
+        # Non-separable 2-D loop for the cross-CRS warp: the source sampling
+        # grid is not axis-aligned with the output, so weights and indices
+        # are full 2-D and cannot be reused across rows/columns.
+        acc_val = np.zeros((n_bands, dst_height, dst_width), dtype=np.float64)
+        acc_wt: np.ndarray | None = None
+        row_valid_counts: np.ndarray | None = None
+        col_valid_counts: np.ndarray | None = None
+        if nodata is not None:
+            acc_wt = np.zeros((dst_height, dst_width), dtype=np.float64)
+            if method == "cubic":
+                # int32 (not int8): a single axis can have >127 kernel taps
+                # under heavy anisotropic downsampling, which would overflow
+                # int8 and spuriously fail the >=2 gate.
+                row_valid_counts = np.zeros(
+                    (len(y_offsets), dst_height, dst_width), dtype=np.int32
+                )
+                col_valid_counts = np.zeros(
+                    (len(x_offsets), dst_height, dst_width), dtype=np.int32
+                )
 
-            if coords_2d:
+        for i, dy in enumerate(y_offsets):
+            src_row_idx = base_row + dy
+            safe_row = np.clip(src_row_idx, 0, h - 1)
+            in_bounds_row = (src_row_idx >= 0) & (src_row_idx < h)
+            wy_i = wy[i]
+            for j, dx in enumerate(x_offsets):
+                src_col_idx = base_col + dx
+                safe_col = np.clip(src_col_idx, 0, w - 1)
+                in_bounds_col = (src_col_idx >= 0) & (src_col_idx < w)
+                wx_j = wx[j]
+
                 sample = src_array[:, safe_row, safe_col]  # (B, H, W)
                 w_xy = wy_i * wx_j  # (H, W)
                 in_bounds = in_bounds_row & in_bounds_col  # (H, W)
-            else:
-                sample = src_array[:, safe_row[:, None], safe_col[None, :]]
-                w_xy = wy_i[:, None] * wx_j[None, :]  # outer product → (H, W)
-                in_bounds = in_bounds_row[:, None] & in_bounds_col[None, :]
 
-            if nodata is not None:
-                # Pixel is valid only if all bands are non-nodata AND the
-                # tap is in-bounds.  Per-band-uniform validity matches the
-                # single dataset-level nodata convention used throughout
-                # rastera.  NaN-sentinel: use `np.isnan` (NaN != NaN means
-                # `!=` would mark every NaN as valid) and zero-out NaN
-                # samples before the multiply.
-                if nodata_is_nan:
-                    is_nodata = np.isnan(sample)
-                    sample = np.where(is_nodata, 0.0, sample)
+                if nodata is not None:
+                    # Pixel is valid only if all bands are non-nodata AND the
+                    # tap is in-bounds.  NaN-sentinel: use `np.isnan` and
+                    # zero-out NaN samples before the multiply.
+                    if nodata_is_nan:
+                        is_nodata = np.isnan(sample)
+                        sample = np.where(is_nodata, 0.0, sample)
+                    else:
+                        is_nodata = sample == nodata
+                    valid = ~is_nodata.any(axis=0) & in_bounds  # (H, W)
+                    contrib = w_xy * valid  # (H, W), bool→float promotion
+                    acc_val += sample * contrib  # broadcast (B,H,W) * (H,W)
+                    assert acc_wt is not None
+                    acc_wt += contrib
+                    if method == "cubic":
+                        assert row_valid_counts is not None
+                        assert col_valid_counts is not None
+                        row_valid_counts[i] += valid
+                        col_valid_counts[j] += valid
                 else:
-                    is_nodata = sample == nodata
-                valid = ~is_nodata.any(axis=0) & in_bounds  # (H, W)
-                contrib = w_xy * valid  # (H, W), bool→float promotion
-                acc_val += sample * contrib  # broadcast (B,H,W) * (H,W)
-                assert acc_wt is not None
-                acc_wt += contrib
-                if method == "cubic":
-                    assert row_valid_counts is not None
-                    assert col_valid_counts is not None
-                    row_valid_counts[i] += valid
-                    col_valid_counts[j] += valid
-            else:
-                # No nodata: kernel uses clamped (edge-replicated) samples
-                # without renormalization.
-                acc_val += sample * w_xy
+                    # No nodata: clamped (edge-replicated) samples, no renorm.
+                    acc_val += sample * w_xy
 
-    # --- Finalize: renormalize, apply gates, cast to source dtype.
-    if nodata is not None:
-        assert acc_wt is not None
-        out_f = np.zeros_like(acc_val)
-        has_weight = acc_wt > 0
-        np.divide(acc_val, acc_wt, out=out_f, where=has_weight)
-
-        # Center gate: source pixel under the dst center is nodata or OOB.
-        center_safe_row = np.clip(center_row, 0, h - 1)
-        center_safe_col = np.clip(center_col, 0, w - 1)
-        if coords_2d:
-            center_sample = src_array[:, center_safe_row, center_safe_col]
-            in_bounds_center = (
-                (center_row >= 0)
-                & (center_row < h)
-                & (center_col >= 0)
-                & (center_col < w)
-            )
-        else:
-            center_sample = src_array[
-                :, center_safe_row[:, None], center_safe_col[None, :]
-            ]
-            in_bounds_center = (
-                ((center_row >= 0) & (center_row < h))[:, None]
-                & ((center_col >= 0) & (center_col < w))[None, :]
-            )
-        if nodata_is_nan:
-            center_is_nodata = np.isnan(center_sample).any(axis=0)
-        else:
-            center_is_nodata = (center_sample == nodata).any(axis=0)
-        center_bad = center_is_nodata | ~in_bounds_center
-
-        invalid = center_bad | ~has_weight
-
-        if method == "cubic":
+        if nodata is not None and method == "cubic":
             assert row_valid_counts is not None
             assert col_valid_counts is not None
-            per_dim_ok = (row_valid_counts >= 2).any(axis=0) & (
-                col_valid_counts >= 2
-            ).any(axis=0)
-            invalid |= ~per_dim_ok
-
-        if invalid.any():
-            out_f[:, invalid] = float(nodata)
+            per_dim_ok = np.asarray(
+                (row_valid_counts >= 2).any(axis=0)
+                & (col_valid_counts >= 2).any(axis=0)
+            )
     else:
-        out_f = acc_val
+        # Same-CRS: separable two-pass, O(taps_x + taps_y).
+        acc_val, acc_wt, per_dim_ok = _accumulate_separable(
+            src_array,
+            base_col,
+            base_row,
+            wx,
+            wy,
+            x_offsets,
+            y_offsets,
+            nodata,
+            nodata_is_nan,
+            method,
+        )
 
-    src_dtype = src_array.dtype
-    if np.issubdtype(src_dtype, np.integer):
-        info = np.iinfo(src_dtype)
-        np.clip(out_f, info.min, info.max, out=out_f)
-        np.round(out_f, out=out_f)
-    return out_f.astype(src_dtype)
+    return _finalize_kernel(
+        acc_val,
+        acc_wt,
+        per_dim_ok,
+        src_array,
+        center_row,
+        center_col,
+        coords_2d,
+        nodata,
+        nodata_is_nan,
+    )
 
 
 # ---- Private helpers ----
 
 _WARP_GRID_STEP = 16
+
+# Output-row block size for the separable two-pass accumulator.  Bounds the
+# (bands, src_rows, dst_w) intermediate and keeps each pass cache-resident.
+_SEPARABLE_ROW_BLOCK = 256
 
 
 def _coarse_grid_transform(
@@ -517,3 +506,208 @@ def _cubic_weights(
         weights.append(np.where(d < 1.0, w_inner, np.where(d < 2.0, w_outer, 0.0)))
     out = np.stack(weights)
     return out / out.sum(axis=0, keepdims=True)
+
+
+def _accumulate_separable(
+    src_array: np.ndarray,
+    base_col: np.ndarray,
+    base_row: np.ndarray,
+    wx: np.ndarray,
+    wy: np.ndarray,
+    x_offsets: Sequence[int],
+    y_offsets: Sequence[int],
+    nodata: int | float | None,
+    nodata_is_nan: bool,
+    method: Literal["bilinear", "cubic"],
+) -> tuple[np.ndarray, np.ndarray | None, np.ndarray | None]:
+    """Separable two-pass kernel accumulation for the same-CRS path.
+
+    Equivalent to the non-separable 2-D loop in :func:`_resample_kernel`, but
+    ``O(taps_x + taps_y)`` instead of ``O(taps_x · taps_y)``: convolve along
+    columns into a ``(bands, src_rows, dst_w)`` intermediate, then along rows.
+    Processed in output-row blocks so the intermediate stays bounded and each
+    pass is cache-resident.
+
+    ``base_col``/``base_row`` are 1-D ``(dst_w,)``/``(dst_h,)`` and ``wx``/``wy``
+    are ``(taps, dst_w)``/``(taps, dst_h)`` (separable, same-CRS only).
+
+    With ``nodata`` set, GDAL-style renormalization is two separable
+    convolutions: a masked-value numerator and a valid-weight denominator
+    over the per-source-pixel validity mask.  Without ``nodata``, samples are
+    edge-replicated (clamped) with no renormalization.
+
+    Returns ``(acc_val, acc_wt, per_dim_ok)`` for :func:`_finalize_kernel`.
+    """
+    n_bands, h, w = src_array.shape
+    dst_w = base_col.shape[0]
+    dst_h = base_row.shape[0]
+
+    # Per-x-tap source columns (edge-clamped) and in-bounds, reused per block.
+    safe_cols = [np.clip(base_col + dx, 0, w - 1) for dx in x_offsets]
+    inb_cols = [(base_col + dx >= 0) & (base_col + dx < w) for dx in x_offsets]
+
+    acc_val = np.empty((n_bands, dst_h, dst_w), dtype=np.float64)
+    acc_wt = (
+        np.empty((dst_h, dst_w), dtype=np.float64) if nodata is not None else None
+    )
+
+    # Source-pixel validity (all bands non-nodata), shared by every block.
+    valid_src: np.ndarray | None = None
+    if nodata is not None:
+        if nodata_is_nan:
+            valid_src = np.asarray(~np.isnan(src_array).any(axis=0))
+        else:
+            valid_src = np.asarray(~(src_array == nodata).any(axis=0))
+
+    for r0 in range(0, dst_h, _SEPARABLE_ROW_BLOCK):
+        r1 = min(r0 + _SEPARABLE_ROW_BLOCK, dst_h)
+        br = base_row[r0:r1]
+        # Source-row span this block touches (clamped into [0, h-1]).
+        smin = int(np.clip(int(br.min()) + y_offsets[0], 0, h - 1))
+        smax = int(np.clip(int(br.max()) + y_offsets[-1], 0, h - 1))
+        nrows = smax - smin + 1
+
+        if nodata is not None:
+            assert valid_src is not None and acc_wt is not None
+            vs_blk = valid_src[smin : smax + 1]  # (nrows, w)
+            # Zero out invalid (incl. NaN) source values before the multiply.
+            ms_blk = np.where(vs_blk, src_array[:, smin : smax + 1, :], 0.0)
+            # Pass 1 (columns): masked-value numerator + valid-weight denom.
+            inter_num = np.zeros((n_bands, nrows, dst_w), dtype=np.float64)
+            inter_den = np.zeros((nrows, dst_w), dtype=np.float64)
+            for j in range(len(x_offsets)):
+                weff = wx[j] * inb_cols[j]  # (dst_w,)
+                inter_num += ms_blk[:, :, safe_cols[j]] * weff
+                inter_den += vs_blk[:, safe_cols[j]] * weff
+            # Pass 2 (rows).
+            val_blk = np.zeros((n_bands, r1 - r0, dst_w), dtype=np.float64)
+            wt_blk = np.zeros((r1 - r0, dst_w), dtype=np.float64)
+            for i, dy in enumerate(y_offsets):
+                src_row_idx = br + dy
+                sr = np.clip(np.clip(src_row_idx, 0, h - 1) - smin, 0, nrows - 1)
+                weff_y = wy[i][r0:r1] * ((src_row_idx >= 0) & (src_row_idx < h))
+                val_blk += inter_num[:, sr, :] * weff_y[None, :, None]
+                wt_blk += inter_den[sr, :] * weff_y[:, None]
+            acc_val[:, r0:r1, :] = val_blk
+            acc_wt[r0:r1, :] = wt_blk
+        else:
+            src_blk = src_array[:, smin : smax + 1, :]
+            inter = np.zeros((n_bands, nrows, dst_w), dtype=np.float64)
+            for j in range(len(x_offsets)):
+                inter += src_blk[:, :, safe_cols[j]] * wx[j]
+            val_blk = np.zeros((n_bands, r1 - r0, dst_w), dtype=np.float64)
+            for i, dy in enumerate(y_offsets):
+                sr = np.clip(np.clip(br + dy, 0, h - 1) - smin, 0, nrows - 1)
+                val_blk += inter[:, sr, :] * wy[i][r0:r1][None, :, None]
+            acc_val[:, r0:r1, :] = val_blk
+
+    per_dim_ok: np.ndarray | None = None
+    if nodata is not None and method == "cubic":
+        assert valid_src is not None
+        per_dim_ok = _separable_cubic_per_dim_ok(
+            valid_src, base_row, safe_cols, inb_cols, x_offsets, y_offsets, h, w
+        )
+    return acc_val, acc_wt, per_dim_ok
+
+
+def _separable_cubic_per_dim_ok(
+    valid_src: np.ndarray,
+    base_row: np.ndarray,
+    safe_cols: list[np.ndarray],
+    inb_cols: list[np.ndarray],
+    x_offsets: Sequence[int],
+    y_offsets: Sequence[int],
+    h: int,
+    w: int,
+) -> np.ndarray:
+    """Separable form of the cubic per-dimension ≥2-valid safety gate.
+
+    Reproduces ``(row_valid_counts >= 2).any(0) & (col_valid_counts >= 2).any(0)``
+    from the 2-D loop without materializing the per-tap count tensors:
+    ``xcount[sr, c]`` counts valid in-bounds x-taps at source row ``sr`` /
+    dst col ``c``; ``ycount[r, sc]`` the y-analogue.  Returns a
+    ``(dst_h, dst_w)`` boolean mask (True where the pixel passes the gate).
+    """
+    dst_w = safe_cols[0].shape[0]
+    dst_h = base_row.shape[0]
+    safe_rows = [np.clip(base_row + dy, 0, h - 1) for dy in y_offsets]
+    inb_rows = [(base_row + dy >= 0) & (base_row + dy < h) for dy in y_offsets]
+
+    xcount = np.zeros((h, dst_w), dtype=np.int32)
+    for j in range(len(x_offsets)):
+        xcount += valid_src[:, safe_cols[j]] & inb_cols[j]
+    ycount = np.zeros((dst_h, w), dtype=np.int32)
+    for i in range(len(y_offsets)):
+        ycount += valid_src[safe_rows[i], :] & inb_rows[i][:, None]
+
+    part_a = np.zeros((dst_h, dst_w), dtype=bool)
+    for i in range(len(y_offsets)):
+        part_a |= (xcount[safe_rows[i], :] >= 2) & inb_rows[i][:, None]
+    part_b = np.zeros((dst_h, dst_w), dtype=bool)
+    for j in range(len(x_offsets)):
+        part_b |= (ycount[:, safe_cols[j]] >= 2) & inb_cols[j][None, :]
+    return part_a & part_b
+
+
+def _finalize_kernel(
+    acc_val: np.ndarray,
+    acc_wt: np.ndarray | None,
+    per_dim_ok: np.ndarray | None,
+    src_array: np.ndarray,
+    center_row: np.ndarray,
+    center_col: np.ndarray,
+    coords_2d: bool,
+    nodata: int | float | None,
+    nodata_is_nan: bool,
+) -> np.ndarray:
+    """Renormalize, apply nodata gates, and cast to the source dtype.
+
+    Shared by both the separable (same-CRS) and 2-D (cross-CRS) paths.
+    ``center_row``/``center_col`` are 1-D for same-CRS and 2-D for cross-CRS;
+    ``per_dim_ok`` is the precomputed cubic safety mask (or ``None``).
+    """
+    h, w = src_array.shape[1], src_array.shape[2]
+    if nodata is not None:
+        assert acc_wt is not None
+        out_f = np.zeros_like(acc_val)
+        has_weight = acc_wt > 0
+        np.divide(acc_val, acc_wt, out=out_f, where=has_weight)
+
+        # Center gate: source pixel under the dst center is nodata or OOB.
+        center_safe_row = np.clip(center_row, 0, h - 1)
+        center_safe_col = np.clip(center_col, 0, w - 1)
+        if coords_2d:
+            center_sample = src_array[:, center_safe_row, center_safe_col]
+            in_bounds_center = (
+                (center_row >= 0)
+                & (center_row < h)
+                & (center_col >= 0)
+                & (center_col < w)
+            )
+        else:
+            center_sample = src_array[
+                :, center_safe_row[:, None], center_safe_col[None, :]
+            ]
+            in_bounds_center = (
+                ((center_row >= 0) & (center_row < h))[:, None]
+                & ((center_col >= 0) & (center_col < w))[None, :]
+            )
+        if nodata_is_nan:
+            center_is_nodata = np.isnan(center_sample).any(axis=0)
+        else:
+            center_is_nodata = (center_sample == nodata).any(axis=0)
+
+        invalid = (center_is_nodata | ~in_bounds_center) | ~has_weight
+        if per_dim_ok is not None:
+            invalid |= ~per_dim_ok
+        if invalid.any():
+            out_f[:, invalid] = float(nodata)
+    else:
+        out_f = acc_val
+
+    src_dtype = src_array.dtype
+    if np.issubdtype(src_dtype, np.integer):
+        info = np.iinfo(src_dtype)
+        np.clip(out_f, info.min, info.max, out=out_f)
+        np.round(out_f, out=out_f)
+    return out_f.astype(src_dtype)
