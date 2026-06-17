@@ -26,7 +26,18 @@ import numpy as np
 from affine import Affine
 from pyproj import Transformer
 
+from . import config
+from .config import WarpStrategy
+
 ResamplingMethod = Literal["nearest", "bilinear", "cubic"]
+
+# Local downsample scale above which the two-pass cross-CRS strategy kicks in,
+# per strategy.  ``"two_pass"`` triggers whenever there is meaningful
+# downsampling; ``"auto"`` only where the widened-kernel cost clearly dominates
+# the small quality difference.  Below the threshold the single-pass warp is
+# used (and at scale <= 1 — upsampling — the two-pass split has no benefit).
+_TWO_PASS_SCALE_THRESHOLD = 1.5
+_AUTO_SCALE_THRESHOLD = 2.0
 
 
 def resample(
@@ -38,6 +49,8 @@ def resample(
     nodata: int | float | None = None,
     transformer: Transformer | None = None,
     method: ResamplingMethod = "nearest",
+    *,
+    warp_strategy: WarpStrategy | None = None,
 ) -> np.ndarray:
     """Resample src_array to a target grid.
 
@@ -80,7 +93,15 @@ def resample(
         transformer: pyproj Transformer (target CRS → source CRS).
             ``None`` if same CRS.
         method: One of ``"nearest"``, ``"bilinear"``, ``"cubic"``.
+        warp_strategy: How a cross-CRS bilinear/cubic warp is carried out.
+            ``None`` (default) reads the process-wide setting from
+            :func:`rastera.set_warp_strategy`; pass an explicit value to
+            override it for this call (useful in tests). See that function for
+            the ``"auto"`` / ``"two_pass"`` / ``"single_pass"`` semantics. No
+            effect on nearest (any CRS/scale), same-CRS, or upsampling.
     """
+    if warp_strategy is None:
+        warp_strategy = config._warp_strategy
     if method == "nearest":
         return _resample_nearest(
             src_array,
@@ -101,6 +122,7 @@ def resample(
             nodata,
             transformer,
             method,
+            warp_strategy,
         )
     raise ValueError(
         f"Unknown resampling method {method!r}; "
@@ -187,6 +209,7 @@ def _resample_kernel(
     nodata: int | float | None,
     transformer: Transformer | None,
     method: Literal["bilinear", "cubic"],
+    warp_strategy: WarpStrategy = "single_pass",
 ) -> np.ndarray:
     """Bilinear or cubic resampling with GDAL-style nodata renormalization
     and anti-aliasing kernel expansion for downsampling.
@@ -259,6 +282,24 @@ def _resample_kernel(
             y_scale_local = float(np.median(np.abs(np.diff(src_row_f, axis=0))))
         else:
             y_scale_local = 1.0
+
+        # Cross-CRS downsample: optionally split into a same-CRS downsample
+        # (fast separable path) + a near-unit-scale reproject.  Gated on the
+        # local scale we just computed, so no extra coarse-grid work.
+        threshold = _two_pass_threshold(warp_strategy)
+        if threshold is not None and max(x_scale_local, y_scale_local) > threshold:
+            return _resample_two_pass(
+                src_array,
+                src_transform,
+                dst_transform,
+                dst_width,
+                dst_height,
+                nodata,
+                transformer,
+                method,
+                x_scale_local,
+                y_scale_local,
+            )
 
     # Source pixel containing the dst center (pixel-corner convention).
     # Used for the OOB gate and the GDAL-style center-pixel nodata gate.
@@ -711,3 +752,121 @@ def _finalize_kernel(
         np.clip(out_f, info.min, info.max, out=out_f)
         np.round(out_f, out=out_f)
     return out_f.astype(src_dtype)
+
+
+def _two_pass_threshold(strategy: WarpStrategy) -> float | None:
+    """Local downsample scale above which two-pass applies, or None to disable.
+
+    ``"two_pass"`` triggers on any meaningful downsample; ``"auto"`` only on
+    the stronger downsamples where the widened-kernel cost clearly dominates;
+    ``"single_pass"`` never triggers.
+    """
+    if strategy == "two_pass":
+        return _TWO_PASS_SCALE_THRESHOLD
+    if strategy == "auto":
+        return _AUTO_SCALE_THRESHOLD
+    return None
+
+
+def _two_pass_work_dtype(dtype: np.dtype) -> np.dtype:
+    """Float dtype for the two-pass intermediate that avoids double rounding.
+
+    Running both passes in float (the intermediate is never cast back to an
+    integer dtype between them) means a single clip+round at the end instead
+    of one per pass.  float32 is used only when it represents the source
+    integer range exactly (mantissa is 24 bits); otherwise float64.  Float
+    sources keep their own width (kernel accumulation is float64 regardless).
+    """
+    if np.issubdtype(dtype, np.floating):
+        return dtype
+    info = np.iinfo(dtype)
+    if info.min >= -(2**24) and info.max <= 2**24:
+        return np.dtype(np.float32)
+    return np.dtype(np.float64)
+
+
+def _resample_two_pass(
+    src_array: np.ndarray,
+    src_transform: Affine,
+    dst_transform: Affine,
+    dst_width: int,
+    dst_height: int,
+    nodata: int | float | None,
+    transformer: Transformer | None,
+    method: Literal["bilinear", "cubic"],
+    x_scale: float,
+    y_scale: float,
+) -> np.ndarray:
+    """Cross-CRS downsample as two cheap passes instead of one wide warp.
+
+    Pass A downsamples ``src_array`` in its own CRS to an intermediate grid at
+    ~target resolution (``transformer=None`` → fast separable path).  Pass B
+    reprojects that smaller intermediate to the final grid at near-unit scale
+    (a narrow kernel).  Both passes run in float so the integer clip+round
+    happens once, at the end.
+
+    The intermediate is built with a halo beyond the source extent: Pass A's
+    widened kernel and (for cubic) the ≥2-valid gate erode the outermost
+    intermediate pixels under nodata, so the halo keeps that erosion off the
+    region Pass B samples — avoiding an edge fringe single-pass would not have.
+
+    See :func:`resample` / :func:`rastera.set_warp_strategy` for when this
+    runs and how its output relates to the single-pass warp.
+    """
+    n_bands, h, w = src_array.shape
+    base_radius = 1 if method == "bilinear" else 2
+
+    # Per-axis: only ever downsample (scale <= 1 axes keep source resolution).
+    sx = max(1.0, x_scale)
+    sy = max(1.0, y_scale)
+    core_w = max(1, round(w / sx))
+    core_h = max(1, round(h / sy))
+
+    # Intermediate pixel size that spans the source extent exactly with
+    # ``core_w``/``core_h`` pixels, preserving the source axis signs.
+    inter_a = float(src_transform.a) * w / core_w
+    inter_e = float(src_transform.e) * h / core_h
+
+    # Halo (intermediate pixels) >= Pass A's edge reach, plus one for the
+    # cubic gate's slightly longer reach at nodata boundaries.
+    halo = base_radius + 1
+    inter_w = core_w + 2 * halo
+    inter_h = core_h + 2 * halo
+    origin_x = float(src_transform.c) - halo * inter_a
+    origin_y = float(src_transform.f) - halo * inter_e
+    inter_transform = Affine(inter_a, 0.0, origin_x, 0.0, inter_e, origin_y)
+
+    orig_dtype = src_array.dtype
+    work_dtype = _two_pass_work_dtype(orig_dtype)
+    work = src_array.astype(work_dtype, copy=False)
+
+    inter = resample(
+        work,
+        src_transform=src_transform,
+        dst_transform=inter_transform,
+        dst_width=inter_w,
+        dst_height=inter_h,
+        nodata=nodata,
+        transformer=None,
+        method=method,
+        warp_strategy="single_pass",
+    )
+    out = resample(
+        inter,
+        src_transform=inter_transform,
+        dst_transform=dst_transform,
+        dst_width=dst_width,
+        dst_height=dst_height,
+        nodata=nodata,
+        transformer=transformer,
+        method=method,
+        warp_strategy="single_pass",
+    )
+
+    # Both passes ran in float; clip+round+cast back to the source dtype once.
+    if np.issubdtype(orig_dtype, np.integer):
+        info = np.iinfo(orig_dtype)
+        out = out.astype(np.float64, copy=False)
+        np.clip(out, info.min, info.max, out=out)
+        np.round(out, out=out)
+    return out.astype(orig_dtype, copy=False)

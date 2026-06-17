@@ -3,7 +3,7 @@ from __future__ import annotations
 from async_geotiff import RasterArray, Window
 from async_tiff.store import S3Store  # type: ignore[import-untyped]
 
-from .config import set_concurrency
+from .config import set_concurrency, set_warp_strategy
 from .merge import merge
 from .reader import AsyncGeoTIFF, clear_cache, open, set_cache_size
 
@@ -15,6 +15,7 @@ __all__ = [
     "clear_cache",
     "set_cache_size",
     "set_concurrency",
+    "set_warp_strategy",
     "open",
     "merge",
 ]
