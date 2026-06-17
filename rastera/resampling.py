@@ -32,11 +32,13 @@ from .config import WarpStrategy
 ResamplingMethod = Literal["nearest", "bilinear", "cubic"]
 
 # Local downsample scale above which the ``"auto"`` strategy takes the two-pass
-# cross-CRS route.  Set conservatively: two-pass only clearly beats single-pass
-# above ~1.75 (below that its fixed intermediate-allocation + near-unit
-# reproject cost is not yet repaid), and the local scale here is an estimate,
-# so the cutoff leaves margin.  Below it (and at scale <= 1 — upsampling — where
-# the two-pass split has no benefit) the single-pass warp is used.
+# cross-CRS route.  Set conservatively: benchmarking cross-CRS warps across
+# image sizes (512²–4096²) and both kernels, scale 2.0 is the lowest threshold
+# that is a speed win everywhere; below it two-pass is erratic and often slower
+# (its fixed intermediate-allocation + near-unit reproject cost is not repaid —
+# worst for cheap-kernel bilinear at large sizes, where it can run ~1.5x
+# slower).  Below the threshold (and at scale <= 1 — upsampling — where the
+# two-pass split has no benefit) the single-pass warp is used.
 _AUTO_SCALE_THRESHOLD = 2.0
 
 
