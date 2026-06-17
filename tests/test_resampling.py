@@ -609,3 +609,131 @@ class TestSeparableEquivalence:
         monkeypatch.setattr(r, "_SEPARABLE_ROW_BLOCK", 7)
         tiny = resample(src, src_t, dst_t, 32, 250, **kw)
         np.testing.assert_array_equal(whole, tiny)
+
+
+class TestTwoPassReproject:
+    """The two-pass cross-CRS strategy (downsample in source CRS, then
+    reproject near-unit-scale) is an opt-in faster alternative to the single
+    non-separable warp.  It is not bit-exact — two kernels apply — but must
+    stay close on the interior, be a strict no-op where it does not apply
+    (upsample / same-CRS / nearest / single_pass), and not introduce an edge
+    fringe under nodata.
+    """
+
+    def _cross_setup(
+        self, src_res, dst_res, *, H=200, W=200, dtype=np.float32, seed=0
+    ):
+        """A smooth EPSG:3006 raster + a target UTM33N grid at ``dst_res``.
+
+        Returns ``(arr, src_t, dst_t, dw, dh, transformer)`` ready for
+        ``resample(..., transformer=transformer)``.  ``scale ≈ dst_res/src_res``.
+        """
+        from pyproj import Transformer
+
+        yy, xx = np.mgrid[0:H, 0:W]
+        arr = (100 + 50 * np.sin(xx / 15.0) + 40 * np.cos(yy / 12.0)).astype(dtype)
+        arr = arr[None]  # (1, H, W); strictly positive so 0 means nodata only
+        x0, y0 = 650000.0, 6580000.0
+        src_t = Affine(src_res, 0, x0, 0, -src_res, y0)
+        fwd = Transformer.from_crs(3006, 32633, always_xy=True)
+        gx, gy = np.meshgrid([x0, x0 + W * src_res], [y0 - H * src_res, y0])
+        ux, uy = fwd.transform(gx.ravel(), gy.ravel())
+        pad = 4 * dst_res  # keep dst footprint inside the source extent
+        dw = int((ux.max() - ux.min() - 2 * pad) // dst_res)
+        dh = int((uy.max() - uy.min() - 2 * pad) // dst_res)
+        dst_t = Affine(dst_res, 0, ux.min() + pad, 0, -dst_res, uy.min() + pad + dh * dst_res)
+        T = Transformer.from_crs(32633, 3006, always_xy=True)
+        return arr, src_t, dst_t, dw, dh, T
+
+    @pytest.mark.parametrize("method", ["bilinear", "cubic"])
+    def test_matches_single_pass_on_interior(self, method):
+        arr, st, dt, dw, dh, T = self._cross_setup(0.16, 0.5)
+        kw = dict(transformer=T, method=method)
+        sp = resample(arr, st, dt, dw, dh, warp_strategy="single_pass", **kw)
+        tp = resample(arr, st, dt, dw, dh, warp_strategy="auto", **kw)
+        b = 3  # drop the edge band where the two methods legitimately differ
+        d = np.abs(sp[:, b:-b, b:-b].astype(float) - tp[:, b:-b, b:-b].astype(float))
+        assert float(np.sqrt((d**2).mean())) < 1.0
+        assert float(d.max()) < 5.0
+
+    def test_auto_dispatch_threshold(self):
+        # "auto" takes the two-pass route only above its conservative downsample
+        # scale (> 2.0).  Below it, "auto" is identical to single-pass.
+        arr, st, dt, dw, dh, T = self._cross_setup(0.16, 0.28)  # scale ~1.75
+        kw = dict(transformer=T, method="cubic")
+        sp = resample(arr, st, dt, dw, dh, warp_strategy="single_pass", **kw)
+        auto = resample(arr, st, dt, dw, dh, warp_strategy="auto", **kw)
+        np.testing.assert_array_equal(auto, sp)
+        # Well above the cutoff, "auto" engages the two-pass branch and diverges.
+        arr, st, dt, dw, dh, T = self._cross_setup(0.16, 0.5)  # scale ~3.1
+        kw = dict(transformer=T, method="cubic")
+        sp = resample(arr, st, dt, dw, dh, warp_strategy="single_pass", **kw)
+        auto = resample(arr, st, dt, dw, dh, warp_strategy="auto", **kw)
+        assert not np.array_equal(auto, sp)
+
+    def test_upsample_is_noop(self):
+        # scale < 1: two-pass split has no benefit and must not engage.
+        arr, st, dt, dw, dh, T = self._cross_setup(0.5, 0.16)
+        kw = dict(transformer=T, method="cubic")
+        sp = resample(arr, st, dt, dw, dh, warp_strategy="single_pass", **kw)
+        out = resample(arr, st, dt, dw, dh, warp_strategy="auto", **kw)
+        np.testing.assert_array_equal(sp, out)
+
+    def test_same_crs_is_noop(self):
+        # transformer=None: the separable same-CRS path handles it; the
+        # cross-CRS two-pass branch is never reached.
+        arr = (np.arange(160 * 160, dtype=np.float32) % 97).reshape(1, 160, 160)
+        st = Affine(0.16, 0, 0, 0, -0.16, 0)
+        dt = Affine(0.5, 0, 0, 0, -0.5, 0)
+        kw = dict(transformer=None, method="cubic")
+        sp = resample(arr, st, dt, 50, 50, warp_strategy="single_pass", **kw)
+        out = resample(arr, st, dt, 50, 50, warp_strategy="auto", **kw)
+        np.testing.assert_array_equal(sp, out)
+
+    def test_nearest_ignores_strategy(self):
+        arr, st, dt, dw, dh, T = self._cross_setup(0.16, 0.5)
+        kw = dict(transformer=T, method="nearest")
+        sp = resample(arr, st, dt, dw, dh, warp_strategy="single_pass", **kw)
+        tp = resample(arr, st, dt, dw, dh, warp_strategy="auto", **kw)
+        np.testing.assert_array_equal(sp, tp)
+
+    def test_integer_no_double_rounding(self):
+        # uint16 two-pass must equal the float two-pass rounded once — i.e. the
+        # intermediate is not re-quantized between passes.
+        arr, st, dt, dw, dh, T = self._cross_setup(0.16, 0.5)
+        arr_u = arr.astype(np.uint16)
+        kw = dict(transformer=T, method="cubic", warp_strategy="auto")
+        tp_u = resample(arr_u, st, dt, dw, dh, **kw)
+        tp_f = resample(arr_u.astype(np.float32), st, dt, dw, dh, **kw)
+        b = 3
+        np.testing.assert_allclose(
+            tp_u[:, b:-b, b:-b], np.round(tp_f[:, b:-b, b:-b]), atol=1
+        )
+
+    @pytest.mark.parametrize("method", ["bilinear", "cubic"])
+    def test_nodata_no_edge_fringe(self, method):
+        # The halo must keep Pass A's edge erosion off the region Pass B reads:
+        # two-pass should not turn many single-pass-valid pixels into nodata.
+        arr, st, dt, dw, dh, T = self._cross_setup(0.16, 0.5)
+        kw = dict(transformer=T, nodata=0, method=method)
+        sp = resample(arr, st, dt, dw, dh, warp_strategy="single_pass", **kw)
+        tp = resample(arr, st, dt, dw, dh, warp_strategy="auto", **kw)
+        extra_nodata = (tp == 0) & (sp != 0)
+        assert extra_nodata.mean() < 0.01
+
+    def test_global_setter_and_validation(self):
+        import rastera
+        import rastera.config as config
+
+        arr, st, dt, dw, dh, T = self._cross_setup(0.16, 0.5)
+        kw = dict(transformer=T, method="cubic")
+        explicit = resample(arr, st, dt, dw, dh, warp_strategy="auto", **kw)
+        prev = config._warp_strategy
+        try:
+            rastera.set_warp_strategy("auto")
+            via_global = resample(arr, st, dt, dw, dh, **kw)  # no explicit arg
+            np.testing.assert_array_equal(explicit, via_global)
+        finally:
+            rastera.set_warp_strategy(prev)
+        with pytest.raises(ValueError):
+            rastera.set_warp_strategy("nope")
