@@ -75,3 +75,8 @@ reportDeprecated = "error"
 
 [tool.setuptools.packages.find]
 include = ["rastera*"]
+
+[tool.setuptools.package-data]
+# Ship the PEP 561 marker so downstream type checkers use rastera's
+# inline annotations instead of reporting missing stubs.
+rastera = ["py.typed"]
