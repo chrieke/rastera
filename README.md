@@ -10,9 +10,9 @@
 
 **Note:** Only COGs & tiled GeoTIFFs are supported. Stripped (non-tiled) TIFFs will not work.
 
-**VRT scope.** Two flavours are handled: *band-stack* VRTs (each band driven by one `<SimpleSource>`, all sources being the same full image) and *processed* VRTs (single-step LUT). Anything that would change *which pixels* a source contributes — mosaicking, windowing or rescaling via `SrcRect`/`DstRect`, warped VRTs, pixel functions, GCP/RPC georeferencing — raises `NotImplementedError` rather than being silently ignored, since a silently wrong pixel is worse than a missing feature. Use `rastera.merge()` to mosaic separate COGs, or GDAL/rasterio for the rest.
+**VRT scope.** Two flavours are handled: *band-stack* VRTs (each band driven by one `<SimpleSource>` or `<ComplexSource>`, all sources being the same full image — this is what `gdalbuildvrt -separate` emits) and *processed* VRTs (single-step LUT). Anything that would change *which pixels* a source contributes — mosaicking, windowing or rescaling via `SrcRect`/`DstRect`, value transforms on a source, warped VRTs, pixel functions, GCP/RPC georeferencing — raises `NotImplementedError` rather than being silently ignored, since a silently wrong pixel is worse than a missing feature. Use `rastera.merge()` to mosaic separate COGs, or GDAL/rasterio for the rest.
 
-*Metadata* the VRT declares is still silently ignored in favour of the first source's: `<VRTRasterBand>`'s `NoDataValue`, `ColorInterp`, `Description`, `dataType`, and the VRT's own `<SRS>` / `<GeoTransform>`. See `rastera/vrt.py`'s module docstring for the full list.
+Band-level `<NoDataValue>` / `<HideNoDataValue>` are honoured; the VRT's other *metadata* (`ColorInterp`, `Description`, `dataType`, `<SRS>`, `<GeoTransform>`) is ignored in favour of the first source's. See `rastera/vrt.py`'s module docstring for the exact rules.
 
 ### Read a single COG
 

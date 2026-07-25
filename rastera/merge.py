@@ -186,8 +186,13 @@ async def merge(
         read_fn=_read_native_bands,
         mosaic_method=mosaic_method,
     )
+    # ``base._nodata``, not ``base_gt.nodata``: the two differ for a VRT, whose
+    # declared <NoDataValue> overrides its source's. The compositing above
+    # already keys off the former, so reporting the latter would advertise a
+    # sentinel the pixels don't use.
+    geotiff_ref = _CrsNodata(CRS.from_epsg(native_crs), base._nodata)
     return _make_output_array(
-        out_data, window_transform, win_width, win_height, base_gt
+        out_data, window_transform, win_width, win_height, geotiff_ref
     )
 
 

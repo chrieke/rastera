@@ -3,6 +3,7 @@
 import math
 
 import numpy as np
+import pytest
 
 from rastera.reader import _coerce_nodata
 
@@ -38,3 +39,18 @@ class TestCoerceNodata:
         result = _coerce_nodata(-32768.0, np.dtype("i2"))
         assert result == -32768
         assert isinstance(result, int)
+
+    @pytest.mark.parametrize(
+        ("nodata", "dtype"),
+        [(-9999.0, "u2"), (65535.0, "u1"), (-32769.0, "i2")],
+    )
+    def test_out_of_range_returns_none_for_int_dtype(self, nodata: float, dtype: str):
+        """No pixel of that dtype can hold the value, and carrying it anyway
+        makes ``np.array(nodata, dtype=...)`` inside resample raise
+        OverflowError. A VRT declaring <NoDataValue>-9999</NoDataValue> over a
+        uint16 source is how this arises."""
+        assert _coerce_nodata(nodata, np.dtype(dtype)) is None
+
+    def test_dtype_bounds_are_inclusive(self):
+        assert _coerce_nodata(65535.0, np.dtype("u2")) == 65535
+        assert _coerce_nodata(-32768.0, np.dtype("i2")) == -32768

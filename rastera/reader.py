@@ -63,6 +63,18 @@ class AsyncGeoTIFF:
             (o.width, o.height) for o in geotiff.overviews
         ]
 
+    def _override_nodata(self, nodata: float) -> None:
+        """Replace the sentinel this dataset's *pixels* use with *nodata*.
+
+        A value this dataset's dtype cannot carry is ignored rather than
+        treated as "no nodata", which would discard a sentinel the file does
+        declare. Subclasses that wrap other datasets override this to push the
+        value down to whoever actually resamples (see ``_VRTDataset``).
+        """
+        coerced = _coerce_nodata(nodata, self._geotiff.dtype)
+        if coerced is not None:
+            self._nodata = coerced
+
     @property
     def count(self) -> int:
         """Number of bands exposed by this dataset."""
@@ -684,12 +696,24 @@ def _make_output_array(
 def _coerce_nodata(
     nodata: float | None, dtype: np.dtype[Any] | None
 ) -> int | float | None:
-    """Coerce nodata from async-geotiff (always float) to match the raster dtype."""
+    """Coerce nodata from async-geotiff (always float) to match the raster dtype.
+
+    Returns None when *dtype* cannot carry the value — NaN on an integer band,
+    or an integer outside the dtype's range. Both mean "this raster has no
+    representable sentinel": no pixel can ever equal it, and carrying it
+    anyway makes ``np.array(nodata, dtype=...)`` inside ``resample`` raise
+    ``OverflowError``. A VRT declaring ``<NoDataValue>-9999</NoDataValue>``
+    over a uint16 source is the case that reaches this (GDAL clamps the value
+    when it fills, so its masked copy is a no-op there too).
+    """
     if nodata is None or dtype is None:
         return None
-    kind = np.dtype(dtype).kind
-    if kind in ("i", "u"):
-        return None if math.isnan(nodata) else int(nodata)
+    dt = np.dtype(dtype)
+    if dt.kind in ("i", "u"):
+        if math.isnan(nodata):
+            return None
+        info = np.iinfo(dt)
+        return None if not info.min <= nodata <= info.max else int(nodata)
     return float(nodata)
 
 
