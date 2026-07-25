@@ -6,9 +6,27 @@ Two flavours are supported:
   ``<SimpleSource>`` that names a source file and a source band. All sources
   are assumed to describe the same spatial image; the VRT's own geotransform,
   SRS, and raster size are ignored in favour of the first source's metadata.
-  More complex VRT features (``<ComplexSource>``, multi-source bands,
-  mosaicking via ``<SrcRect>`` / ``<DstRect>``) are out of scope and raise
-  ``NotImplementedError``.
+  More complex VRT features (``<ComplexSource>`` / ``<AveragedSource>`` /
+  ``<KernelFilteredSource>``, multi-source bands, mosaicking via ``<SrcRect>``
+  / ``<DstRect>``) are out of scope and raise ``NotImplementedError``.
+
+  Because that "same spatial image" assumption is load-bearing, anything in
+  the XML that would contradict it is *rejected* rather than ignored — a
+  silently wrong pixel is worse than a missing feature. Dimension-free checks
+  (rect offsets, rect rescaling, ``<NODATA>`` on a source) happen in
+  ``_parse_vrt_xml``; checks that need a source's real size (rects that window
+  or rescale a sub-region, a declared ``rasterXSize`` / ``rasterYSize`` that
+  differs from the source grid, sources of differing size) happen in
+  ``_validate_source_windows`` once the sources are open. Full-extent identity
+  rects — what ``gdalbuildvrt`` normally emits — are accepted; only rects that
+  disagree with the source grid raise. Band-level ``NoDataValue`` /
+  ``ColorInterp`` / ``Description`` / ``dataType`` are *metadata* and remain
+  inherited from the first source.
+
+  Warped VRTs, pixel-function (``VRTDerivedRasterBand``) bands, and GCP/RPC
+  georeferencing are permanently out of scope — implementing them means
+  reimplementing GDAL's warper and expression engine — and raise with a
+  pointer to GDAL/rasterio.
 
 - *Processed* VRTs (``VRTDataset subClass="VRTProcessedDataset"``): a single
   top-level ``<Input>`` plus a ``<ProcessingSteps>`` block. Only the
@@ -38,10 +56,24 @@ from .store import _fetch_descriptor_bytes, _join_relative_uri
 
 @dataclass(frozen=True, slots=True)
 class _VRTBand:
-    """One output band of a band-stack VRT."""
+    """One output band of a band-stack VRT.
+
+    The rect sizes and ``vrt_declared_size`` exist only to be re-checked
+    against the real source dimensions once the sources are open (see
+    ``_validate_source_windows``); they are never used to transform pixels.
+    ``vrt_declared_size`` is stamped identically on every band.
+    """
 
     source_uri: str
     source_band: int  # 1-based into the source TIFF
+    # <SrcRect>/<DstRect> sizes, when the element is present (their offsets are
+    # already validated to be 0 at parse time). None when absent — GDAL then
+    # reads the full source / writes the full canvas, so an absent rect still
+    # has to line up with the source grid.
+    src_rect_size: tuple[float, float] | None = None
+    dst_rect_size: tuple[float, float] | None = None
+    # The VRT root's declared (rasterXSize, rasterYSize), or None if omitted.
+    vrt_declared_size: tuple[float, float] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -114,6 +146,7 @@ async def _open_vrt(
             meta_overrides=meta_overrides,
             **store_kwargs,
         )
+    _validate_source_windows(bands, sources_map)
     return _VRTDataset(uri, bands, sources_map, meta_overrides=meta_overrides)
 
 
@@ -358,14 +391,25 @@ def _parse_vrt_xml(
     if root.tag != "VRTDataset":
         raise ValueError(f"Not a VRT file (root tag {root.tag!r})")
 
+    _reject_out_of_scope_georeferencing(root)
+
     subclass = root.attrib.get("subClass")
     if subclass == "VRTProcessedDataset":
         return _parse_processed_vrt(root, vrt_uri)
+    if subclass == "VRTWarpedDataset":
+        raise NotImplementedError(
+            "Warped VRTs (VRTDataset subClass='VRTWarpedDataset') are out of "
+            "scope for rastera: honouring one means reimplementing GDAL's "
+            "warper. Use GDAL/rasterio for this VRT, or warp it to a COG "
+            "first and read that."
+        )
     if subclass:
         raise NotImplementedError(
             f"VRTDataset subClass={subclass!r} is not supported; only "
             f"plain band-stack VRTs and 'VRTProcessedDataset' are handled"
         )
+
+    declared_size = _declared_raster_size(root)
 
     source_tags = {
         "SimpleSource",
@@ -376,6 +420,7 @@ def _parse_vrt_xml(
     bands: list[_VRTBand] = []
     for vrt_band in root.findall("VRTRasterBand"):
         band_no = vrt_band.attrib.get("band", "?")
+        _reject_derived_band(vrt_band, band_no)
         sources = [child for child in vrt_band if child.tag in source_tags]
         if not sources:
             raise ValueError(f"Malformed VRT band {band_no}: no source element")
@@ -401,11 +446,229 @@ def _parse_vrt_xml(
             if source_band_el is not None and source_band_el.text
             else 1
         )
-        bands.append(_VRTBand(source_uri=source_uri, source_band=source_band))
+        src_rect_size, dst_rect_size = _reject_unsupported_source(src, band_no)
+        bands.append(
+            _VRTBand(
+                source_uri=source_uri,
+                source_band=source_band,
+                src_rect_size=src_rect_size,
+                dst_rect_size=dst_rect_size,
+                vrt_declared_size=declared_size,
+            )
+        )
 
     if not bands:
         raise ValueError("VRT has no <VRTRasterBand> elements")
     return bands
+
+
+# ---- Unsupported-feature guards ----
+#
+# These only ever raise; none of them transform pixels. Splitting them this way
+# keeps the "all sources are the same full image" assumption honest without
+# pulling any GDAL-style warping/mosaicking into rastera.
+
+_GDAL_HINT = "Use GDAL/rasterio for this VRT, or translate it to a COG first."
+
+
+def _reject_out_of_scope_georeferencing(root: ET.Element) -> None:
+    """Reject GCP- or RPC-georeferenced VRTs (permanently out of scope).
+
+    Both describe a coordinate transform rastera does not run; ignoring them
+    silently falls back to the source's geotransform, which georeferences the
+    output wrongly.
+
+    RPCs are only *rejected* when the VRT has no ``<GeoTransform>``, mirroring
+    GDAL's precedence: with a geotransform present the RPCs are supplementary
+    metadata GDAL itself ignores, and orthorectified products (PNEO / SPOT /
+    Pleiades, Maxar, Planet) routinely carry both — ``gdal_translate -of VRT``
+    copies the domain through. Rejecting those would be a false positive.
+    """
+    if root.find("GCPList") is not None:
+        raise NotImplementedError(
+            f"GCP-georeferenced VRTs (<GCPList>) are out of scope for rastera: "
+            f"honouring them means reimplementing GDAL's GCP transformer. "
+            f"{_GDAL_HINT}"
+        )
+    if root.find("GeoTransform") is not None:
+        return
+    for md in root.findall("Metadata"):
+        if md.attrib.get("domain") == "RPC":
+            raise NotImplementedError(
+                f"RPC-georeferenced VRTs (<Metadata domain='RPC'>) are out of "
+                f"scope for rastera: honouring them means reimplementing "
+                f"GDAL's RPC transformer. {_GDAL_HINT}"
+            )
+
+
+def _reject_derived_band(vrt_band: ET.Element, band_no: str) -> None:
+    """Reject pixel-function bands (permanently out of scope).
+
+    A ``VRTDerivedRasterBand`` computes its pixels with a named (or Python)
+    pixel function. Parsing it as an ordinary band would silently drop that
+    computation and return the raw source pixels instead.
+    """
+    if (
+        vrt_band.attrib.get("subClass") == "VRTDerivedRasterBand"
+        or vrt_band.find("PixelFunctionType") is not None
+    ):
+        raise NotImplementedError(
+            f"VRT band {band_no} is a pixel-function band "
+            f"(VRTDerivedRasterBand / <PixelFunctionType>), which is out of "
+            f"scope for rastera: honouring it means running GDAL's pixel "
+            f"functions. {_GDAL_HINT}"
+        )
+
+
+def _declared_raster_size(root: ET.Element) -> tuple[float, float] | None:
+    """The VRT's declared ``(rasterXSize, rasterYSize)``, or None if absent."""
+    x = root.attrib.get("rasterXSize")
+    y = root.attrib.get("rasterYSize")
+    if x is None or y is None:
+        return None
+    try:
+        return float(x), float(y)
+    except ValueError as e:
+        raise ValueError(f"VRT has malformed rasterXSize/rasterYSize: {e}") from e
+
+
+def _rect(parent: ET.Element, tag: str) -> tuple[float, float, float, float] | None:
+    """Parse a ``<SrcRect>``/``<DstRect>`` child into ``(xOff, yOff, xSize, ySize)``.
+
+    Returns ``None`` when the element is absent. Values are compared exactly
+    downstream: valid band-stack rects are whole pixel counts (exactly
+    representable as floats), and fractional rects only occur in the warped
+    cases we reject anyway.
+    """
+    el = parent.find(tag)
+    if el is None:
+        return None
+    try:
+        return (
+            float(el.attrib["xOff"]),
+            float(el.attrib["yOff"]),
+            float(el.attrib["xSize"]),
+            float(el.attrib["ySize"]),
+        )
+    except KeyError as e:
+        raise ValueError(f"Malformed <{tag}>: missing attribute {e}") from e
+    except ValueError as e:
+        raise ValueError(f"Malformed <{tag}>: non-numeric attribute ({e})") from e
+
+
+def _reject_unsupported_source(
+    src: ET.Element, band_no: str
+) -> tuple[tuple[float, float] | None, tuple[float, float] | None]:
+    """Run the dimension-free ``<SimpleSource>`` checks.
+
+    Returns the ``<SrcRect>`` and ``<DstRect>`` sizes (``None`` for whichever
+    element is absent) so the caller can stash them for
+    ``_validate_source_windows``, which is where they are compared against the
+    source's real dimensions. The rescaling check below only catches a
+    src/dst *disagreement*; a lone rect looks self-consistent here and is
+    caught there.
+    """
+    src_rect = _rect(src, "SrcRect")
+    dst_rect = _rect(src, "DstRect")
+
+    if src_rect is not None and (src_rect[0], src_rect[1]) != (0.0, 0.0):
+        raise NotImplementedError(
+            f"VRT band {band_no} has a <SrcRect> offset "
+            f"(xOff={src_rect[0]:g}, yOff={src_rect[1]:g}); reading a windowed "
+            f"region of a source is not supported. Only full-extent sources "
+            f"are handled."
+        )
+    if dst_rect is not None and (dst_rect[0], dst_rect[1]) != (0.0, 0.0):
+        raise NotImplementedError(
+            f"VRT band {band_no} has a <DstRect> offset "
+            f"(xOff={dst_rect[0]:g}, yOff={dst_rect[1]:g}); this VRT places its "
+            f"source at an offset (mosaicking), which is not supported. Use "
+            f"rastera.merge() to mosaic separate COGs instead."
+        )
+    if (
+        src_rect is not None
+        and dst_rect is not None
+        and (src_rect[2], src_rect[3]) != (dst_rect[2], dst_rect[3])
+    ):
+        raise NotImplementedError(
+            f"VRT band {band_no} rescales its source "
+            f"({src_rect[2]:g}x{src_rect[3]:g} -> {dst_rect[2]:g}x{dst_rect[3]:g}); "
+            f"resampling via <SrcRect>/<DstRect> is not supported. Pass "
+            f"target_resolution to read() instead."
+        )
+    if src.find("NODATA") is not None:
+        raise NotImplementedError(
+            f"VRT band {band_no} declares <NODATA> on its source, which "
+            f"requests nodata-aware compositing that rastera does not perform. "
+            f"Reading it would silently ignore the mask."
+        )
+
+    return (
+        None if src_rect is None else (src_rect[2], src_rect[3]),
+        None if dst_rect is None else (dst_rect[2], dst_rect[3]),
+    )
+
+
+def _validate_source_windows(
+    bands: Sequence[_VRTBand], sources_map: dict[str, AsyncGeoTIFF]
+) -> None:
+    """Check the opened sources really are the one full image the VRT implies.
+
+    This is the authoritative gate for everything that needs a source's true
+    size, which is unknowable while parsing XML: a ``<SrcRect>`` that windows a
+    sub-region of a larger source, a ``<DstRect>`` that covers only part of the
+    output canvas, a declared VRT canvas that differs from the source grid, and
+    sources that disagree with each other. GDAL's optional
+    ``<SourceProperties>`` is deliberately not trusted for this — it may be
+    absent or stale.
+    """
+
+    def dims(src: AsyncGeoTIFF) -> tuple[float, float]:
+        return float(src._geotiff.width), float(src._geotiff.height)
+
+    reference = sources_map[bands[0].source_uri]
+    ref_dims = dims(reference)
+
+    for i, band in enumerate(bands, start=1):
+        src = sources_map[band.source_uri]
+        src_dims = dims(src)
+
+        if src_dims != ref_dims:
+            raise NotImplementedError(
+                f"VRT band {i} source {band.source_uri!r} is "
+                f"{src_dims[0]:g}x{src_dims[1]:g} but band 1 source "
+                f"{bands[0].source_uri!r} is {ref_dims[0]:g}x{ref_dims[1]:g}; "
+                f"band-stack VRTs must reference sources of identical size."
+            )
+        if band.src_rect_size is not None and band.src_rect_size != src_dims:
+            raise NotImplementedError(
+                f"VRT band {i} has a <SrcRect> of "
+                f"{band.src_rect_size[0]:g}x{band.src_rect_size[1]:g} but its "
+                f"source is {src_dims[0]:g}x{src_dims[1]:g}; reading a windowed "
+                f"region of a source is not supported. Only full-extent "
+                f"sources are handled."
+            )
+        if band.dst_rect_size is not None and band.dst_rect_size != src_dims:
+            # Reachable when <DstRect> is the band's only rect: the parse-time
+            # rescaling check needs both rects to spot a mismatch, and an
+            # omitted <SrcRect> means GDAL reads the whole source.
+            raise NotImplementedError(
+                f"VRT band {i} has a <DstRect> of "
+                f"{band.dst_rect_size[0]:g}x{band.dst_rect_size[1]:g} but its "
+                f"source is {src_dims[0]:g}x{src_dims[1]:g}; this VRT scales its "
+                f"source onto a differently sized output canvas, which is not "
+                f"supported. Pass target_resolution to read() instead."
+            )
+
+    declared = bands[0].vrt_declared_size
+    if declared is not None and declared != ref_dims:
+        raise NotImplementedError(
+            f"VRT declares a {declared[0]:g}x{declared[1]:g} raster but its "
+            f"source is {ref_dims[0]:g}x{ref_dims[1]:g}; rastera reads sources "
+            f"on their own grid and cannot resample them onto a different "
+            f"declared canvas. Pass target_resolution to read(), or use "
+            f"GDAL/rasterio for this VRT."
+        )
 
 
 _VSI_SCHEMES = {"vsis3": "s3", "vsigs": "gs", "vsiaz": "az"}

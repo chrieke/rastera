@@ -10,11 +10,9 @@
 
 **Note:** Only COGs & tiled GeoTIFFs are supported. Stripped (non-tiled) TIFFs will not work.
 
-**VRT TODO — band-level features ignored.** The VRT parser currently reads only `<SourceFilename>` + `<SourceBand>` and inherits everything else from the first source. The following are silently dropped:
+**VRT scope.** Two flavours are handled: *band-stack* VRTs (each band driven by one `<SimpleSource>`, all sources being the same full image) and *processed* VRTs (single-step LUT). Anything that would change *which pixels* a source contributes — mosaicking, windowing or rescaling via `SrcRect`/`DstRect`, warped VRTs, pixel functions, GCP/RPC georeferencing — raises `NotImplementedError` rather than being silently ignored, since a silently wrong pixel is worse than a missing feature. Use `rastera.merge()` to mosaic separate COGs, or GDAL/rasterio for the rest.
 
-- `<VRTRasterBand>`: `NoDataValue`, `ColorInterp`, `Description`, `dataType`
-- `<SimpleSource>`: `NODATA`, `SrcRect`, `DstRect`
-- `<ComplexSource>` (any variant): rejected with `NotImplementedError`
+*Metadata* the VRT declares is still silently ignored in favour of the first source's: `<VRTRasterBand>`'s `NoDataValue`, `ColorInterp`, `Description`, `dataType`, and the VRT's own `<SRS>` / `<GeoTransform>`. See `rastera/vrt.py`'s module docstring for the full list.
 
 ### Read a single COG
 

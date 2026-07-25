@@ -52,6 +52,12 @@ RGBNIR_VRT = b"""<VRTDataset rasterXSize="10000" rasterYSize="10000">
   </VRTRasterBand>
 </VRTDataset>"""
 
+# A VRT's declared raster size must match its sources' real dimensions —
+# _validate_source_windows rejects a mismatch, since rastera cannot resample a
+# source onto a different declared canvas. Mock sources for RGBNIR_VRT must
+# therefore be built at its declared size.
+_RGBNIR_DIMS = {"width": 10000, "height": 10000}
+
 
 def _read_result(
     shape: tuple[int, int, int], *, fill: int = 1, dtype: Any = np.uint8
@@ -138,6 +144,149 @@ class TestParseVRTXML:
             )
 
 
+def _one_band_vrt(
+    inner: str = "", *, root_attrs: str = "", band_attrs: str = "", size: int = 100
+) -> bytes:
+    """A minimal single-SimpleSource VRT, with *inner* spliced into the source."""
+    return (
+        f'<VRTDataset rasterXSize="{size}" rasterYSize="{size}" {root_attrs}>'
+        f'<VRTRasterBand band="1" {band_attrs}><SimpleSource>'
+        f"<SourceFilename>/vsis3/b/a.tif</SourceFilename><SourceBand>1</SourceBand>"
+        f"{inner}"
+        f"</SimpleSource></VRTRasterBand></VRTDataset>"
+    ).encode()
+
+
+# ── unsupported-feature rejection (silent-wrong-pixel guards) ───────────────
+
+
+class TestRejectUnsupportedSource:
+    """Elements that change which pixels a source contributes must raise
+    rather than be ignored — a quiet wrong answer is worse than a missing
+    feature. See rastera/vrt.py's guard section."""
+
+    def test_full_extent_identity_rects_still_parse(self):
+        """Real gdalbuildvrt output carries explicit full-extent SrcRect and
+        DstRect. Rejecting on mere presence would break every such VRT."""
+        xml = _one_band_vrt(
+            '<SrcRect xOff="0" yOff="0" xSize="100" ySize="100"/>'
+            '<DstRect xOff="0" yOff="0" xSize="100" ySize="100"/>'
+        )
+        bands = _parse_vrt_xml(xml, "s3://b/x.vrt")
+        assert bands == [
+            _VRTBand(
+                source_uri="s3://b/a.tif",
+                source_band=1,
+                src_rect_size=(100.0, 100.0),
+                dst_rect_size=(100.0, 100.0),
+                vrt_declared_size=(100.0, 100.0),
+            )
+        ]
+
+    def test_no_rects_parses_with_no_recorded_sizes(self):
+        bands = _parse_vrt_xml(_one_band_vrt(), "s3://b/x.vrt")
+        assert bands[0].src_rect_size is None
+        assert bands[0].dst_rect_size is None
+        assert bands[0].vrt_declared_size == (100.0, 100.0)
+
+    def test_dst_rect_offset_rejected(self):
+        """A DstRect offset means mosaicking — the source belongs at a
+        non-origin position, which rastera would silently paste at 0,0."""
+        xml = _one_band_vrt(
+            '<SrcRect xOff="0" yOff="0" xSize="50" ySize="50"/>'
+            '<DstRect xOff="50" yOff="0" xSize="50" ySize="50"/>'
+        )
+        with pytest.raises(NotImplementedError, match="<DstRect> offset"):
+            _parse_vrt_xml(xml, "s3://b/x.vrt")
+
+    def test_src_rect_offset_rejected(self):
+        xml = _one_band_vrt('<SrcRect xOff="10" yOff="0" xSize="50" ySize="50"/>')
+        with pytest.raises(NotImplementedError, match="<SrcRect> offset"):
+            _parse_vrt_xml(xml, "s3://b/x.vrt")
+
+    def test_rescaling_rects_rejected(self):
+        xml = _one_band_vrt(
+            '<SrcRect xOff="0" yOff="0" xSize="100" ySize="100"/>'
+            '<DstRect xOff="0" yOff="0" xSize="50" ySize="50"/>'
+        )
+        with pytest.raises(NotImplementedError, match="rescales its source"):
+            _parse_vrt_xml(xml, "s3://b/x.vrt")
+
+    def test_source_nodata_rejected(self):
+        xml = _one_band_vrt("<NODATA>0</NODATA>")
+        with pytest.raises(NotImplementedError, match="<NODATA>"):
+            _parse_vrt_xml(xml, "s3://b/x.vrt")
+
+    def test_malformed_rect_raises_value_error(self):
+        xml = _one_band_vrt('<SrcRect xOff="0" yOff="0" xSize="50"/>')
+        with pytest.raises(ValueError, match="Malformed <SrcRect>"):
+            _parse_vrt_xml(xml, "s3://b/x.vrt")
+
+
+class TestRejectOutOfScopeFeatures:
+    """Permanently out of scope: honouring these means reimplementing GDAL's
+    warper / pixel functions / GCP-RPC transformers."""
+
+    def test_warped_vrt_rejected(self):
+        xml = _one_band_vrt(root_attrs='subClass="VRTWarpedDataset"')
+        with pytest.raises(NotImplementedError, match="Warped VRTs"):
+            _parse_vrt_xml(xml, "s3://b/x.vrt")
+
+    def test_derived_band_subclass_rejected(self):
+        xml = _one_band_vrt(band_attrs='subClass="VRTDerivedRasterBand"')
+        with pytest.raises(NotImplementedError, match="pixel-function band"):
+            _parse_vrt_xml(xml, "s3://b/x.vrt")
+
+    def test_pixel_function_type_rejected(self):
+        """A single-SimpleSource derived band trips no other guard, so without
+        this check the pixel function is silently dropped."""
+        xml = _one_band_vrt().replace(
+            b"<SimpleSource>",
+            b"<PixelFunctionType>sum</PixelFunctionType><SimpleSource>",
+        )
+        with pytest.raises(NotImplementedError, match="pixel-function band"):
+            _parse_vrt_xml(xml, "s3://b/x.vrt")
+
+    def test_gcp_list_rejected(self):
+        xml = _one_band_vrt().replace(
+            b"><VRTRasterBand", b"><GCPList><GCP/></GCPList><VRTRasterBand"
+        )
+        with pytest.raises(NotImplementedError, match="GCP-georeferenced"):
+            _parse_vrt_xml(xml, "s3://b/x.vrt")
+
+    def test_rpc_metadata_rejected(self):
+        """No <GeoTransform>, so the RPCs are the only georeferencing there is."""
+        xml = _one_band_vrt().replace(
+            b"><VRTRasterBand",
+            b'><Metadata domain="RPC"><MDI key="HEIGHT_OFF">1</MDI></Metadata>'
+            b"<VRTRasterBand",
+        )
+        with pytest.raises(NotImplementedError, match="RPC-georeferenced"):
+            _parse_vrt_xml(xml, "s3://b/x.vrt")
+
+    def test_rpc_metadata_alongside_geotransform_still_parses(self):
+        """GDAL prefers the geotransform when both are present, so RPCs here are
+        supplementary metadata it ignores. Orthorectified products (PNEO/SPOT/
+        Pleiades, Maxar, Planet) ship both and gdal_translate -of VRT copies the
+        domain through — rejecting them would be a false positive."""
+        xml = _one_band_vrt().replace(
+            b"><VRTRasterBand",
+            b"><SRS>EPSG:32633</SRS>"
+            b"<GeoTransform>0.0, 1.0, 0.0, 100.0, 0.0, -1.0</GeoTransform>"
+            b'<Metadata domain="RPC"><MDI key="HEIGHT_OFF">1</MDI></Metadata>'
+            b"<VRTRasterBand",
+        )
+        assert len(_parse_vrt_xml(xml, "s3://b/x.vrt")) == 1
+
+    def test_plain_metadata_domain_still_parses(self):
+        """Only the RPC domain is rejected; ordinary <Metadata> is harmless."""
+        xml = _one_band_vrt().replace(
+            b"><VRTRasterBand",
+            b'><Metadata><MDI key="AREA_OR_POINT">Area</MDI></Metadata><VRTRasterBand',
+        )
+        assert len(_parse_vrt_xml(xml, "s3://b/x.vrt")) == 1
+
+
 # ── source URI resolution ───────────────────────────────────────────────────
 
 
@@ -198,8 +347,8 @@ class TestResolveSourceURI:
 class TestOpenVRT:
     @pytest.mark.asyncio
     async def test_opens_unique_sources_once(self):
-        gt_rgb = make_mock_geotiff(count=3)
-        gt_nir = make_mock_geotiff(count=1)
+        gt_rgb = make_mock_geotiff(count=3, **_RGBNIR_DIMS)
+        gt_nir = make_mock_geotiff(count=1, **_RGBNIR_DIMS)
         rgb_src = AsyncGeoTIFF("s3://bucket/rgb.tif", gt_rgb)
         nir_src = AsyncGeoTIFF("s3://bucket/nir.tif", gt_nir)
 
@@ -227,8 +376,8 @@ class TestOpenVRT:
         """meta_overrides must reach each source open — otherwise the VRT
         wrapper's CRS override is inconsistent with the sources the reads
         dispatch to."""
-        gt_rgb = make_mock_geotiff(count=3)
-        gt_nir = make_mock_geotiff(count=1)
+        gt_rgb = make_mock_geotiff(count=3, **_RGBNIR_DIMS)
+        gt_nir = make_mock_geotiff(count=1, **_RGBNIR_DIMS)
 
         async def fake_open(uri: str, **kwargs: Any) -> AsyncGeoTIFF:
             gt = gt_rgb if "rgb" in uri else gt_nir
@@ -257,9 +406,15 @@ class TestOpenVRT:
         just work — no special casing in _open_vrt_source."""
         from tests.formats.test_dimap import PNEO_DIMAP  # small DIMAP fixture
 
-        vrt_with_xml_source = RGBNIR_VRT.replace(
-            b"/vsis3/bucket/rgb.tif", b"/vsis3/bucket/DIM_PNEO.XML"
-        ).replace(b"/vsis3/bucket/nir.tif", b"/vsis3/bucket/DIM_PNEO.XML")
+        vrt_with_xml_source = (
+            RGBNIR_VRT.replace(b"/vsis3/bucket/rgb.tif", b"/vsis3/bucket/DIM_PNEO.XML")
+            .replace(b"/vsis3/bucket/nir.tif", b"/vsis3/bucket/DIM_PNEO.XML")
+            # Declared size must match the PNEO fixture's real dimensions.
+            .replace(
+                b'rasterXSize="10000" rasterYSize="10000"',
+                b'rasterXSize="800" rasterYSize="1000"',
+            )
+        )
 
         from tests.formats.test_dimap import _patch_sniff
 
@@ -315,6 +470,79 @@ class TestOpenVRT:
         assert "s3://bucket/v.vrt" in msg
         assert "rgb.tif" in msg or "nir.tif" in msg
         assert "DIMAP" in msg
+
+
+class TestValidateSourceWindows:
+    """Checks that need a source's *real* size, which is unknowable while
+    parsing XML — so they run once the sources are open."""
+
+    @staticmethod
+    async def _open(xml: bytes, *, width: int, height: int) -> AsyncGeoTIFF:
+        gt = make_mock_geotiff(count=3, width=width, height=height)
+
+        async def fake_open(uri: str, **_: Any) -> AsyncGeoTIFF:
+            return AsyncGeoTIFF(uri, gt)
+
+        with (
+            patch(
+                "rastera.vrt._fetch_descriptor_bytes", new=AsyncMock(return_value=xml)
+            ),
+            patch.object(AsyncGeoTIFF, "open", side_effect=fake_open),
+        ):
+            return await _open_vrt("s3://bucket/v.vrt")
+
+    @pytest.mark.asyncio
+    async def test_src_rect_windowing_larger_source_rejected(self):
+        """SrcRect sizes match DstRect and offsets are 0, so the parse-time
+        guard passes — but the source is physically bigger, so this VRT wants a
+        sub-window rastera would silently read past."""
+        xml = _one_band_vrt(
+            '<SrcRect xOff="0" yOff="0" xSize="500" ySize="500"/>'
+            '<DstRect xOff="0" yOff="0" xSize="500" ySize="500"/>',
+            size=500,
+        )
+        with pytest.raises(NotImplementedError, match="<SrcRect> of 500x500"):
+            await self._open(xml, width=1000, height=1000)
+
+    @pytest.mark.asyncio
+    async def test_lone_dst_rect_smaller_than_source_rejected(self):
+        """With no SrcRect to compare against, the parse-time rescaling guard
+        can't fire — but GDAL reads the whole source and squeezes it into the
+        DstRect, so accepting this would return unresampled full-size pixels."""
+        xml = _one_band_vrt('<DstRect xOff="0" yOff="0" xSize="50" ySize="50"/>')
+        with pytest.raises(NotImplementedError, match="<DstRect> of 50x50"):
+            await self._open(xml, width=100, height=100)
+
+    @pytest.mark.asyncio
+    async def test_declared_size_mismatch_rejected(self):
+        """No rects at all: the VRT just declares a canvas that differs from
+        its source, which GDAL would resample onto and rastera would not."""
+        with pytest.raises(NotImplementedError, match="declares a 500x500 raster"):
+            await self._open(_one_band_vrt(size=500), width=1000, height=1000)
+
+    @pytest.mark.asyncio
+    async def test_consistent_sizes_pass(self):
+        ds = await self._open(_one_band_vrt(size=500), width=500, height=500)
+        assert isinstance(ds, _VRTDataset)
+
+    @pytest.mark.asyncio
+    async def test_mismatched_sources_rejected_at_open(self):
+        """Previously only surfaced lazily, as a generic shape error on read."""
+        gt_small = make_mock_geotiff(count=3, width=10000, height=10000)
+        gt_big = make_mock_geotiff(count=1, width=9999, height=10000)
+
+        async def fake_open(uri: str, **_: Any) -> AsyncGeoTIFF:
+            return AsyncGeoTIFF(uri, gt_small if "rgb" in uri else gt_big)
+
+        with (
+            patch(
+                "rastera.vrt._fetch_descriptor_bytes",
+                new=AsyncMock(return_value=RGBNIR_VRT),
+            ),
+            patch.object(AsyncGeoTIFF, "open", side_effect=fake_open),
+            pytest.raises(NotImplementedError, match="identical size"),
+        ):
+            await _open_vrt("s3://bucket/v.vrt")
 
 
 class TestVRTRead:
