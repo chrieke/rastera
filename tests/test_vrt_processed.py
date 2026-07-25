@@ -7,8 +7,9 @@ import numpy as np
 import pytest
 from affine import Affine
 from async_geotiff import RasterArray
+from pyproj import CRS
 
-from rastera.reader import AsyncGeoTIFF
+from rastera.reader import AsyncGeoTIFF, _CrsNodata
 from rastera.vrt import (
     _LUT_SIZE,
     _compile_lut,
@@ -64,9 +65,7 @@ def _processed_vrt(
 </VRTDataset>""".encode()
 
 
-def _src_array(
-    shape: tuple[int, int, int], *, dtype: Any = np.uint16
-) -> RasterArray:
+def _src_array(shape: tuple[int, int, int], *, dtype: Any = np.uint16) -> RasterArray:
     data = np.zeros(shape, dtype=dtype)
     # Stripe distinct values across bands so we can verify per-band LUT routing.
     for i in range(shape[0]):
@@ -119,6 +118,17 @@ class TestCompileLut:
         assert lut[0] == 0
         # Non-nodata values are unaffected by the override.
         assert lut[100] == 200
+
+    def test_half_values_round_up_like_gdal(self):
+        """GDAL's LUT returns a double and its Float64 -> Byte conversion
+        rounds half away from zero, so an interpolated x.5 must go up.
+        numpy's default (``rint``, half-to-even) sends the even cases down
+        instead — measured against real display VRTs, that was ~3% of
+        pixels one DN too low."""
+        # Output steps by 1 across an input span of 2, so every odd input
+        # interpolates to exactly x.5.
+        lut = _compile_lut("0.0:0,2.0:1,4.0:2,6.0:3", src_nodata=0, dst_nodata=0)
+        assert [int(lut[v]) for v in (1, 3, 5)] == [1, 2, 3]
 
     def test_rejects_decreasing_x(self):
         with pytest.raises(ValueError, match="non-decreasing"):
@@ -218,6 +228,43 @@ class TestParseProcessedVRT:
         with pytest.raises(ValueError, match="lut_2"):
             _parse_vrt_xml(xml, "s3://b/x.vrt")
 
+    def test_band_nodata_matching_dst_nodata_accepted(self):
+        """Real display VRTs carry <NoDataValue> on every processed band
+        *alongside* the LUT's dst_nodata, agreeing. rastera reports
+        dst_nodata, so agreement is all that is required."""
+        xml = _processed_vrt(n_bands=2, dst_nodata=0).replace(
+            b"<Description>B1</Description>",
+            b"<Description>B1</Description><NoDataValue>0</NoDataValue>",
+        )
+        assert isinstance(_parse_vrt_xml(xml, "s3://b/x.vrt"), _VRTProcessedSpec)
+
+    def test_band_nodata_disagreeing_with_dst_nodata_rejected(self):
+        """If they diverged, every masked pixel would hold dst_nodata while the
+        dataset advertised the band's value. Raise rather than pick a winner."""
+        xml = _processed_vrt(n_bands=2, dst_nodata=0).replace(
+            b"<Description>B1</Description>",
+            b"<Description>B1</Description><NoDataValue>255</NoDataValue>",
+        )
+        with pytest.raises(NotImplementedError, match="cannot honour both"):
+            _parse_vrt_xml(xml, "s3://b/x.vrt")
+
+    def test_nonzero_dst_nodata_agreeing_accepted(self):
+        """dst_nodata is 0 in every other test here, which makes the LUT's
+        nodata override indistinguishable from the table's own output at 0.
+        With 255 the override has to actually do something."""
+        xml = _processed_vrt(n_bands=2, src_nodata=0, dst_nodata=255).replace(
+            b"<Description>B1</Description>",
+            b"<Description>B1</Description><NoDataValue>255</NoDataValue>",
+        )
+        spec = _parse_vrt_xml(xml, "s3://b/x.vrt")
+        assert isinstance(spec, _VRTProcessedSpec)
+        assert spec.dst_nodata == 255
+        # The control-point table maps 0 -> 0; the src_nodata override wins.
+        assert spec.luts[0][0] == 255
+        assert spec.luts[1][0] == 255
+        # And only at src_nodata — neighbouring inputs keep their table value.
+        assert spec.luts[0][100] != 255
+
 
 # ── _VRTProcessedDataset reads ──────────────────────────────────────────────
 
@@ -276,6 +323,23 @@ class TestProcessedRead:
         # Second requested band is output band 0 → source array row 1 fill 200,
         # apply lut_1 (index 0) to it.
         np.testing.assert_array_equal(data[1], ds._spec.luts[0][200])
+
+    @pytest.mark.asyncio
+    async def test_reprojected_read_reports_the_target_crs(self):
+        """The LUT does not move pixels, but ``target_crs`` reprojection happens
+        inside the source read — so the result's CRS is whatever the sub-read
+        produced, not this dataset's own (source) CRS."""
+        ds, source = _make_processed_ds(n_bands=2)
+        reprojected = _src_array((2, 3, 3))
+        # What reader.py hands back from a reprojecting read: a stub carrying
+        # the *target* CRS.
+        object.__setattr__(reprojected, "_geotiff", _CrsNodata(CRS.from_epsg(4326), 0))
+        source.read = AsyncMock(return_value=reprojected)
+
+        arr = await ds.read(target_crs=4326)
+        assert arr.crs.to_epsg() == 4326
+        # nodata still comes from the LUT step, which is what writes it.
+        assert arr.nodata == ds._spec.dst_nodata
 
     @pytest.mark.asyncio
     async def test_use_overviews_rejected(self):
@@ -358,9 +422,7 @@ class TestOpenProcessedVRT:
             ),
             patch.object(AsyncGeoTIFF, "open", side_effect=fake_open) as mock_open,
         ):
-            ds = await _open_vrt(
-                "s3://b/x.vrt", meta_overrides={"crs": 3006}
-            )
+            ds = await _open_vrt("s3://b/x.vrt", meta_overrides={"crs": 3006})
 
         assert mock_open.await_args.kwargs["meta_overrides"] == {"crs": 3006}
         assert ds._crs_epsg == 3006

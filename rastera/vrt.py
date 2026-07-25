@@ -3,25 +3,41 @@
 Two flavours are supported:
 
 - *Band-stack* VRTs: each ``<VRTRasterBand>`` is driven by a single
-  ``<SimpleSource>`` that names a source file and a source band. All sources
-  are assumed to describe the same spatial image; the VRT's own geotransform,
-  SRS, and raster size are ignored in favour of the first source's metadata.
-  More complex VRT features (``<ComplexSource>`` / ``<AveragedSource>`` /
+  ``<SimpleSource>`` or ``<ComplexSource>`` that names a source file and a
+  source band. All sources are assumed to describe the same spatial image; the
+  VRT's own geotransform, SRS, and raster size are ignored in favour of the
+  first source's metadata. Other VRT features (``<AveragedSource>`` /
   ``<KernelFilteredSource>``, multi-source bands, mosaicking via ``<SrcRect>``
   / ``<DstRect>``) are out of scope and raise ``NotImplementedError``.
+
+  ``<ComplexSource>`` is accepted only when it is *semantically* a
+  ``<SimpleSource>`` — see ``_SIMPLE_SOURCE_CHILDREN``. That is not a
+  technicality: ``gdalbuildvrt -separate`` emits ``<ComplexSource>`` with a
+  ``<NODATA>`` child for every band whose source declares a nodata value, so
+  the canonical band-stack VRT is a ComplexSource one. Any child that
+  transforms pixel *values* (``<ScaleOffset>`` / ``<ScaleRatio>`` /
+  ``<LUT>`` / ``<Exponent>``) or masks them (``<UseMaskBand>`` /
+  ``<ColorTableComponent>``) still raises. ``<NODATA>`` is honoured — and
+  policed — only on ``<ComplexSource>``, which is the only place GDAL reads
+  it (see ``_reject_remapping_nodata``).
 
   Because that "same spatial image" assumption is load-bearing, anything in
   the XML that would contradict it is *rejected* rather than ignored — a
   silently wrong pixel is worse than a missing feature. Dimension-free checks
-  (rect offsets, rect rescaling, ``<NODATA>`` on a source) happen in
+  (rect offsets, rect rescaling, value-transforming source children,
+  ``<NODATA>`` that would remap pixels) happen in
   ``_parse_vrt_xml``; checks that need a source's real size (rects that window
   or rescale a sub-region, a declared ``rasterXSize`` / ``rasterYSize`` that
   differs from the source grid, sources of differing size) happen in
   ``_validate_source_windows`` once the sources are open. Full-extent identity
   rects — what ``gdalbuildvrt`` normally emits — are accepted; only rects that
-  disagree with the source grid raise. Band-level ``NoDataValue`` /
-  ``ColorInterp`` / ``Description`` / ``dataType`` are *metadata* and remain
-  inherited from the first source.
+  disagree with the source grid raise. Band-level ``ColorInterp`` /
+  ``Description`` / ``dataType`` are *metadata* and remain inherited from the
+  first source; ``NoDataValue`` is the exception and *is* honoured, because
+  ignoring it makes ``merge`` composite nodata over real pixels (see
+  ``_declared_nodata``) and makes ``bilinear`` / ``cubic`` reads average nodata
+  into the kernel (see ``_VRTDataset._override_nodata``). ``HideNoDataValue``
+  is honoured alongside it (see ``_hides_nodata``).
 
   Warped VRTs, pixel-function (``VRTDerivedRasterBand``) bands, and GCP/RPC
   georeferencing are permanently out of scope — implementing them means
@@ -38,6 +54,7 @@ Two flavours are supported:
 
 from __future__ import annotations
 
+import math
 import xml.etree.ElementTree as ET
 from collections.abc import Awaitable, Sequence
 from dataclasses import dataclass
@@ -49,7 +66,12 @@ from pyproj import CRS
 
 from . import config
 from .geo import BBox, normalize_band_indices
-from .reader import AsyncGeoTIFF, MetaOverrides, _make_output_array
+from .reader import (
+    AsyncGeoTIFF,
+    MetaOverrides,
+    _CrsNodata,
+    _make_output_array,
+)
 from .resampling import ResamplingMethod
 from .store import _fetch_descriptor_bytes, _join_relative_uri
 
@@ -74,6 +96,14 @@ class _VRTBand:
     dst_rect_size: tuple[float, float] | None = None
     # The VRT root's declared (rasterXSize, rasterYSize), or None if omitted.
     vrt_declared_size: tuple[float, float] | None = None
+    # The band's own <NoDataValue>, or None when it declares none. Unlike the
+    # rest of the VRT's metadata this is *honoured* — see _declared_nodata.
+    nodata: float | None = None
+    # <HideNoDataValue>: the band fills masked pixels with `nodata` but does
+    # not report it (GDAL's GetNoDataValue returns none). So `nodata` still
+    # governs _reject_remapping_nodata and is still skipped by
+    # _declared_nodata — the two uses genuinely diverge here.
+    hide_nodata: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -170,6 +200,41 @@ class _VRTDataset(AsyncGeoTIFF):
         self._band_sources: list[tuple[AsyncGeoTIFF, int]] = [
             (sources_map[b.source_uri], b.source_band) for b in bands
         ]
+        declared = _declared_nodata(bands)
+        if declared is not None:
+            self._override_nodata(declared)
+        elif _hides_declared_nodata(bands):
+            # Not silence — an explicit "report nothing". Inheriting the
+            # source's value here is what makes rastera punch holes in the
+            # opaque background the flag exists to preserve.
+            self._nodata = None
+
+    def _override_nodata(self, nodata: float) -> None:
+        """Adopt *nodata* and push it onto the sources, which do the resampling.
+
+        Reporting it on the VRT alone is not enough: ``read()`` forwards
+        ``target_crs`` / ``target_resolution`` to each source, and
+        ``resample``'s bilinear/cubic kernels renormalize around whatever
+        nodata *that source* carries. A source declaring none — the shape this
+        whole feature exists for — would otherwise average the VRT's nodata
+        pixels in as if they were real values. (``nearest`` is unaffected;
+        there nodata is only a fill value.)
+
+        Mutating a source is safe because these wrappers are ours:
+        ``AsyncGeoTIFF.open`` caches only the inner ``GeoTIFF``, so a wrapper
+        is constructed fresh per ``_open_vrt`` and is never shared with another
+        dataset. Sharing *within* one VRT is deliberate and consistent —
+        ``_declared_nodata`` already enforces a single value per VRT.
+
+        Dispatch handles the source flavours: a nested VRT source recurses
+        through this same method, while a ``_VRTProcessedDataset`` source
+        inherits the base method and stops here on purpose — its nodata is
+        post-LUT Byte while its own child resamples pre-LUT reflectance, so
+        pushing this value further down would corrupt pixels.
+        """
+        super()._override_nodata(nodata)
+        for src in {id(s): s for s, _ in self._band_sources}.values():
+            src._override_nodata(nodata)
 
     @property
     def count(self) -> int:
@@ -210,6 +275,7 @@ class _VRTDataset(AsyncGeoTIFF):
                 use_overviews=False,
                 resampling=resampling,
             ),
+            output_nodata=self._nodata,
         )
 
     async def _read_native(
@@ -240,6 +306,7 @@ class _VRTDataset(AsyncGeoTIFF):
             # indices; stored source_band values are 1-based.
             source_band_offset=-1,
             read_kwargs=dict(bbox=bbox, window=window, snap_to_grid=snap_to_grid),
+            output_nodata=self._nodata,
         )
 
     def __repr__(self) -> str:
@@ -361,12 +428,16 @@ class _VRTProcessedDataset(AsyncGeoTIFF):
         )
         for i, b0 in enumerate(band_indices_0):
             out[i] = self._spec.luts[b0][in_data[i]]
+        # Take the CRS from the sub-read, not from ``self._geotiff``: a read
+        # with ``target_crs`` reprojects inside the source, and reporting our
+        # own (source) CRS would label the returned pixels with the wrong one.
+        # The nodata is ours, since the LUT writes ``dst_nodata``.
         return _make_output_array(
             out,
             src_result.transform,
             src_result.width,
             src_result.height,
-            self._geotiff,
+            _CrsNodata(src_result.crs, self._nodata),
         )
 
     def __repr__(self) -> str:
@@ -430,10 +501,10 @@ def _parse_vrt_xml(
                 f"single-SimpleSource band-stack VRTs are supported"
             )
         src = sources[0]
-        if src.tag != "SimpleSource":
+        if src.tag not in ("SimpleSource", "ComplexSource"):
             raise NotImplementedError(
                 f"VRT band {band_no} uses <{src.tag}>; only <SimpleSource> "
-                f"is supported"
+                f"and <ComplexSource> are supported"
             )
         filename_el = src.find("SourceFilename")
         if filename_el is None or not filename_el.text:
@@ -446,7 +517,10 @@ def _parse_vrt_xml(
             if source_band_el is not None and source_band_el.text
             else 1
         )
-        src_rect_size, dst_rect_size = _reject_unsupported_source(src, band_no)
+        band_nodata = _band_nodata(vrt_band, band_no)
+        src_rect_size, dst_rect_size = _reject_unsupported_source(
+            src, band_no, band_nodata
+        )
         bands.append(
             _VRTBand(
                 source_uri=source_uri,
@@ -454,11 +528,17 @@ def _parse_vrt_xml(
                 src_rect_size=src_rect_size,
                 dst_rect_size=dst_rect_size,
                 vrt_declared_size=declared_size,
+                nodata=band_nodata,
+                hide_nodata=_hides_nodata(vrt_band),
             )
         )
 
     if not bands:
         raise ValueError("VRT has no <VRTRasterBand> elements")
+    # Dimension-free, so it belongs here with the other guards rather than in
+    # _VRTDataset.__init__ — this rejects an unrepresentable VRT before any
+    # source header is fetched. The value itself is read again at construction.
+    _declared_nodata(bands)
     return bands
 
 
@@ -556,10 +636,22 @@ def _rect(parent: ET.Element, tag: str) -> tuple[float, float, float, float] | N
         raise ValueError(f"Malformed <{tag}>: non-numeric attribute ({e})") from e
 
 
+# The only children a source may carry and still be a plain "copy these
+# pixels through" source. Everything else GDAL defines on <ComplexSource>
+# transforms or masks pixel values (<ScaleOffset>, <ScaleRatio>, <LUT>,
+# <Exponent>, <SrcMin>/<SrcMax>/<DstMin>/<DstMax>, <UseMaskBand>,
+# <ColorTableComponent>) or changes how the source is opened (<OpenOptions>).
+# Whitelisting rather than blacklisting means a future GDAL element raises
+# instead of being silently dropped.
+_SIMPLE_SOURCE_CHILDREN = frozenset(
+    {"SourceFilename", "SourceBand", "SourceProperties", "SrcRect", "DstRect", "NODATA"}
+)
+
+
 def _reject_unsupported_source(
-    src: ET.Element, band_no: str
+    src: ET.Element, band_no: str, band_nodata: float | None
 ) -> tuple[tuple[float, float] | None, tuple[float, float] | None]:
-    """Run the dimension-free ``<SimpleSource>`` checks.
+    """Run the dimension-free source checks.
 
     Returns the ``<SrcRect>`` and ``<DstRect>`` sizes (``None`` for whichever
     element is absent) so the caller can stash them for
@@ -568,6 +660,16 @@ def _reject_unsupported_source(
     src/dst *disagreement*; a lone rect looks self-consistent here and is
     caught there.
     """
+    for child in src:
+        if child.tag not in _SIMPLE_SOURCE_CHILDREN:
+            raise NotImplementedError(
+                f"VRT band {band_no} has a <{child.tag}> on its <{src.tag}>, "
+                f"which asks for a per-pixel transform (rescaling, LUT "
+                f"remapping, or masking) that rastera does not apply. "
+                f"Reading it would silently return untransformed pixels. "
+                f"{_GDAL_HINT}"
+            )
+
     src_rect = _rect(src, "SrcRect")
     dst_rect = _rect(src, "DstRect")
 
@@ -596,17 +698,184 @@ def _reject_unsupported_source(
             f"resampling via <SrcRect>/<DstRect> is not supported. Pass "
             f"target_resolution to read() instead."
         )
-    if src.find("NODATA") is not None:
-        raise NotImplementedError(
-            f"VRT band {band_no} declares <NODATA> on its source, which "
-            f"requests nodata-aware compositing that rastera does not perform. "
-            f"Reading it would silently ignore the mask."
-        )
+    _reject_remapping_nodata(src, band_no, band_nodata)
 
     return (
         None if src_rect is None else (src_rect[2], src_rect[3]),
         None if dst_rect is None else (dst_rect[2], dst_rect[3]),
     )
+
+
+def _band_nodata(vrt_band: ET.Element, band_no: str) -> float | None:
+    """The band's declared ``<NoDataValue>``, or None when absent.
+
+    Used both to decide whether a source's ``<NODATA>`` is a no-op (see
+    ``_reject_remapping_nodata``) and as the dataset's nodata (see
+    ``_declared_nodata``).
+    """
+    el = vrt_band.find("NoDataValue")
+    if el is None or not el.text or not el.text.strip():
+        return None
+    try:
+        return float(el.text)
+    except ValueError as e:
+        raise ValueError(
+            f"VRT band {band_no} has a malformed <NoDataValue>: {e}"
+        ) from e
+
+
+def _hides_nodata(vrt_band: ET.Element) -> bool:
+    """Whether the band carries ``<HideNoDataValue>``, GDAL's "fill with this
+    but do not report it" flag (``gdalbuildvrt -hidenodata``).
+
+    Only the *reported* value is suppressed. Verified on GDAL 3.12: a band with
+    ``<NoDataValue>100</NoDataValue><HideNoDataValue>1</HideNoDataValue>`` and a
+    source ``<NODATA>50</NODATA>`` still reads 50 back as 100, while
+    ``gdalinfo`` reports no nodata at all. So ``_band_nodata`` must keep
+    returning the value for ``_reject_remapping_nodata``; only
+    ``_declared_nodata`` skips it.
+
+    Honouring the flag matters because it inverts compositing: the point of
+    ``-hidenodata`` is that the fill value is *opaque* background, so reporting
+    it would make ``merge`` paste a neighbour's pixels through it.
+    """
+    el = vrt_band.find("HideNoDataValue")
+    if el is None or not el.text or not el.text.strip():
+        return False
+    # GDAL writes 1; treat anything it would read as true the same way.
+    return el.text.strip() not in ("0", "false", "FALSE")
+
+
+def _reject_remapping_nodata(
+    src: ET.Element, band_no: str, band_nodata: float | None
+) -> None:
+    """Reject a ``<ComplexSource>``'s ``<NODATA>`` that would remap pixels.
+
+    GDAL renders a band by filling the output with the band's
+    ``<NoDataValue>`` (or 0 when unset), then copying in each source while
+    *skipping* pixels equal to that source's ``<NODATA>``. For the single
+    full-extent source this module supports, the result is therefore
+    ``src[p] if src[p] != NODATA else fill`` — which is exactly the raw
+    source pixels when ``NODATA == fill``, and rastera returning them
+    unchanged is bit-correct.
+
+    That equality is the common case, not a lucky one:
+    ``gdalbuildvrt -separate`` writes ``<NODATA>v</NODATA>`` alongside
+    ``<NoDataValue>v</NoDataValue>`` for every band whose source declares a
+    nodata value. When the two disagree, GDAL really does remap one sentinel
+    to another and rastera would silently return the un-remapped value, so
+    that case still raises.
+
+    Only ``<ComplexSource>`` gets this treatment. ``<NODATA>`` is a
+    ComplexSource-only element: ``VRTSimpleSource`` never parses it, so GDAL
+    copies the source through untouched and rastera doing the same is already
+    bit-correct. Verified on GDAL 3.12 — one source pixel of 7 under
+    ``<NODATA>7</NODATA>`` + ``<NoDataValue>0</NoDataValue>`` reads back as 7
+    through a SimpleSource and 0 through a ComplexSource. Raising on the
+    SimpleSource form would reject a VRT we can read exactly.
+
+    Known over-rejection: the comparison is done in double space, but GDAL
+    fills in the *band's* data type, so a ``<NoDataValue>`` outside that range
+    is clamped and the masked copy becomes a no-op after all. Verified —
+    ``gdalbuildvrt -separate -vrtnodata -9999`` over Byte sources with nodata 0
+    emits ``<NoDataValue>-9999</NoDataValue>`` + ``<NODATA>0</NODATA>`` and
+    GDAL returns the raw source pixels, while this raises. Left as is: a
+    missing feature is this module's acceptable failure mode, and closing it
+    needs a second clamp keyed off the XML ``dataType`` attribute.
+    """
+    if src.tag != "ComplexSource":
+        return
+    el = src.find("NODATA")
+    if el is None or not el.text or not el.text.strip():
+        return
+    try:
+        source_nodata = float(el.text)
+    except ValueError as e:
+        raise ValueError(f"VRT band {band_no} has a malformed <NODATA>: {e}") from e
+
+    fill = 0.0 if band_nodata is None else band_nodata
+    if source_nodata == fill or (math.isnan(source_nodata) and math.isnan(fill)):
+        return
+
+    declared = (
+        "the band declares no <NoDataValue>, so GDAL fills masked pixels with 0"
+        if band_nodata is None
+        else f"the band's <NoDataValue> is {band_nodata:g}"
+    )
+    raise NotImplementedError(
+        f"VRT band {band_no} declares <NODATA>{source_nodata:g}</NODATA> on its "
+        f"source but {declared}; GDAL would remap those pixels to {fill:g} and "
+        f"rastera does not perform that compositing. Reading it would silently "
+        f"return {source_nodata:g} instead. {_GDAL_HINT}"
+    )
+
+
+def _declared_nodata(bands: Sequence[_VRTBand]) -> float | None:
+    """The nodata value the VRT itself declares, or None when it declares none.
+
+    This is the one piece of ``<VRTRasterBand>`` metadata rastera does *not*
+    ignore, because ignoring it is not a cosmetic loss. A common shape is a
+    band-stack VRT over a DIMAP descriptor: the VRT declares
+    ``<NoDataValue>0</NoDataValue>`` per band while the descriptor declares
+    nothing, so inheriting the source's ``None`` makes the black corners of a
+    rotated orthorectified footprint look like valid zeros — and ``merge`` then
+    composites them *over* a neighbour's real pixels. Measured against GDAL on
+    two overlapping rotated footprints, 82% of a 128x128 window came back zero
+    where GDAL returned imagery.
+
+    Bands that declare nothing are ignored rather than treated as "no nodata":
+    GDAL reports a dataset-level nodata from band 1, and a band-stack VRT with
+    a mix is far more likely to be sloppy XML than a genuine per-band scheme.
+    Two bands declaring *different* values cannot be represented by rastera's
+    single scalar at all, so that raises.
+
+    A band that hides its value (``<HideNoDataValue>``, what
+    ``gdalbuildvrt -hidenodata`` writes) declares one for *filling* but not for
+    *reporting*, so it is skipped here — see ``_hides_declared_nodata``, which
+    is what stops the source's value being inherited in its place.
+
+    The value is used for compositing (``merge``), for reporting, and — via
+    ``_VRTDataset._override_nodata`` — for the resampling the sources perform
+    on the VRT's behalf.
+    """
+    declared = {b.nodata for b in bands if b.nodata is not None and not b.hide_nodata}
+    # NaN is never equal to itself, so a NaN-nodata VRT would look like a
+    # disagreement; collapse those first.
+    non_nan = {v for v in declared if not math.isnan(v)}
+    if len(declared) > len(non_nan):  # at least one NaN present
+        if non_nan:
+            raise NotImplementedError(
+                f"VRT bands declare both NaN and {sorted(non_nan)} as "
+                f"<NoDataValue>; rastera carries one nodata per dataset. "
+                f"{_GDAL_HINT}"
+            )
+        return math.nan
+    if len(non_nan) > 1:
+        raise NotImplementedError(
+            f"VRT bands declare differing <NoDataValue>s {sorted(non_nan)}; "
+            f"rastera carries one nodata per dataset, so honouring them all "
+            f"is not possible. {_GDAL_HINT}"
+        )
+    return next(iter(non_nan)) if non_nan else None
+
+
+def _hides_declared_nodata(bands: Sequence[_VRTBand]) -> bool:
+    """Whether every band declaring a ``<NoDataValue>`` also hides it.
+
+    Only meaningful when ``_declared_nodata`` came back None: it separates "the
+    VRT said nothing about nodata" (fall back to the source's, rastera's
+    long-standing default) from "the VRT said to report none". GDAL reports no
+    nodata for a hidden band and never consults the source's, and the whole
+    point of ``-hidenodata`` is that the fill value is *opaque* background — so
+    inheriting the source's here would make ``merge`` paste a neighbour's pixels
+    through it, which is the bug the flag exists to avoid.
+
+    The sources keep their own nodata: the value still governs
+    ``_reject_remapping_nodata`` and still fills masked pixels in GDAL, so this
+    suppresses reporting and compositing only.
+    """
+    declaring = [b for b in bands if b.nodata is not None]
+    return bool(declaring) and all(b.hide_nodata for b in declaring)
 
 
 def _validate_source_windows(
@@ -739,6 +1008,7 @@ async def _dispatch_source_reads(
     *,
     source_band_offset: int,
     read_kwargs: dict[str, Any],
+    output_nodata: int | float | None,
 ) -> RasterArray:
     """Group output bands by source, invoke *method_name* on each source with
     the bundled source-band list, and reassemble into VRT output order.
@@ -747,6 +1017,10 @@ async def _dispatch_source_reads(
     *source_band_offset* is added to each source's stored (1-based) source band
     before it is forwarded — 0 for public ``read`` (keeps 1-based), -1 for
     internal ``_read_native`` (converts to 0-based).
+    *output_nodata* is the VRT's own nodata; when it differs from what the
+    sources report, the result carries the VRT's value instead of theirs. It has
+    no default on purpose — defaulting to ``None`` would make a caller that
+    forgets it silently strip the sources' nodata from the result.
     """
     # Group output bands by source while preserving output order within each group.
     groups: dict[int, tuple[AsyncGeoTIFF, list[tuple[int, int]]]] = {}
@@ -785,12 +1059,21 @@ async def _dispatch_source_reads(
         for i, (out_idx, _) in enumerate(entries):
             out_data[out_idx] = res_data[i]
 
+    # Keep the sub-read's own ``_geotiff`` (which already reflects any
+    # reprojection) unless it reports a different nodata than the VRT carries;
+    # then swap in a stub that keeps the result's CRS. Still needed even though
+    # _VRTDataset pushes its nodata onto the sources, because a native sub-read
+    # returns the source's raw GeoTIFF, whose nodata is the file's.
+    geotiff_ref: Any = first._geotiff
+    if output_nodata != first.nodata:
+        geotiff_ref = _CrsNodata(first.crs, output_nodata)
+
     return _make_output_array(
         out_data,
         first.transform,
         first.width,
         first.height,
-        first._geotiff,
+        geotiff_ref,
     )
 
 
@@ -804,18 +1087,14 @@ async def _dispatch_source_reads(
 _LUT_SIZE = 65536
 
 
-def _parse_processed_vrt(
-    root: ET.Element, vrt_uri: str
-) -> _VRTProcessedSpec:
+def _parse_processed_vrt(root: ET.Element, vrt_uri: str) -> _VRTProcessedSpec:
     """Parse a ``VRTDataset subClass='VRTProcessedDataset'``."""
     input_el = root.find("Input")
     if input_el is None:
         raise ValueError("VRTProcessedDataset: missing <Input>")
     filename_el = input_el.find("SourceFilename")
     if filename_el is None or not filename_el.text:
-        raise ValueError(
-            "VRTProcessedDataset: missing <Input>/<SourceFilename>"
-        )
+        raise ValueError("VRTProcessedDataset: missing <Input>/<SourceFilename>")
     relative = filename_el.attrib.get("relativeToVRT", "0") == "1"
     input_uri = _resolve_source_uri(filename_el.text, relative, vrt_uri)
 
@@ -876,6 +1155,8 @@ def _parse_processed_vrt(
             )
         luts[i] = _compile_lut(args[key], src_nodata=src_nodata, dst_nodata=dst_nodata)
 
+    _reject_processed_nodata_mismatch(output_bands, dst_nodata)
+
     return _VRTProcessedSpec(
         input_uri=input_uri,
         luts=luts,
@@ -885,9 +1166,31 @@ def _parse_processed_vrt(
     )
 
 
-def _compile_lut(
-    arg_text: str, *, src_nodata: int, dst_nodata: int
-) -> np.ndarray:
+def _reject_processed_nodata_mismatch(
+    output_bands: Sequence[ET.Element], dst_nodata: int
+) -> None:
+    """Reject a processed VRT whose bands and LUT disagree about nodata.
+
+    Real display VRTs declare ``<NoDataValue>`` on every
+    ``VRTProcessedRasterBand`` *and* pass ``dst_nodata`` to the LUT step, with
+    the two agreeing — GDAL reports the band's value while the LUT is what
+    actually writes it. rastera reports ``dst_nodata``, which is right exactly
+    while they agree. If they ever diverged, every masked pixel would hold one
+    sentinel while the dataset advertised another, so raise instead of picking
+    a winner.
+    """
+    for i, band in enumerate(output_bands, start=1):
+        declared = _band_nodata(band, str(i))
+        if declared is None or declared == dst_nodata:
+            continue
+        raise NotImplementedError(
+            f"VRTProcessedDataset band {i} declares <NoDataValue>{declared:g} "
+            f"but the LUT step writes dst_nodata={dst_nodata} for masked "
+            f"pixels; rastera cannot honour both. {_GDAL_HINT}"
+        )
+
+
+def _compile_lut(arg_text: str, *, src_nodata: int, dst_nodata: int) -> np.ndarray:
     """Compile a ``"x0:y0,x1:y1,..."`` control-point string into a dense LUT.
 
     Returns a ``uint8`` array of length ``_LUT_SIZE`` whose ``lut[v]`` is
@@ -896,6 +1199,14 @@ def _compile_lut(
     output beyond the table). ``lut[src_nodata]`` is forced to
     ``dst_nodata`` so source nodata always maps cleanly even if a future
     control-point table omits it.
+
+    Rounding is half-*up* (``floor(x + 0.5)``), not numpy's default
+    half-to-even: GDAL's LUT function returns a ``double`` and the
+    Float64 → Byte conversion that follows rounds half away from zero.
+    The distinction is not academic — real display-product LUTs step the
+    output by 1 over an even-width input interval, so the exact ``.5``
+    case is common. With ``np.rint`` roughly 3% of pixels came back one
+    DN below GDAL; with half-up a 192x192x4 window matches bit for bit.
     """
     pairs = [p.strip() for p in arg_text.strip().split(",") if p.strip()]
     if not pairs:
@@ -915,7 +1226,7 @@ def _compile_lut(
         raise ValueError("LUT control points must be non-decreasing in x")
     grid = np.arange(_LUT_SIZE, dtype=np.float64)
     interp = np.interp(grid, xs_arr, ys_arr)
-    lut = np.clip(np.rint(interp), 0, 255).astype(np.uint8)
+    lut = np.clip(np.floor(interp + 0.5), 0, 255).astype(np.uint8)
     if 0 <= src_nodata < _LUT_SIZE:
         lut[src_nodata] = np.uint8(dst_nodata)
     return lut
