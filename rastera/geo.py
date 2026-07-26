@@ -4,11 +4,11 @@ import math
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 
-import numpy as np
 from affine import Affine
 from async_geotiff import Window
 from async_geotiff._transform import HasTransform
 from pyproj import CRS, Transformer
+from pyproj.exceptions import ProjError
 
 
 @dataclass(frozen=True, slots=True)
@@ -223,50 +223,43 @@ def transform_bbox(
 ) -> BBox:
     """Transform a BBox between CRS (EPSG codes).
 
-    Densifies all 4 edges with *densify_pts* samples each (default 21,
-    matching rasterio's ``transform_bounds``). This captures the curvature
-    of projected edges at high latitudes and near polar singularities.
+    Delegates to pyproj's ``transform_bounds``, which densifies each edge with
+    *densify_pts* samples to capture projected curvature *and* accounts for a
+    pole or antimeridian falling in the box's interior. Hulling densified edges
+    alone misses those: an EPSG:3413 sea-ice grid reaches lat 90 through its
+    interior, and edge sampling tops out around 56.
     """
     if from_crs == to_crs:
         return bbox
     transformer = Transformer.from_crs(from_crs, to_crs, always_xy=True)
-    t = np.linspace(0, 1, densify_pts)
-    dx = t * (bbox.maxx - bbox.minx)
-    dy = t * (bbox.maxy - bbox.miny)
-    xs = np.concatenate(
-        [
-            bbox.minx + dx,  # bottom edge
-            np.full_like(t, bbox.maxx),  # right edge
-            bbox.maxx - dx,  # top edge
-            np.full_like(t, bbox.minx),  # left edge
-        ]
-    )
-    ys = np.concatenate(
-        [
-            np.full_like(t, bbox.miny),  # bottom edge
-            bbox.miny + dy,  # right edge
-            np.full_like(t, bbox.maxy),  # top edge
-            bbox.maxy - dy,  # left edge
-        ]
-    )
-    xs_out, ys_out = transformer.transform(xs, ys)
-    # Any non-finite edge point means the bbox reaches outside the target CRS's
-    # domain, so no finite envelope is correct.  Taking the hull of just the
-    # finite subset would silently under-cover the request.
-    n_bad = int(np.count_nonzero(~(np.isfinite(xs_out) & np.isfinite(ys_out))))
-    if n_bad:
-        raise ValueError(
-            f"{n_bad}/{xs_out.size} densified edge points became inf/nan "
-            f"transforming bbox {tuple(bbox)} from EPSG:{from_crs} to "
-            f"EPSG:{to_crs}; the bbox reaches outside the target CRS's area "
-            f"of use. Clip it first."
+    try:
+        minx, miny, maxx, maxy = transformer.transform_bounds(
+            *bbox, densify_pts=densify_pts, errcheck=True
         )
-    return BBox(
-        float(np.min(xs_out)),
-        float(np.min(ys_out)),
-        float(np.max(xs_out)),
-        float(np.max(ys_out)),
-    )
+    except ProjError as exc:
+        raise ValueError(
+            f"Cannot transform bbox {tuple(bbox)} from EPSG:{from_crs} to "
+            f"EPSG:{to_crs}; the bbox reaches outside the target CRS's area "
+            f"of use. Clip it first. ({exc})"
+        ) from exc
+    # errcheck only fires on hard PROJ errors; a bbox that merely leaves the
+    # domain can still come back inf/nan, and no finite envelope is correct.
+    if not all(math.isfinite(v) for v in (minx, miny, maxx, maxy)):
+        raise ValueError(
+            f"Transforming bbox {tuple(bbox)} from EPSG:{from_crs} to "
+            f"EPSG:{to_crs} produced inf/nan bounds; the bbox reaches outside "
+            f"the target CRS's area of use. Clip it first."
+        )
+    # transform_bounds signals an antimeridian crossing by returning minx > maxx.
+    # No axis-aligned BBox represents that, and silently hulling it would span
+    # the wrong 340 degrees of the globe.
+    if minx > maxx:
+        raise ValueError(
+            f"Bbox {tuple(bbox)} crosses the antimeridian in EPSG:{to_crs} "
+            f"(wrapped bounds {minx} > {maxx}); no single axis-aligned bbox "
+            f"covers it. Split the request at the antimeridian."
+        )
+    return BBox(float(minx), float(miny), float(maxx), float(maxy))
 
 
 def _affine_apply(t: Affine, x: float, y: float) -> tuple[float, float]:

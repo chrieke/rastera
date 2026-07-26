@@ -256,8 +256,22 @@ class TestTransformBbox:
         the finite subset, under-covering the request. A grid rounded outward
         past the pole (ceil in _grid_for_bbox) reaches this.
         """
-        with pytest.raises(ValueError, match="inf/nan"):
+        with pytest.raises(ValueError, match="area of use"):
             transform_bbox(BBox(0.0, 80.0, 10.0, 95.0), 4326, 32632)
+
+    def test_interior_pole_reaches_90(self):
+        """The NSIDC EPSG:3413 sea-ice grid contains the north pole as an
+        interior point; hulling densified *edges* tops out near lat 56.
+        """
+        result = transform_bbox(BBox(-3850000, -5350000, 3750000, 5850000), 3413, 4326)
+        assert result.maxy == pytest.approx(90.0)
+        assert result.minx == pytest.approx(-180.0)
+        assert result.maxx == pytest.approx(180.0)
+
+    def test_antimeridian_crossing_raises(self):
+        """UTM zone 60N straddles the dateline; its 4326 envelope wraps."""
+        with pytest.raises(ValueError, match="antimeridian"):
+            transform_bbox(BBox(166021, 0, 833978, 9329005), 32601, 4326)
 
     def test_roundtrip(self):
         bbox = BBox(10.0, 50.0, 11.0, 51.0)  # lon/lat
