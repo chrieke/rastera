@@ -1,10 +1,13 @@
 """Unit tests for the resample() function and its kernel/coord helpers."""
 
+from typing import Any
+
 import numpy as np
 import pytest
 from affine import Affine
+from pyproj import Transformer
 
-from rastera.resampling import resample
+from rastera.resampling import ResamplingMethod, resample
 
 # ── resample (nearest) ───────────────────────────────────────────────────
 
@@ -69,9 +72,7 @@ class TestResampleNearest:
         # Small bbox in WGS84 covering the source area
         dst_t = Affine(0.001, 0, 9.0, 0, -0.001, 45.1)
         transformer = Transformer.from_crs(4326, 32632, always_xy=True)
-        out = resample(
-            src_arr, src_t, dst_t, 10, 10, nodata=0, transformer=transformer
-        )
+        out = resample(src_arr, src_t, dst_t, 10, 10, nodata=0, transformer=transformer)
         assert out.shape == (1, 10, 10)
         # Some pixels should have data (1.0), some may be nodata (0)
         assert np.any(out == 1.0) or np.any(out == 0)
@@ -113,9 +114,7 @@ class TestResampleNearest:
         src_t = Affine(100, 0, 500000, 0, -100, 5000000)
         dst_t = Affine(0.001, 0, 9.0, 0, -0.001, 45.1)
         transformer = Transformer.from_crs(4326, 32632, always_xy=True)
-        out = resample(
-            src_arr, src_t, dst_t, 5, 5, nodata=-1, transformer=transformer
-        )
+        out = resample(src_arr, src_t, dst_t, 5, 5, nodata=-1, transformer=transformer)
         assert out.shape == (1, 5, 5)
 
     def test_single_pixel_with_transformer(self):
@@ -126,9 +125,7 @@ class TestResampleNearest:
         src_t = Affine(100, 0, 500000, 0, -100, 5000000)
         dst_t = Affine(0.01, 0, 9.0, 0, -0.01, 45.1)
         transformer = Transformer.from_crs(4326, 32632, always_xy=True)
-        out = resample(
-            src_arr, src_t, dst_t, 1, 1, nodata=0, transformer=transformer
-        )
+        out = resample(src_arr, src_t, dst_t, 1, 1, nodata=0, transformer=transformer)
         assert out.shape == (1, 1, 1)
 
 
@@ -285,9 +282,7 @@ class TestResampleBilinear:
         )
         src_t = Affine(10, 0, 0, 0, -10, 20)
         dst_t = Affine(1, 0, 9.5, 0, -1, 10.5)
-        out = resample(
-            arr, src_t, dst_t, 1, 1, nodata=float("nan"), method="bilinear"
-        )
+        out = resample(arr, src_t, dst_t, 1, 1, nodata=float("nan"), method="bilinear")
         # Renormalized over the three valid 10.0 samples → 10.0 exactly,
         # and no NaN leaks through.
         assert not np.any(np.isnan(out)), f"output should be NaN-free, got {out}"
@@ -302,9 +297,7 @@ class TestResampleBilinear:
         )
         src_t = Affine(10, 0, 0, 0, -10, 30)
         dst_t = Affine(1, 0, 14.5, 0, -1, 15.5)  # center → src pixel (1, 1)
-        out = resample(
-            arr, src_t, dst_t, 1, 1, nodata=float("nan"), method="bilinear"
-        )
+        out = resample(arr, src_t, dst_t, 1, 1, nodata=float("nan"), method="bilinear")
         assert np.isnan(out[0, 0, 0]), f"expected NaN output, got {out}"
 
 
@@ -464,7 +457,15 @@ class TestResampleCubic:
 # ── separable (same-CRS) two-pass accumulator ────────────────────────────
 
 
-def _bruteforce_kernel(src, src_t, dst_t, dw, dh, method, nodata):
+def _bruteforce_kernel(
+    src: np.ndarray[Any, Any],
+    src_t: Affine,
+    dst_t: Affine,
+    dw: int,
+    dh: int,
+    method: ResamplingMethod,
+    nodata: float | None,
+) -> np.ndarray[Any, Any]:
     """Non-separable per-tap reference for the same-CRS kernel.
 
     A straightforward 2-D-loop transcription of the documented algorithm
@@ -555,7 +556,9 @@ class TestSeparableEquivalence:
     @pytest.mark.parametrize("method", ["bilinear", "cubic"])
     @pytest.mark.parametrize("scale", [0.5, 2.0, 4.0])
     @pytest.mark.parametrize("nodata", [None, 0])
-    def test_matches_bruteforce(self, method, scale, nodata):
+    def test_matches_bruteforce(
+        self, method: ResamplingMethod, scale: float, nodata: int | None
+    ):
         rng = np.random.default_rng(7)
         # src_h tall enough that several scales push dst_h past the 256-row
         # block size and trigger multi-block chunking.
@@ -576,7 +579,7 @@ class TestSeparableEquivalence:
             np.testing.assert_array_equal(out == nodata, ref == nodata)
 
     @pytest.mark.parametrize("method", ["bilinear", "cubic"])
-    def test_anisotropic_downsample_no_int8_overflow(self, method):
+    def test_anisotropic_downsample_no_int8_overflow(self, method: ResamplingMethod):
         """One axis downsampled hard enough to exceed 127 cubic kernel taps:
         the per-dimension valid-sample count must not overflow (int32, not
         int8), or pixels with plenty of valid neighbours are wrongly gated to
@@ -593,7 +596,7 @@ class TestSeparableEquivalence:
         np.testing.assert_array_equal(out == 0, ref == 0)  # identical nodata mask
         np.testing.assert_allclose(out, ref, atol=1)
 
-    def test_block_size_invariance(self, monkeypatch):
+    def test_block_size_invariance(self, monkeypatch: pytest.MonkeyPatch):
         """Chunking is purely an implementation detail: output must not depend
         on the row-block size (catches block-boundary indexing bugs)."""
         import rastera.resampling as r
@@ -603,7 +606,7 @@ class TestSeparableEquivalence:
         src[:, rng.random((500, 64)) < 0.2] = 0
         src_t = Affine(1, 0, 0, 0, -1, 500)
         dst_t = Affine(2, 0, 0, 0, -2, 500)
-        kw = dict(nodata=0, method="cubic")
+        kw: dict[str, Any] = dict(nodata=0, method="cubic")
         monkeypatch.setattr(r, "_SEPARABLE_ROW_BLOCK", 1_000_000)
         whole = resample(src, src_t, dst_t, 32, 250, **kw)
         monkeypatch.setattr(r, "_SEPARABLE_ROW_BLOCK", 7)
@@ -621,15 +624,20 @@ class TestTwoPassReproject:
     """
 
     def _cross_setup(
-        self, src_res, dst_res, *, H=200, W=200, dtype=np.float32, seed=0
-    ):
+        self,
+        src_res: float,
+        dst_res: float,
+        *,
+        H: int = 200,
+        W: int = 200,
+        dtype: np.typing.DTypeLike = np.float32,
+        seed: int = 0,
+    ) -> tuple[np.ndarray[Any, Any], Affine, Affine, int, int, Transformer]:
         """A smooth EPSG:3006 raster + a target UTM33N grid at ``dst_res``.
 
         Returns ``(arr, src_t, dst_t, dw, dh, transformer)`` ready for
         ``resample(..., transformer=transformer)``.  ``scale ≈ dst_res/src_res``.
         """
-        from pyproj import Transformer
-
         yy, xx = np.mgrid[0:H, 0:W]
         arr = (100 + 50 * np.sin(xx / 15.0) + 40 * np.cos(yy / 12.0)).astype(dtype)
         arr = arr[None]  # (1, H, W); strictly positive so 0 means nodata only
@@ -641,14 +649,16 @@ class TestTwoPassReproject:
         pad = 4 * dst_res  # keep dst footprint inside the source extent
         dw = int((ux.max() - ux.min() - 2 * pad) // dst_res)
         dh = int((uy.max() - uy.min() - 2 * pad) // dst_res)
-        dst_t = Affine(dst_res, 0, ux.min() + pad, 0, -dst_res, uy.min() + pad + dh * dst_res)
+        dst_t = Affine(
+            dst_res, 0, ux.min() + pad, 0, -dst_res, uy.min() + pad + dh * dst_res
+        )
         T = Transformer.from_crs(32633, 3006, always_xy=True)
         return arr, src_t, dst_t, dw, dh, T
 
     @pytest.mark.parametrize("method", ["bilinear", "cubic"])
-    def test_matches_single_pass_on_interior(self, method):
+    def test_matches_single_pass_on_interior(self, method: ResamplingMethod):
         arr, st, dt, dw, dh, T = self._cross_setup(0.16, 0.5)
-        kw = dict(transformer=T, method=method)
+        kw: dict[str, Any] = dict(transformer=T, method=method)
         sp = resample(arr, st, dt, dw, dh, warp_strategy="single_pass", **kw)
         tp = resample(arr, st, dt, dw, dh, warp_strategy="auto", **kw)
         b = 3  # drop the edge band where the two methods legitimately differ
@@ -660,13 +670,13 @@ class TestTwoPassReproject:
         # "auto" takes the two-pass route only above its conservative downsample
         # scale (> 2.0).  Below it, "auto" is identical to single-pass.
         arr, st, dt, dw, dh, T = self._cross_setup(0.16, 0.28)  # scale ~1.75
-        kw = dict(transformer=T, method="cubic")
+        kw: dict[str, Any] = dict(transformer=T, method="cubic")
         sp = resample(arr, st, dt, dw, dh, warp_strategy="single_pass", **kw)
         auto = resample(arr, st, dt, dw, dh, warp_strategy="auto", **kw)
         np.testing.assert_array_equal(auto, sp)
         # Well above the cutoff, "auto" engages the two-pass branch and diverges.
         arr, st, dt, dw, dh, T = self._cross_setup(0.16, 0.5)  # scale ~3.1
-        kw = dict(transformer=T, method="cubic")
+        kw: dict[str, Any] = dict(transformer=T, method="cubic")
         sp = resample(arr, st, dt, dw, dh, warp_strategy="single_pass", **kw)
         auto = resample(arr, st, dt, dw, dh, warp_strategy="auto", **kw)
         assert not np.array_equal(auto, sp)
@@ -674,7 +684,7 @@ class TestTwoPassReproject:
     def test_upsample_is_noop(self):
         # scale < 1: two-pass split has no benefit and must not engage.
         arr, st, dt, dw, dh, T = self._cross_setup(0.5, 0.16)
-        kw = dict(transformer=T, method="cubic")
+        kw: dict[str, Any] = dict(transformer=T, method="cubic")
         sp = resample(arr, st, dt, dw, dh, warp_strategy="single_pass", **kw)
         out = resample(arr, st, dt, dw, dh, warp_strategy="auto", **kw)
         np.testing.assert_array_equal(sp, out)
@@ -685,14 +695,14 @@ class TestTwoPassReproject:
         arr = (np.arange(160 * 160, dtype=np.float32) % 97).reshape(1, 160, 160)
         st = Affine(0.16, 0, 0, 0, -0.16, 0)
         dt = Affine(0.5, 0, 0, 0, -0.5, 0)
-        kw = dict(transformer=None, method="cubic")
+        kw: dict[str, Any] = dict(transformer=None, method="cubic")
         sp = resample(arr, st, dt, 50, 50, warp_strategy="single_pass", **kw)
         out = resample(arr, st, dt, 50, 50, warp_strategy="auto", **kw)
         np.testing.assert_array_equal(sp, out)
 
     def test_nearest_ignores_strategy(self):
         arr, st, dt, dw, dh, T = self._cross_setup(0.16, 0.5)
-        kw = dict(transformer=T, method="nearest")
+        kw: dict[str, Any] = dict(transformer=T, method="nearest")
         sp = resample(arr, st, dt, dw, dh, warp_strategy="single_pass", **kw)
         tp = resample(arr, st, dt, dw, dh, warp_strategy="auto", **kw)
         np.testing.assert_array_equal(sp, tp)
@@ -702,7 +712,7 @@ class TestTwoPassReproject:
         # intermediate is not re-quantized between passes.
         arr, st, dt, dw, dh, T = self._cross_setup(0.16, 0.5)
         arr_u = arr.astype(np.uint16)
-        kw = dict(transformer=T, method="cubic", warp_strategy="auto")
+        kw: dict[str, Any] = dict(transformer=T, method="cubic", warp_strategy="auto")
         tp_u = resample(arr_u, st, dt, dw, dh, **kw)
         tp_f = resample(arr_u.astype(np.float32), st, dt, dw, dh, **kw)
         b = 3
@@ -711,11 +721,11 @@ class TestTwoPassReproject:
         )
 
     @pytest.mark.parametrize("method", ["bilinear", "cubic"])
-    def test_nodata_no_edge_fringe(self, method):
+    def test_nodata_no_edge_fringe(self, method: ResamplingMethod):
         # The halo must keep Pass A's edge erosion off the region Pass B reads:
         # two-pass should not turn many single-pass-valid pixels into nodata.
         arr, st, dt, dw, dh, T = self._cross_setup(0.16, 0.5)
-        kw = dict(transformer=T, nodata=0, method=method)
+        kw: dict[str, Any] = dict(transformer=T, nodata=0, method=method)
         sp = resample(arr, st, dt, dw, dh, warp_strategy="single_pass", **kw)
         tp = resample(arr, st, dt, dw, dh, warp_strategy="auto", **kw)
         extra_nodata = (tp == 0) & (sp != 0)
@@ -726,7 +736,7 @@ class TestTwoPassReproject:
         import rastera.config as config
 
         arr, st, dt, dw, dh, T = self._cross_setup(0.16, 0.5)
-        kw = dict(transformer=T, method="cubic")
+        kw: dict[str, Any] = dict(transformer=T, method="cubic")
         explicit = resample(arr, st, dt, dw, dh, warp_strategy="auto", **kw)
         prev = config._warp_strategy
         try:
@@ -736,4 +746,147 @@ class TestTwoPassReproject:
         finally:
             rastera.set_warp_strategy(prev)
         with pytest.raises(ValueError):
-            rastera.set_warp_strategy("nope")
+            rastera.set_warp_strategy("nope")  # type: ignore[reportArgumentType]
+
+
+# ── input validation ─────────────────────────────────────────────────────
+
+
+class TestResampleValidation:
+    """Guards against silently-wrong output for grids/dtypes/sentinels the
+    kernels cannot represent. Each of these previously either produced
+    plausible wrong pixels or disagreed between methods."""
+
+    SRC = np.arange(64, dtype=np.uint8).reshape(1, 8, 8)
+    SRC_T = Affine(1, 0, 0, 0, -1, 8)
+    # Destination partly outside the source, so nodata fill is exercised.
+    DST_T = Affine(1, 0, -4, 0, -1, 8)
+
+    @pytest.mark.parametrize("method", ["nearest", "bilinear", "cubic"])
+    def test_rotated_dst_rejected(self, method: ResamplingMethod):
+        """Only the a/c/e/f terms are read, so a rotated grid used to be
+        resampled as if it were north-up."""
+        rotated = self.SRC_T * Affine.rotation(30)
+        with pytest.raises(NotImplementedError, match="north-up"):
+            resample(self.SRC, self.SRC_T, rotated, 8, 8, method=method)
+
+    @pytest.mark.parametrize("method", ["nearest", "bilinear", "cubic"])
+    def test_rotated_src_rejected(self, method: ResamplingMethod):
+        rotated = self.SRC_T * Affine.rotation(30)
+        with pytest.raises(NotImplementedError, match="north-up"):
+            resample(self.SRC, rotated, self.DST_T, 8, 8, method=method)
+
+    @pytest.mark.parametrize("method", ["nearest", "bilinear", "cubic"])
+    def test_nodata_outside_dtype_range_rejected(self, method: ResamplingMethod):
+        """nearest raised OverflowError while bilinear/cubic clipped -9999 to 0,
+        making nodata indistinguishable from a real 0-valued pixel."""
+        with pytest.raises(ValueError, match="outside the range"):
+            resample(
+                self.SRC, self.SRC_T, self.DST_T, 8, 8, nodata=-9999, method=method
+            )
+
+    @pytest.mark.parametrize("method", ["nearest", "bilinear", "cubic"])
+    def test_nan_nodata_on_integer_rejected(self, method: ResamplingMethod):
+        """np.round(NaN).astype(int16) is undefined; nearest raised but
+        bilinear/cubic emitted a RuntimeWarning and cast garbage."""
+        src = self.SRC.astype(np.int16)
+        with pytest.raises(ValueError, match="NaN cannot be represented"):
+            resample(
+                src, self.SRC_T, self.DST_T, 8, 8, nodata=float("nan"), method=method
+            )
+
+    def test_nan_nodata_on_float_allowed(self):
+        src = self.SRC.astype(np.float32)
+        out = resample(
+            src, self.SRC_T, self.DST_T, 8, 8, nodata=float("nan"), method="bilinear"
+        )
+        assert np.isnan(out[0, 0, 0])
+
+    @pytest.mark.parametrize("method", ["bilinear", "cubic"])
+    def test_complex_rejected(self, method: ResamplingMethod):
+        src = self.SRC.astype(np.complex128)
+        with pytest.raises(NotImplementedError, match="complex"):
+            resample(src, self.SRC_T, self.DST_T, 8, 8, method=method)
+
+    def test_complex_allowed_for_nearest(self):
+        """Only the kernels do arithmetic on samples; nearest is a pure gather,
+        so it copies complex values through unharmed."""
+        src = self.SRC.astype(np.complex128) * (1 + 2j)
+        out = resample(src, self.SRC_T, self.SRC_T, 8, 8, method="nearest")
+        np.testing.assert_array_equal(out, src)
+
+    @pytest.mark.parametrize("method", ["nearest", "bilinear", "cubic"])
+    @pytest.mark.parametrize("transformer", [None, "cross"])
+    def test_zero_size_output(self, method: ResamplingMethod, transformer: str | None):
+        """The cross-CRS path raised IndexError on an empty coarse grid while
+        the same-CRS path returned cleanly."""
+        t = None
+        if transformer == "cross":
+            from pyproj import Transformer
+
+            t = Transformer.from_crs(32632, 32633, always_xy=True)
+        out = resample(
+            self.SRC, self.SRC_T, self.DST_T, 0, 0, transformer=t, method=method
+        )
+        assert out.shape == (1, 0, 0)
+        assert out.dtype == self.SRC.dtype
+
+    def test_negative_size_rejected(self):
+        with pytest.raises(ValueError, match=">= 0"):
+            resample(self.SRC, self.SRC_T, self.DST_T, -1, 8)
+
+    def test_unknown_method_rejected(self):
+        with pytest.raises(ValueError, match="Unknown resampling method"):
+            resample(self.SRC, self.SRC_T, self.DST_T, 8, 8, method="lanczos")  # type: ignore[arg-type]
+
+
+class TestBoolMask:
+    """bool is not an np.integer, so the clip+round was skipped and any
+    non-zero kernel accumulation became True — dilating the mask."""
+
+    @pytest.mark.parametrize("method", ["nearest", "bilinear", "cubic"])
+    def test_downsample_does_not_dilate(self, method: ResamplingMethod):
+        mask = np.zeros((1, 4, 4), dtype=bool)
+        mask[0, 0, 0] = True
+        out = resample(
+            mask,
+            Affine(1, 0, 0, 0, -1, 4),
+            Affine(2, 0, 0, 0, -2, 4),
+            2,
+            2,
+            method=method,
+        )
+        assert out.dtype == np.bool_
+        # A single True out of the 2x2 footprint is a 0.25 weight -> False.
+        assert not out.any()
+
+    @pytest.mark.parametrize("method", ["nearest", "bilinear", "cubic"])
+    def test_majority_true_survives(self, method: ResamplingMethod):
+        mask = np.ones((1, 4, 4), dtype=bool)
+        out = resample(
+            mask,
+            Affine(1, 0, 0, 0, -1, 4),
+            Affine(2, 0, 0, 0, -2, 4),
+            2,
+            2,
+            method=method,
+        )
+        assert out.all()
+
+    def test_two_pass_cross_crs_bool(self):
+        """_two_pass_work_dtype called np.iinfo(np.bool_), which raises."""
+        from pyproj import Transformer
+
+        mask = np.ones((1, 64, 64), dtype=bool)
+        t = Transformer.from_crs(32632, 32632, always_xy=True)
+        out = resample(
+            mask,
+            Affine(1, 0, 0, 0, -1, 64),
+            Affine(4, 0, 0, 0, -4, 64),
+            16,
+            16,
+            transformer=t,
+            method="cubic",
+            warp_strategy="auto",
+        )
+        assert out.dtype == np.bool_

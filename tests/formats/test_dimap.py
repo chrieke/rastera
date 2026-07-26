@@ -1,6 +1,7 @@
 """Unit tests for DIMAP parser."""
 
 import asyncio
+from collections.abc import Callable
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -365,7 +366,9 @@ class TestSingleGroupDIMAP:
             return _mock_tile_ds(
                 lambda bands, w, col=c: np.stack(
                     [
-                        np.full((w.height, w.width), col * 10 + (b + 1), dtype=np.uint16)
+                        np.full(
+                            (w.height, w.width), col * 10 + (b + 1), dtype=np.uint16
+                        )
                         for b in bands
                     ]
                 )
@@ -577,7 +580,11 @@ def _two_group_layout() -> _DIMAPLayout:
     )
 
 
-def _mock_tile_ds(fill_fn: Any) -> AsyncGeoTIFF:
+# Annotated rather than Any so the fill lambdas below get inferred param types.
+_TileFillFn = Callable[[list[int], Window], np.ndarray[Any, Any]]
+
+
+def _mock_tile_ds(fill_fn: _TileFillFn) -> AsyncGeoTIFF:
     """Build a mock tile ``AsyncGeoTIFF`` whose ``_read_native`` returns an
     array whose values depend on the tile identity and requested bands.
 
@@ -942,7 +949,7 @@ class TestDetection:
         assert ds is not None
         assert ds._nodata == 65535
         # Pre-populated tile cache: no re-fetch when the first read hits (1,1).
-        assert (0, 1, 1) in ds._tile_tasks
+        assert (0, 1, 1) in ds._tiles
 
     def test_missing_sign_defaults_to_unsigned(self):
         """Some older DIMAP deliveries omit the <SIGN> element. Treat a
@@ -1105,7 +1112,7 @@ class TestDIMAPConcurrencyInvariance:
         return ds
 
     @pytest.mark.parametrize("n", [1, 2, 8])
-    async def test_pixel_equal_across_n(self, n, _reset_dimap_concurrency):
+    async def test_pixel_equal_across_n(self, n: int, _reset_dimap_concurrency: None):
         import rastera
 
         rastera.set_concurrency(dimap=1)
@@ -1119,4 +1126,62 @@ class TestDIMAPConcurrencyInvariance:
             window=Window(col_off=0, row_off=0, width=800, height=1000),
             band_indices=[0, 2, 4, 5],
         )
-        np.testing.assert_array_equal(result.data, baseline.data)
+        result_data: np.ndarray[Any, Any] = result.data  # type: ignore[reportUnknownMemberType]
+        baseline_data: np.ndarray[Any, Any] = baseline.data  # type: ignore[reportUnknownMemberType]
+        np.testing.assert_array_equal(result_data, baseline_data)
+
+
+class TestTileCache:
+    @staticmethod
+    def _layout() -> _DIMAPLayout:
+        return _parse_dimap_xml(PNEO_DIMAP)
+
+    @pytest.mark.asyncio
+    async def test_failed_open_is_retried(self):
+        """A rejected Future used to stay in the cache, so one transient error
+        poisoned that tile for the dataset's lifetime."""
+        ds = _DIMAPDataset("s3://bucket/DIM_PNEO.XML", self._layout())
+        tile = MagicMock()
+        calls = 0
+
+        async def flaky(*_: Any, **__: Any):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise OSError("transient 503")
+            return tile
+
+        with patch.object(_DIMAPDataset, "_open_tile", new=flaky):
+            with pytest.raises(OSError, match="transient"):
+                await ds._get_tile(0, 0, 0)
+            assert await ds._get_tile(0, 0, 0) is tile
+        assert calls == 2
+
+    @pytest.mark.asyncio
+    async def test_successful_open_is_cached(self):
+        ds = _DIMAPDataset("s3://bucket/DIM_PNEO.XML", self._layout())
+        tile = MagicMock()
+        calls = 0
+
+        async def once(*_: Any, **__: Any):
+            nonlocal calls
+            calls += 1
+            return tile
+
+        with patch.object(_DIMAPDataset, "_open_tile", new=once):
+            assert await ds._get_tile(0, 0, 0) is tile
+            assert await ds._get_tile(0, 0, 0) is tile
+        assert calls == 1
+
+    def test_construction_needs_no_running_loop(self):
+        """The primed first tile was held as a resolved Future, which requires a
+        running event loop and binds the dataset to it."""
+        tile = MagicMock()
+        tile._nodata = 0
+        ds = _DIMAPDataset(
+            "s3://bucket/DIM_PNEO.XML",
+            self._layout(),
+            first_tile=tile,
+            first_tile_key=(0, 1, 1),
+        )
+        assert ds._tiles[(0, 1, 1)] is tile

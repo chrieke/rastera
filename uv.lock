@@ -634,15 +634,19 @@ dependencies = [
 index = [
     { name = "geopandas" },
     { name = "pyarrow" },
+    { name = "shapely" },
 ]
 
 [package.dev-dependencies]
 dev = [
     { name = "boto3" },
+    { name = "geopandas" },
+    { name = "pyarrow" },
     { name = "pyright" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
     { name = "ruff" },
+    { name = "shapely" },
 ]
 
 [package.metadata]
@@ -654,16 +658,20 @@ requires-dist = [
     { name = "obstore", specifier = ">=0.9.0" },
     { name = "pyarrow", marker = "extra == 'index'", specifier = ">=18.0.0" },
     { name = "pyproj", specifier = ">=3.7.1" },
+    { name = "shapely", marker = "extra == 'index'", specifier = ">=2.0.0" },
 ]
 provides-extras = ["index"]
 
 [package.metadata.requires-dev]
 dev = [
     { name = "boto3", specifier = ">=1.42.93" },
+    { name = "geopandas", specifier = ">=1.0.0" },
+    { name = "pyarrow", specifier = ">=18.0.0" },
     { name = "pyright", specifier = ">=1.1.408,<2.0.0" },
     { name = "pytest", specifier = ">=8.0.0" },
     { name = "pytest-asyncio", specifier = ">=1.0.0" },
     { name = "ruff", specifier = "==0.8.5" },
+    { name = "shapely", specifier = ">=2.0.0" },
 ]
 
 [[package]]

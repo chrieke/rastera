@@ -196,15 +196,18 @@ class _DIMAPDataset(AsyncGeoTIFF):
             "cache": cache,
             **(store_kwargs or {}),
         }
-        # Single-flight lazy tile opens keyed by (group_idx, tile_row, tile_col).
-        self._tile_tasks: dict[tuple[int, int, int], asyncio.Future[AsyncGeoTIFF]] = {}
+        # Opened tiles, and in-flight single-flight opens, keyed by
+        # (group_idx, tile_row, tile_col). Both grow with the number of tiles
+        # touched and are only released with the dataset — a large product read
+        # in full holds every tile's parsed header for its lifetime.
+        self._tiles: dict[tuple[int, int, int], AsyncGeoTIFF] = {}
+        self._tile_tasks: dict[tuple[int, int, int], asyncio.Task[AsyncGeoTIFF]] = {}
         if first_tile is not None:
-            # Prime the cache so the first read doesn't re-fetch this tile.
+            # Prime the cache so the first read doesn't re-fetch this tile. Held
+            # as a plain value, not a resolved Future, so constructing a
+            # _DIMAPDataset does not require a running event loop.
             assert first_tile_key is not None
-            loop = asyncio.get_running_loop()
-            fut: asyncio.Future[AsyncGeoTIFF] = loop.create_future()
-            fut.set_result(first_tile)
-            self._tile_tasks[first_tile_key] = fut
+            self._tiles[first_tile_key] = first_tile
 
     async def read(self, *args: Any, use_overviews: bool = False, **kwargs: Any):
         if use_overviews:
@@ -291,8 +294,9 @@ class _DIMAPDataset(AsyncGeoTIFF):
 
         results = await config._gather_bounded(config._dimap_concurrency, coros)
         for (out_positions, tr), result in zip(metadata, results):
+            data: np.ndarray[Any, Any] = result.data  # type: ignore[reportUnknownMemberType]
             for i, pos in enumerate(out_positions):
-                out[pos, tr.dst_rows, tr.dst_cols] = result.data[i]
+                out[pos, tr.dst_rows, tr.dst_cols] = data[i]
 
         out_transform = layout.transform * Affine.translation(
             window.col_off, window.row_off
@@ -309,15 +313,25 @@ class _DIMAPDataset(AsyncGeoTIFF):
     async def _get_tile(
         self, group_idx: int, tile_row: int, tile_col: int
     ) -> AsyncGeoTIFF:
-        """Lazy, single-flight tile open. Subsequent callers await the
-        same Future rather than re-fetching the TIFF header. A pre-opened
-        tile primed by the constructor is returned immediately."""
+        """Lazy, single-flight tile open. Concurrent callers await the same
+        task rather than re-fetching the TIFF header. A failed open is not
+        retained, so a transient error does not poison the tile permanently."""
         key = (group_idx, tile_row, tile_col)
-        fut = self._tile_tasks.get(key)
-        if fut is None:
-            fut = asyncio.ensure_future(self._open_tile(group_idx, tile_row, tile_col))
-            self._tile_tasks[key] = fut
-        return await fut
+        tile = self._tiles.get(key)
+        if tile is not None:
+            return tile
+        task = self._tile_tasks.get(key)
+        if task is None:
+            task = asyncio.ensure_future(self._open_tile(group_idx, tile_row, tile_col))
+            self._tile_tasks[key] = task
+        try:
+            tile = await task
+        finally:
+            # Drop the in-flight entry either way: on success the tile moves to
+            # `_tiles`, on failure the next read gets a fresh attempt.
+            self._tile_tasks.pop(key, None)
+        self._tiles[key] = tile
+        return tile
 
     async def _open_tile(
         self, group_idx: int, tile_row: int, tile_col: int
@@ -502,7 +516,9 @@ def _parse_band_groups(
             continue
         group_bands = [
             _DIMAPBand(
-                band_id=_require_text(ri, "BAND_ID"),
+                # Labels only — nothing in the read path consumes them, so a
+                # delivery that omits them must not fail the whole open.
+                band_id=(ri.findtext("BAND_ID") or "").strip(),
                 band_name=(ri.findtext("BAND_NAME") or "").strip(),
                 group_index=group_index,
                 source_band=int(_require_text(ri, "BAND_INDEX")),

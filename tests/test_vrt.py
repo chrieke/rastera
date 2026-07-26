@@ -19,6 +19,7 @@ from rastera.vrt import (
     _open_vrt,
     _parse_vrt_xml,
     _resolve_source_uri,
+    _transforms_match,
     _VRTBand,
     _VRTDataset,
 )
@@ -96,6 +97,7 @@ def _read_result(
 class TestParseVRTXML:
     def test_band_stack_rgbnir(self):
         bands = _parse_vrt_xml(RGBNIR_VRT, "s3://bucket/x.vrt")
+        assert isinstance(bands, list)
         assert len(bands) == 4
         assert [b.source_uri for b in bands] == [
             "s3://bucket/rgb.tif",
@@ -123,6 +125,7 @@ class TestParseVRTXML:
           </SimpleSource></VRTRasterBand>
         </VRTDataset>"""
         bands = _parse_vrt_xml(xml, "s3://b/x.vrt")
+        assert isinstance(bands, list)
         assert bands[0].source_band == 1
 
     def test_kernel_filtered_source_rejected(self):
@@ -217,6 +220,7 @@ class TestRejectUnsupportedSource:
 
     def test_no_rects_parses_with_no_recorded_sizes(self):
         bands = _parse_vrt_xml(_one_band_vrt(), "s3://b/x.vrt")
+        assert isinstance(bands, list)
         assert bands[0].src_rect_size is None
         assert bands[0].dst_rect_size is None
         assert bands[0].vrt_declared_size == (100.0, 100.0)
@@ -750,7 +754,8 @@ class TestRejectOutOfScopeFeatures:
             b'<Metadata domain="RPC"><MDI key="HEIGHT_OFF">1</MDI></Metadata>'
             b"<VRTRasterBand",
         )
-        assert len(_parse_vrt_xml(xml, "s3://b/x.vrt")) == 1
+        bands = _parse_vrt_xml(xml, "s3://b/x.vrt")
+        assert isinstance(bands, list) and len(bands) == 1
 
     def test_plain_metadata_domain_still_parses(self):
         """Only the RPC domain is rejected; ordinary <Metadata> is harmless."""
@@ -758,7 +763,8 @@ class TestRejectOutOfScopeFeatures:
             b"><VRTRasterBand",
             b'><Metadata><MDI key="AREA_OR_POINT">Area</MDI></Metadata><VRTRasterBand',
         )
-        assert len(_parse_vrt_xml(xml, "s3://b/x.vrt")) == 1
+        bands = _parse_vrt_xml(xml, "s3://b/x.vrt")
+        assert isinstance(bands, list) and len(bands) == 1
 
 
 # ── source URI resolution ───────────────────────────────────────────────────
@@ -869,6 +875,7 @@ class TestOpenVRT:
         for call in mock_open.call_args_list:
             assert call.kwargs["meta_overrides"] == {"crs": 3006}
         # Override took effect on both the wrapper and every source.
+        assert isinstance(ds, _VRTDataset)
         assert ds._crs_epsg == 3006
         for src, _ in ds._band_sources:
             assert src._crs_epsg == 3006
@@ -942,6 +949,7 @@ class TestOpenVRT:
         ):
             ds = await _open_vrt("s3://bucket/v.vrt")
 
+        assert isinstance(ds, _VRTDataset)
         assert ds._nodata == 0
         assert ds._band_sources[0][0]._nodata == 0
 
@@ -1049,6 +1057,97 @@ class TestValidateSourceWindows:
             pytest.raises(NotImplementedError, match="identical size"),
         ):
             await _open_vrt("s3://bucket/v.vrt")
+
+    @staticmethod
+    async def _open_rgbnir(nir_kwargs: dict[str, Any]):
+        """Open RGBNIR_VRT where nir.tif differs from rgb.tif by *nir_kwargs*."""
+        # RGBNIR_VRT's canvas
+        base: dict[str, Any] = dict(count=3, width=10000, height=10000)
+        nir: dict[str, Any] = {**base, "count": 1, **nir_kwargs}
+        gt_rgb = make_mock_geotiff(**base)
+        gt_nir = make_mock_geotiff(**nir)
+
+        async def fake_open(uri: str, **_: Any) -> AsyncGeoTIFF:
+            return AsyncGeoTIFF(uri, gt_rgb if "rgb" in uri else gt_nir)
+
+        with (
+            patch(
+                "rastera.vrt._fetch_descriptor_bytes",
+                new=AsyncMock(return_value=RGBNIR_VRT),
+            ),
+            patch.object(AsyncGeoTIFF, "open", side_effect=fake_open),
+        ):
+            return await _open_vrt("s3://bucket/v.vrt")
+
+    @pytest.mark.asyncio
+    async def test_mismatched_source_dtype_rejected(self):
+        """Equal size alone doesn't make sources stackable: bands go into one
+        array typed from band 1, so a differing dtype was silently cast."""
+        with pytest.raises(NotImplementedError, match="identical dtype"):
+            await self._open_rgbnir({"dtype": np.dtype("f4")})
+
+    @pytest.mark.asyncio
+    async def test_mismatched_source_crs_rejected(self):
+        with pytest.raises(NotImplementedError, match="in one CRS"):
+            await self._open_rgbnir({"crs_epsg": 32633})
+
+    @pytest.mark.asyncio
+    async def test_mismatched_source_transform_rejected(self):
+        """Same size, same CRS, different origin — the bands cover different
+        ground but were returned under band 1's transform."""
+        with pytest.raises(NotImplementedError, match="same extent"):
+            await self._open_rgbnir({"scale": 20.0})
+
+    @pytest.mark.asyncio
+    async def test_matching_sources_pass(self):
+        ds = await self._open_rgbnir({})
+        assert isinstance(ds, _VRTDataset)
+
+
+class TestTransformsMatch:
+    UTM = Affine(10.0, 0.0, 399960.0, 0.0, -10.0, 5900040.0)
+
+    def test_float_noise_tolerated(self):
+        """Sources warped in separate GDAL runs can differ by rounding. That is
+        the same grid; exact float equality would reject a valid VRT."""
+        noisy = Affine(10.0, 0.0, 399960.00000000006, 0.0, -10.0, 5900040.0)
+        assert _transforms_match(self.UTM, noisy)
+
+    def test_near_zero_rotation_tolerated(self):
+        noisy = Affine(10.0, 1e-16, 399960.0, 1e-16, -10.0, 5900040.0)
+        assert _transforms_match(self.UTM, noisy)
+
+    def test_origin_shift_rejected(self):
+        shifted = Affine(10.0, 0.0, 399961.0, 0.0, -10.0, 5900040.0)
+        assert not _transforms_match(self.UTM, shifted)
+
+    def test_degree_grid_scale_difference_rejected(self):
+        """A fixed absolute tolerance (affine's ``almost_equals`` uses 1e-5)
+        would call these equal — the whole pixel is 1e-5 degrees."""
+        a = Affine(1e-5, 0.0, 9.0, 0.0, -1e-5, 45.0)
+        b = Affine(1.9e-5, 0.0, 9.0, 0.0, -1.9e-5, 45.0)
+        assert not _transforms_match(a, b)
+
+
+class TestVRTCycle:
+    @pytest.mark.asyncio
+    async def test_self_referencing_vrt_rejected(self):
+        """A VRT source may itself be a VRT, so without a guard this recursed to
+        RecursionError, issuing a network GET per level."""
+        xml = (
+            b'<VRTDataset rasterXSize="100" rasterYSize="100">'
+            b'<VRTRasterBand band="1"><SimpleSource>'
+            b"<SourceFilename>/vsis3/bucket/self.vrt</SourceFilename>"
+            b"<SourceBand>1</SourceBand>"
+            b"</SimpleSource></VRTRasterBand></VRTDataset>"
+        )
+        with (
+            patch(
+                "rastera.vrt._fetch_descriptor_bytes", new=AsyncMock(return_value=xml)
+            ),
+            pytest.raises(ValueError, match="reference cycle"),
+        ):
+            await _open_vrt("s3://bucket/self.vrt")
 
 
 def _make_rgbnir_ds() -> _VRTDataset:
@@ -1363,7 +1462,8 @@ class TestMergeOnVRT:
             ov = MagicMock()
             ov.width = 1  # overview_res = native_res * (10/1) = 10.0
             ov.height = 1
-            vrt._band_sources[0][0]._geotiff.overviews = [ov]
+            # overviews is a read-only property on the real GeoTIFF.
+            vrt._band_sources[0][0]._geotiff.overviews = [ov]  # type: ignore[reportAttributeAccessIssue]
 
         with pytest.raises(NotImplementedError, match="overview"):
             await merge(

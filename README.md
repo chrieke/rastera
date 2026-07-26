@@ -6,13 +6,9 @@
 - Resampling: `nearest` (default), `bilinear`, `cubic` — GDAL-matching kernels with anti-aliasing on downsample and nodata renormalization
 - Optional persisted header cache (geoparquet) for ~6x faster opens
 - Built on [async-geotiff](https://github.com/developmentseed/async-geotiff) handling GeoTIFF parsing, async tile fetching, request coalescing, and Rust-native decompression
-- Limited VRT & DIMAP support
+- Limited VRT & DIMAP support — band-stack VRTs and LUTs work, anything more exotic raises `NotImplementedError` instead of returning wrong pixels (see `rastera/vrt.py`)
 
 **Note:** Only COGs & tiled GeoTIFFs are supported. Stripped (non-tiled) TIFFs will not work.
-
-**VRT scope.** Two flavours are handled: *band-stack* VRTs (each band driven by one `<SimpleSource>` or `<ComplexSource>`, all sources being the same full image — this is what `gdalbuildvrt -separate` emits) and *processed* VRTs (single-step LUT). Anything that would change *which pixels* a source contributes — mosaicking, windowing or rescaling via `SrcRect`/`DstRect`, value transforms on a source, warped VRTs, pixel functions, GCP/RPC georeferencing — raises `NotImplementedError` rather than being silently ignored, since a silently wrong pixel is worse than a missing feature. Use `rastera.merge()` to mosaic separate COGs, or GDAL/rasterio for the rest.
-
-Band-level `<NoDataValue>` / `<HideNoDataValue>` are honoured; the VRT's other *metadata* (`ColorInterp`, `Description`, `dataType`, `<SRS>`, `<GeoTransform>`) is ignored in favour of the first source's. See `rastera/vrt.py`'s module docstring for the exact rules.
 
 ### Read a single COG
 

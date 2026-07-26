@@ -17,7 +17,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-index = ["geopandas>=1.0.0", "pyarrow>=18.0.0"]
+index = ["geopandas>=1.0.0", "pyarrow>=18.0.0", "shapely>=2.0.0"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
@@ -33,6 +33,10 @@ dev = [
     "pytest>=8.0.0",
     "pytest-asyncio>=1.0.0",
     "boto3>=1.42.93",
+    # So the optional index code path is covered by the default test run.
+    "geopandas>=1.0.0",
+    "pyarrow>=18.0.0",
+    "shapely>=2.0.0",
 ]
 
 [tool.ruff]
@@ -59,7 +63,12 @@ known-first-party = ["rastera"]
 
 [tool.pyright]
 include = ["rastera", "tests"]
+# Lowest supported interpreter, so 3.12+ syntax and stdlib use get caught.
 pythonVersion = "3.11"
+venvPath = "."
+venv = ".venv"
+# Hand-written stubs for dependencies that ship no annotations.
+stubPath = "typings"
 strictListInference = true
 strictSetInference = true
 strictDictionaryInference = true

@@ -1,5 +1,6 @@
 """Unit tests for AsyncGeoTIFF."""
 
+from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -139,7 +140,7 @@ class TestOpen:
     @patch("rastera.reader.GeoTIFF")
     @patch("rastera.store.from_url")
     async def test_open_many_accepts_sibling_local_paths(
-        self, mock_from_url: Any, mock_geotiff_cls: Any, tmp_path
+        self, mock_from_url: Any, mock_geotiff_cls: Any, tmp_path: Path
     ):
         """Sibling local paths share a parent-dir bucket and must not be rejected."""
         a = tmp_path / "a.tif"
@@ -303,6 +304,20 @@ class TestLRUCache:
     def teardown_method(self):
         clear_cache()
         set_cache_size(self._orig_size)
+
+    @pytest.mark.parametrize("bad", [-1, -100, 1.5, "x", True, False])
+    def test_rejects_invalid_size(self, bad: Any):
+        """A negative size popped past an empty cache: KeyError, not ValueError.
+        bool is an int subclass, so reject it explicitly (as set_concurrency does).
+        """
+        with pytest.raises(ValueError, match="cache size must be int >= 0"):
+            set_cache_size(bad)
+
+    def test_zero_size_disables_and_evicts(self):
+        set_cache_size(2)
+        _geotiff_cache["a"] = make_mock_geotiff()
+        set_cache_size(0)
+        assert len(_geotiff_cache) == 0
 
     def test_lru_eviction_order(self):
         """Accessing an entry promotes it; the least-recently-used entry is evicted."""

@@ -112,6 +112,10 @@ async def merge(
     # Validate + resolve count; keep original band_indices for cog.read() calls.
     n_out_bands = len(normalize_band_indices(band_indices, base.count))
 
+    # Both paths paste every contributor into one array of cogs[0]'s dtype with
+    # n_out_bands rows, so those must line up before either dispatches.
+    _require_stackable_bands(cogs, band_indices)
+
     # Decide whether we need the reprojected merge path.
     all_same_crs = all(cog._crs_epsg == base._crs_epsg for cog in cogs[1:])
     all_same_res = all(
@@ -181,7 +185,6 @@ async def merge(
         dst_height=win_height,
         n_bands=n_out_bands,
         dtype=base_gt.dtype,
-        nodata=base._nodata,
         fill_value=fill_value,
         read_fn=_read_native_bands,
         mosaic_method=mosaic_method,
@@ -210,7 +213,7 @@ async def _merge_reprojected(
     use_overviews: bool = False,
     resampling: ResamplingMethod = "nearest",
 ) -> RasterArray:
-    """Path B: merge with reprojection — supports mixed-CRS inputs."""
+    """Merge with reprojection — supports mixed-CRS inputs."""
     base = cogs[0]
     base_gt = base._geotiff
     out_crs = target_crs
@@ -222,8 +225,10 @@ async def _merge_reprojected(
     # Build output grid
     out_transform, out_w, out_h = _grid_for_bbox(target_bbox, res)
 
-    # Find contributing COGs by intersecting bounds (in target CRS) with output bbox
+    # Find contributing COGs by intersecting bounds (in target CRS) with output
+    # bbox.  Keep each transformed bounds — overview selection needs it again.
     contributing: list[tuple[AsyncGeoTIFF, BBox]] = []
+    bounds_in_target: dict[int, BBox] = {}
     for cog in cogs:
         assert cog._crs_epsg is not None
         cog_bounds_in_target = transform_bbox(
@@ -232,6 +237,7 @@ async def _merge_reprojected(
         sub_bbox = target_bbox.intersect(cog_bounds_in_target)
         if sub_bbox is not None:
             contributing.append((cog, sub_bbox))
+            bounds_in_target[id(cog)] = cog_bounds_in_target
 
     async def _read_and_reproject(cog: AsyncGeoTIFF, sb: BBox) -> RasterArray:
         assert cog._crs_epsg is not None
@@ -270,10 +276,8 @@ async def _merge_reprojected(
         if use_overviews:
             src_res = res
             if needs_reproject:
-                cog_bounds_target = transform_bbox(
-                    BBox(*cog._geotiff.bounds), cog._crs_epsg, out_crs
-                )
                 cog_bounds_native = BBox(*cog._geotiff.bounds)
+                cog_bounds_target = bounds_in_target[id(cog)]
                 src_res = res * (cog_bounds_native.width / cog_bounds_target.width)
             overview = cog._best_overview_for_resolution(src_res)
 
@@ -309,7 +313,6 @@ async def _merge_reprojected(
         dst_height=out_h,
         n_bands=n_out_bands,
         dtype=base_gt.dtype,
-        nodata=base._nodata,
         fill_value=fill_value,
         read_fn=_read_and_reproject,
         mosaic_method=mosaic_method,
@@ -327,16 +330,15 @@ async def _gather_and_paste(
     dst_height: int,
     n_bands: int,
     dtype: np.dtype[Any] | None,
-    nodata: int | float | None,
     fill_value: int | float,
     read_fn: Callable[[AsyncGeoTIFF, BBox], Awaitable[RasterArray]],
     mosaic_method: Literal["first", "last"] = "first",
 ) -> np.ndarray:
     """Read contributing COGs and paste into a single output array.
 
-    Results are pasted in input order. Overlap is resolved by ``mosaic_method``:
-    ``"first"`` keeps the first valid pixel, ``"last"`` lets later COGs
-    overwrite earlier ones.
+    Results are pasted in input order, each masked by its own nodata. Overlap
+    is resolved by ``mosaic_method``: ``"first"`` keeps the first valid pixel,
+    ``"last"`` lets later COGs overwrite earlier ones.
 
     Sequential by default: async-geotiff already parallelizes COG-block reads
     within each contributing TIFF, so an outer fan-out here multiplies the
@@ -381,11 +383,14 @@ async def _gather_and_paste(
             dst_rows, dst_cols, src_rows, src_cols = slices
             src_data: np.ndarray[Any, Any] = arr.data[:, src_rows, src_cols]  # type: ignore[reportUnknownMemberType]
 
-            if nodata is not None:
-                if isinstance(nodata, float) and math.isnan(nodata):
+            # Each contributor's own sentinel: using cogs[0]'s would paste
+            # another COG's nodata as real data.
+            cog_nodata = cog._nodata
+            if cog_nodata is not None:
+                if isinstance(cog_nodata, float) and math.isnan(cog_nodata):
                     valid = ~np.isnan(src_data)
                 else:
-                    valid = src_data != nodata
+                    valid = src_data != cog_nodata
                 src_valid = np.any(valid, axis=0)
             else:
                 src_valid = None
@@ -483,12 +488,47 @@ def _mosaic_grid_from_bbox(
     return transform, width, height
 
 
+def _require_stackable_bands(
+    cogs: Sequence[AsyncGeoTIFF], band_indices: Sequence[int] | None
+) -> None:
+    """Validate dtype and band availability across inputs.
+
+    Applies to both merge paths: without this, a mismatched dtype surfaces as an
+    opaque ``TypeError`` from ``np.copyto`` (or truncates silently when the cast
+    is narrowing), and a missing band as a broadcast error.
+
+    With explicit *band_indices* the counts need not agree — each read resolves
+    the indices against its own COG, so only the requested bands have to exist.
+    """
+    base = cogs[0]
+    base_dtype = base._geotiff.dtype
+    highest = max(band_indices) if band_indices else None
+    for cog in cogs[1:]:
+        if cog._geotiff.dtype != base_dtype:
+            raise ValueError(
+                f"All GeoTIFFs must share the same dtype; {base.uri!r} is "
+                f"{base_dtype} but {cog.uri!r} is {cog._geotiff.dtype}"
+            )
+        if highest is None:
+            if cog.count != base.count:
+                raise ValueError(
+                    f"All GeoTIFFs must share the same band count; {base.uri!r} "
+                    f"has {base.count} but {cog.uri!r} has {cog.count}"
+                )
+        elif cog.count < highest:
+            raise ValueError(
+                f"All GeoTIFFs must carry the requested bands; band_indices "
+                f"asks for band {highest} but {cog.uri!r} has {cog.count}"
+            )
+
+
 def _require_compatible_merge_inputs(cogs: Sequence[AsyncGeoTIFF]) -> None:
     """
     Validate that all inputs can be pasted onto a single shared pixel grid.
 
-    Current merge assumes a north-up, non-rotated Affine grid (b=d=0) and that
-    all sources are aligned to that grid (origins differ by whole pixels).
+    Native-path only: assumes a north-up, non-rotated Affine grid (b=d=0) and
+    that all sources are aligned to it (origins differ by whole pixels).
+    Cross-input dtype/band-count checks live in :func:`_require_stackable_bands`.
     """
     base = cogs[0]
     base_t = base._geotiff.transform
@@ -504,8 +544,6 @@ def _require_compatible_merge_inputs(cogs: Sequence[AsyncGeoTIFF]) -> None:
         t = cog._geotiff.transform
         if cog._crs_epsg != base._crs_epsg:
             raise ValueError("All GeoTIFFs must share the same CRS EPSG")
-        if cog.count != base.count:
-            raise ValueError("All GeoTIFFs must share the same band count")
         if not math.isclose(float(t.a), scale_x):
             raise ValueError("All GeoTIFFs must share the same pixel width")
         if not math.isclose(float(-t.e), scale_y):

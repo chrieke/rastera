@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
 
@@ -79,19 +80,19 @@ class TestBucketUrl:
         uri = "https://bucket.s3.us-east-1.amazonaws.com/key/file.tif"
         assert _bucket_url(uri) == "https://bucket.s3.us-east-1.amazonaws.com"
 
-    def test_local_path_returns_parent_uri(self, tmp_path):
+    def test_local_path_returns_parent_uri(self, tmp_path: Path):
         f = tmp_path / "a.tif"
         f.write_bytes(b"")
         assert _bucket_url(str(f)) == tmp_path.resolve().as_uri()
 
-    def test_local_siblings_share_bucket(self, tmp_path):
+    def test_local_siblings_share_bucket(self, tmp_path: Path):
         a = tmp_path / "a.tif"
         b = tmp_path / "b.tif"
         a.write_bytes(b"")
         b.write_bytes(b"")
         assert _bucket_url(str(a)) == _bucket_url(str(b))
 
-    def test_file_uri_returns_parent_uri(self, tmp_path):
+    def test_file_uri_returns_parent_uri(self, tmp_path: Path):
         f = tmp_path / "a.tif"
         f.write_bytes(b"")
         assert _bucket_url(f.as_uri()) == tmp_path.resolve().as_uri()
@@ -131,12 +132,12 @@ class TestExtractKey:
         uri = "https://s3.us-east-1.amazonaws.com/bucket/path/file.tif"
         assert _extract_key(uri) == "path/file.tif"
 
-    def test_local_path_returns_filename(self, tmp_path):
+    def test_local_path_returns_filename(self, tmp_path: Path):
         f = tmp_path / "file.tif"
         f.write_bytes(b"")
         assert _extract_key(str(f)) == "file.tif"
 
-    def test_file_uri_returns_filename(self, tmp_path):
+    def test_file_uri_returns_filename(self, tmp_path: Path):
         f = tmp_path / "file.tif"
         f.write_bytes(b"")
         assert _extract_key(f.as_uri()) == "file.tif"
@@ -221,9 +222,9 @@ class TestBuildStoreWith:
         assert call_args[0][0] == "s3://bucket"
 
     def test_local_uri_strips_skip_signature(self):
-        captured: dict = {}
+        captured: dict[str, Any] = {}
 
-        def fake_from_url(url, **kwargs):
+        def fake_from_url(url: str, **kwargs: Any) -> object:
             captured["url"] = url
             captured["kwargs"] = kwargs
             return object()
@@ -232,9 +233,9 @@ class TestBuildStoreWith:
         assert "skip_signature" not in captured["kwargs"]
 
     def test_non_s3_https_uri_strips_skip_signature(self):
-        captured: dict = {}
+        captured: dict[str, Any] = {}
 
-        def fake_from_url(url, **kwargs):
+        def fake_from_url(url: str, **kwargs: Any) -> object:
             captured["url"] = url
             captured["kwargs"] = kwargs
             return object()
