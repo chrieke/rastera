@@ -8,7 +8,7 @@ from typing import Any, Literal
 import numpy as np
 from affine import Affine
 from async_geotiff import RasterArray
-from pyproj import CRS, Transformer
+from pyproj import CRS
 
 from . import config
 from .geo import (
@@ -17,7 +17,6 @@ from .geo import (
     _affine_apply,
     _denoise,
     _normalize_crs,
-    bounds_from_transform,
     compute_paste_slices,
     ensure_bbox,
     normalize_band_indices,
@@ -27,10 +26,9 @@ from .reader import (
     AsyncGeoTIFF,
     _CrsNodata,
     _grid_for_bbox,
-    _halo_bbox,
     _make_output_array,
 )
-from .resampling import ResamplingMethod, resample
+from .resampling import ResamplingMethod
 
 
 async def merge(
@@ -237,18 +235,15 @@ async def _merge_reprojected(
     out_transform, out_w, out_h = _grid_for_bbox(target_bbox, res)
 
     # Find contributing COGs by intersecting bounds (in target CRS) with output
-    # bbox.  Keep each transformed bounds — overview selection needs it again.
+    # bbox.
     contributing: list[tuple[AsyncGeoTIFF, BBox]] = []
-    bounds_in_target: dict[int, BBox] = {}
     for cog in cogs:
         assert cog._crs_epsg is not None
-        cog_bounds_in_target = transform_bbox(
-            BBox(*cog._geotiff.bounds), cog._crs_epsg, out_crs
+        sub_bbox = target_bbox.intersect(
+            transform_bbox(BBox(*cog._geotiff.bounds), cog._crs_epsg, out_crs)
         )
-        sub_bbox = target_bbox.intersect(cog_bounds_in_target)
         if sub_bbox is not None:
             contributing.append((cog, sub_bbox))
-            bounds_in_target[id(cog)] = cog_bounds_in_target
 
     async def _read_and_reproject(cog: AsyncGeoTIFF, sb: BBox) -> RasterArray:
         assert cog._crs_epsg is not None
@@ -264,56 +259,15 @@ async def _merge_reprojected(
             )
         sub_transform, sub_w, sub_h = subgrid
 
-        # Geographic extent of the aligned sub-grid (may be slightly
-        # larger than sb due to integer pixel rounding).
-        read_bbox = bounds_from_transform(sub_transform, sub_w, sub_h)
-
-        needs_reproject = cog._crs_epsg != out_crs
-        if needs_reproject:
-            read_bbox = transform_bbox(read_bbox, out_crs, cog._crs_epsg)
-
-        # Target resolution in this COG's own units.
-        src_res = res
-        if needs_reproject:
-            cog_bounds_native = BBox(*cog._geotiff.bounds)
-            cog_bounds_target = bounds_in_target[id(cog)]
-            src_res = res * (cog_bounds_native.width / cog_bounds_target.width)
-
-        # Select best overview for the target resolution.
-        overview = cog._best_overview_for_resolution(src_res) if use_overviews else None
-
-        readable = overview if overview is not None else cog._geotiff
-        read_bbox = _halo_bbox(
-            read_bbox,
-            method=resampling,
-            dst_res=(src_res, src_res),
-            src_res=(float(readable.res[0]), float(readable.res[1])),
-        )
-
-        indices = normalize_band_indices(band_indices, cog.count)
-        native = await cog._read_native(
-            bbox=read_bbox,
-            band_indices=indices,
-            overview=overview,
-        )
-
-        transformer = None
-        if needs_reproject:
-            transformer = Transformer.from_crs(out_crs, cog._crs_epsg, always_xy=True)
-
-        out_data = resample(
-            native.data,  # type: ignore[reportUnknownMemberType]
-            src_transform=native.transform,
+        return await cog._read_to_grid(
             dst_transform=sub_transform,
             dst_width=sub_w,
             dst_height=sub_h,
-            nodata=cog._nodata,
-            transformer=transformer,
-            method=resampling,
+            out_crs=out_crs,
+            band_indices=normalize_band_indices(band_indices, cog.count),
+            resampling=resampling,
+            use_overviews=use_overviews,
         )
-
-        geotiff_ref = _CrsNodata(CRS.from_epsg(out_crs), cog._nodata)
-        return _make_output_array(out_data, sub_transform, sub_w, sub_h, geotiff_ref)
 
     out_data = await _gather_and_paste(
         contributing=contributing,
