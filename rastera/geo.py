@@ -83,10 +83,18 @@ def normalize_band_indices(
 
 
 def bounds_from_transform(transform: Affine, width: int, height: int) -> BBox:
-    """Compute bounding box in world coordinates from an affine transform."""
-    x0, y0 = _affine_apply(transform, 0, 0)
-    x1, y1 = _affine_apply(transform, width, height)
-    return BBox(minx=min(x0, x1), miny=min(y0, y1), maxx=max(x0, x1), maxy=max(y0, y1))
+    """Compute bounding box in world coordinates from an affine transform.
+
+    Takes the hull of all four corners, so a rotated transform yields its
+    true envelope rather than a degenerate box.
+    """
+    corners = [
+        _affine_apply(transform, c, r)
+        for c, r in ((0, 0), (width, 0), (0, height), (width, height))
+    ]
+    xs = [x for x, _ in corners]
+    ys = [y for _, y in corners]
+    return BBox(minx=min(xs), miny=min(ys), maxx=max(xs), maxy=max(ys))
 
 
 class WindowOutOfRangeError(ValueError):
@@ -119,19 +127,28 @@ def window_from_bbox(
     # An alternative (floor/ceil on individual bounds) includes every
     # pixel partially covered by the bbox, but produces +1 pixel vs
     # rasterio whenever the bbox doesn't align to the source grid.
-    col_lo = min(col_min_f, col_max_f)
-    col_hi = max(col_min_f, col_max_f)
-    row_lo = min(row_min_f, row_max_f)
-    row_hi = max(row_min_f, row_max_f)
+    #
+    # The interval is clipped to the image first.  Clamping only the offset
+    # (`max(0, floor(lo))`) leaves the span positive for a bbox lying entirely
+    # left of or above the image, which yields a plausible window over the wrong
+    # pixels.  For a bbox inside the image the clip is a no-op, so the sizing
+    # rule above is unaffected.
+    col_lo = max(0.0, min(col_min_f, col_max_f))
+    col_hi = min(float(meta.width), max(col_min_f, col_max_f))
+    row_lo = max(0.0, min(row_min_f, row_max_f))
+    row_hi = min(float(meta.height), max(row_min_f, row_max_f))
 
-    col_off = max(0, math.floor(col_lo))
-    row_off = max(0, math.floor(row_lo))
+    if col_hi <= col_lo or row_hi <= row_lo:
+        raise WindowOutOfRangeError("BBox does not intersect image")
+
+    col_off = math.floor(col_lo)
+    row_off = math.floor(row_lo)
     width = min(meta.width, col_off + math.floor(col_hi - col_lo + 0.5)) - col_off
     height = min(meta.height, row_off + math.floor(row_hi - row_lo + 0.5)) - row_off
 
+    # Sub-pixel sliver: the bbox overlaps but rounds to nothing.
     if width <= 0 or height <= 0:
-        msg = "BBox does not intersect image"
-        raise WindowOutOfRangeError(msg)
+        raise WindowOutOfRangeError("BBox does not intersect image")
 
     return Window(col_off=col_off, row_off=row_off, width=width, height=height)
 
@@ -226,17 +243,22 @@ def transform_bbox(
         ]
     )
     xs_out, ys_out = transformer.transform(xs, ys)
-    valid = np.isfinite(xs_out) & np.isfinite(ys_out)
-    if not np.any(valid):
+    # Any non-finite edge point means the bbox reaches outside the target CRS's
+    # domain, so no finite envelope is correct.  Taking the hull of just the
+    # finite subset would silently under-cover the request.
+    n_bad = int(np.count_nonzero(~(np.isfinite(xs_out) & np.isfinite(ys_out))))
+    if n_bad:
         raise ValueError(
-            f"All coordinates became inf/nan transforming bbox "
-            f"from EPSG:{from_crs} to EPSG:{to_crs}"
+            f"{n_bad}/{xs_out.size} densified edge points became inf/nan "
+            f"transforming bbox {tuple(bbox)} from EPSG:{from_crs} to "
+            f"EPSG:{to_crs}; the bbox reaches outside the target CRS's area "
+            f"of use. Clip it first."
         )
     return BBox(
-        float(np.min(xs_out[valid])),
-        float(np.min(ys_out[valid])),
-        float(np.max(xs_out[valid])),
-        float(np.max(ys_out[valid])),
+        float(np.min(xs_out)),
+        float(np.min(ys_out)),
+        float(np.max(xs_out)),
+        float(np.max(ys_out)),
     )
 
 

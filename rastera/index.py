@@ -40,10 +40,11 @@ async def build_index(
 
     Args:
         uris: COG URIs to index.
-        store: Optional pre-constructed object store for connection reuse.
+        store: Optional pre-constructed obstore store for connection reuse
+            (not the async-tiff store ``rastera.open`` takes).
         prefetch: Number of header bytes to store per file (default 32KB).
         concurrency: Maximum number of concurrent file opens (default 100).
-        **store_kwargs: Extra kwargs forwarded to ``async_tiff.store.from_url``.
+        **store_kwargs: Extra kwargs forwarded to ``obstore.store.from_url``.
 
     Returns:
         A GeoDataFrame with geometry in EPSG:4326.
@@ -52,7 +53,7 @@ async def build_index(
     uris = list(uris)
     if not uris:
         return _empty_geodataframe()
-    obs = _build_obstore(uris[0], **store_kwargs)
+    obs = store if store is not None else _build_obstore(uris[0], **store_kwargs)
     sem = asyncio.Semaphore(concurrency)
 
     # Fetch header bytes once, then open COGs through cache so async-geotiff

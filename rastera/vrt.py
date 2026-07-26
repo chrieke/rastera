@@ -57,10 +57,12 @@ from __future__ import annotations
 import math
 import xml.etree.ElementTree as ET
 from collections.abc import Awaitable, Sequence
+from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
+from affine import Affine
 from async_geotiff import RasterArray, Window
 from pyproj import CRS
 
@@ -123,7 +125,41 @@ class _VRTProcessedSpec:
     output_count: int
 
 
+# URIs of the VRTs currently being opened on this task, outermost first.  A VRT
+# source may itself be a VRT (``AsyncGeoTIFF.open`` routes ``.vrt`` back here),
+# so without this a self- or mutually-referencing VRT recurses until
+# RecursionError, issuing a network GET per level.
+_vrt_open_stack: ContextVar[tuple[str, ...]] = ContextVar("_vrt_open_stack", default=())
+
+
 async def _open_vrt(
+    uri: str,
+    *,
+    store: Any = None,
+    prefetch: int = 32768,
+    cache: bool = True,
+    meta_overrides: MetaOverrides | None = None,
+    **store_kwargs: Any,
+) -> AsyncGeoTIFF:
+    """Open a VRT, rejecting reference cycles. See :func:`_open_vrt_checked`."""
+    stack = _vrt_open_stack.get()
+    if uri in stack:
+        raise ValueError(f"VRT reference cycle: {' -> '.join((*stack, uri))}")
+    token = _vrt_open_stack.set((*stack, uri))
+    try:
+        return await _open_vrt_checked(
+            uri,
+            store=store,
+            prefetch=prefetch,
+            cache=cache,
+            meta_overrides=meta_overrides,
+            **store_kwargs,
+        )
+    finally:
+        _vrt_open_stack.reset(token)
+
+
+async def _open_vrt_checked(
     uri: str,
     *,
     store: Any = None,
@@ -197,6 +233,9 @@ class _VRTDataset(AsyncGeoTIFF):
     ):
         first = sources_map[bands[0].source_uri]
         super().__init__(uri, first._geotiff, meta_overrides=meta_overrides)
+        # Don't inherit the first source's pyramid: read(use_overviews=True)
+        # raises here, so advertising overviews we refuse to use is misleading.
+        self.overviews = []
         self._band_sources: list[tuple[AsyncGeoTIFF, int]] = [
             (sources_map[b.source_uri], b.source_band) for b in bands
         ]
@@ -340,7 +379,9 @@ class _VRTProcessedDataset(AsyncGeoTIFF):
             dtype=np.dtype("uint8"),
             nodata=spec.dst_nodata,
         )
-        super().__init__(uri, virtual, meta_overrides=meta_overrides)  # type: ignore[arg-type]
+        super().__init__(uri, virtual, meta_overrides=meta_overrides)
+        # See _VRTDataset: read(use_overviews=True) raises, so advertise none.
+        self.overviews = []
         self._spec = spec
         self._source = source
 
@@ -417,11 +458,18 @@ class _VRTProcessedDataset(AsyncGeoTIFF):
                 f"Processed VRT source dtype {in_data.dtype} is not integer; "
                 f"only integer reflectance sources are supported"
             )
-        if int(in_data.max(initial=0)) >= _LUT_SIZE or int(in_data.min(initial=0)) < 0:
-            raise ValueError(
-                f"Processed VRT source has values outside [0, {_LUT_SIZE - 1}]; "
-                f"the LUT only covers that range"
-            )
+        # Two full passes over the array, so skip them for the dtypes whose
+        # whole range already fits the LUT (uint8/uint16 — all that PNEO, SPOT
+        # and Pleiades ship).
+        if in_data.dtype.kind == "i" or in_data.dtype.itemsize > 2:
+            if (
+                int(in_data.max(initial=0)) >= _LUT_SIZE
+                or int(in_data.min(initial=0)) < 0
+            ):
+                raise ValueError(
+                    f"Processed VRT source has values outside "
+                    f"[0, {_LUT_SIZE - 1}]; the LUT only covers that range"
+                )
         out = np.empty(
             (len(band_indices_0), in_data.shape[1], in_data.shape[2]),
             dtype=np.uint8,
@@ -897,6 +945,7 @@ def _validate_source_windows(
 
     reference = sources_map[bands[0].source_uri]
     ref_dims = dims(reference)
+    ref_uri = bands[0].source_uri
 
     for i, band in enumerate(bands, start=1):
         src = sources_map[band.source_uri]
@@ -906,8 +955,33 @@ def _validate_source_windows(
             raise NotImplementedError(
                 f"VRT band {i} source {band.source_uri!r} is "
                 f"{src_dims[0]:g}x{src_dims[1]:g} but band 1 source "
-                f"{bands[0].source_uri!r} is {ref_dims[0]:g}x{ref_dims[1]:g}; "
+                f"{ref_uri!r} is {ref_dims[0]:g}x{ref_dims[1]:g}; "
                 f"band-stack VRTs must reference sources of identical size."
+            )
+        # Equal size alone does not make two sources stackable: the bands are
+        # written into one array typed from band 1 and returned under band 1's
+        # transform, so a differing dtype would be silently cast and a differing
+        # grid would mislabel the pixels' location.
+        if src._geotiff.dtype != reference._geotiff.dtype:
+            raise NotImplementedError(
+                f"VRT band {i} source {band.source_uri!r} has dtype "
+                f"{src._geotiff.dtype} but band 1 source {ref_uri!r} has "
+                f"{reference._geotiff.dtype}; band-stack VRTs must reference "
+                f"sources of identical dtype."
+            )
+        if src._crs_epsg != reference._crs_epsg:
+            raise NotImplementedError(
+                f"VRT band {i} source {band.source_uri!r} is EPSG:"
+                f"{src._crs_epsg} but band 1 source {ref_uri!r} is EPSG:"
+                f"{reference._crs_epsg}; band-stack VRTs must reference sources "
+                f"in one CRS. Use rastera.merge() to combine differing CRSs."
+            )
+        if not _transforms_match(src._geotiff.transform, reference._geotiff.transform):
+            raise NotImplementedError(
+                f"VRT band {i} source {band.source_uri!r} has geotransform "
+                f"{src._geotiff.transform!r} but band 1 source {ref_uri!r} has "
+                f"{reference._geotiff.transform!r}; band-stack VRTs must "
+                f"reference sources covering the same extent."
             )
         if band.src_rect_size is not None and band.src_rect_size != src_dims:
             raise NotImplementedError(
@@ -1255,4 +1329,20 @@ def _processed_virtual_geotiff(
         bounds=tuple(src_geotiff.bounds),
         transform=src_geotiff.transform,
         overviews=tuple(getattr(src_geotiff, "overviews", ()) or ()),
+    )
+
+
+def _transforms_match(a: Affine, b: Affine) -> bool:
+    """Whether two geotransforms describe the same grid.
+
+    Exact float equality would reject sources whose transforms differ only by
+    rounding between the GDAL runs that produced them.  The relative tolerance
+    covers the scale and origin terms at any CRS unit; the pixel-scaled
+    absolute one covers the rotation terms, which are 0.0 in one source and
+    sometimes 1e-16 in another.
+    """
+    abs_tol = max(abs(float(b.a)), abs(float(b.e))) * 1e-6
+    return all(
+        math.isclose(float(x), float(y), rel_tol=1e-9, abs_tol=abs_tol)
+        for x, y in zip(a[:6], b[:6])
     )

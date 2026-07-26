@@ -102,8 +102,21 @@ def resample(
             the ``"auto"`` / ``"single_pass"`` semantics. No effect on nearest
             (any CRS/scale), same-CRS, or upsampling.
     """
+    if method not in ("nearest", "bilinear", "cubic"):
+        raise ValueError(
+            f"Unknown resampling method {method!r}; "
+            "expected 'nearest', 'bilinear', or 'cubic'."
+        )
     if warp_strategy is None:
         warp_strategy = config._warp_strategy
+
+    _validate_grids(src_transform, dst_transform, dst_width, dst_height)
+    _validate_dtype_nodata(src_array.dtype, nodata)
+    if dst_width == 0 or dst_height == 0:
+        return np.empty(
+            (src_array.shape[0], dst_height, dst_width), dtype=src_array.dtype
+        )
+
     if method == "nearest":
         return _resample_nearest(
             src_array,
@@ -114,21 +127,16 @@ def resample(
             nodata,
             transformer,
         )
-    if method in ("bilinear", "cubic"):
-        return _resample_kernel(
-            src_array,
-            src_transform,
-            dst_transform,
-            dst_width,
-            dst_height,
-            nodata,
-            transformer,
-            method,
-            warp_strategy,
-        )
-    raise ValueError(
-        f"Unknown resampling method {method!r}; "
-        "expected 'nearest', 'bilinear', or 'cubic'."
+    return _resample_kernel(
+        src_array,
+        src_transform,
+        dst_transform,
+        dst_width,
+        dst_height,
+        nodata,
+        transformer,
+        method,
+        warp_strategy,
     )
 
 
@@ -240,6 +248,13 @@ def _resample_kernel(
     - Accumulation is in float64; integer output dtypes are
       clip+round-cast at the end (cubic can overshoot the source range).
     """
+    # Only the kernels do arithmetic on samples; nearest is a pure gather and
+    # copies complex values through unharmed, so the rejection lives here
+    # rather than in `resample`.
+    if np.issubdtype(src_array.dtype, np.complexfloating):
+        raise NotImplementedError(
+            f"{method} resampling does not support complex dtype {src_array.dtype}"
+        )
     n_bands, h, w = src_array.shape
 
     # NaN-sentinel nodata needs `np.isnan` for detection (NaN != NaN means
@@ -434,6 +449,53 @@ def _resample_kernel(
 
 # ---- Private helpers ----
 
+
+def _validate_grids(
+    src_transform: Affine, dst_transform: Affine, dst_width: int, dst_height: int
+) -> None:
+    """Reject grids this module cannot represent.
+
+    Every path below reads only the ``a, c, e, f`` terms of the affines, so a
+    rotated or sheared grid would be resampled as if it were north-up — wrong
+    pixels, no error.  ``merge`` rejects rotation for the same reason.
+    """
+    for name, t in (("src_transform", src_transform), ("dst_transform", dst_transform)):
+        b, d = float(t.b), float(t.d)
+        if not math.isclose(b, 0.0) or not math.isclose(d, 0.0):
+            raise NotImplementedError(
+                f"resample requires a north-up (non-rotated) grid; {name} has "
+                f"b={b!r}, d={d!r}"
+            )
+    if dst_width < 0 or dst_height < 0:
+        raise ValueError(
+            f"dst_width/dst_height must be >= 0, got {dst_width}x{dst_height}"
+        )
+
+
+def _validate_dtype_nodata(dtype: np.dtype, nodata: int | float | None) -> None:
+    """Reject nodata sentinels the dtype cannot carry.
+
+    Such a sentinel used to behave differently per method within one call:
+    ``nearest`` raised ``OverflowError`` while bilinear/cubic clipped it into
+    the valid range, making nodata indistinguishable from real data.
+    """
+    if nodata is None or dtype.kind not in ("i", "u", "b"):
+        return
+    if math.isnan(nodata):
+        raise ValueError(
+            f"nodata=NaN cannot be represented in {dtype}; pass a finite "
+            f"sentinel or nodata=None"
+        )
+    if dtype.kind == "b":
+        return  # np.iinfo has no bool entry, and there is no range to check
+    info = np.iinfo(dtype)
+    if not info.min <= nodata <= info.max:
+        raise ValueError(
+            f"nodata={nodata!r} is outside the range of {dtype} "
+            f"[{info.min}, {info.max}]; no pixel can equal it"
+        )
+
+
 _WARP_GRID_STEP = 16
 
 # Output-row block size for the separable two-pass accumulator.  Bounds the
@@ -470,6 +532,14 @@ def _coarse_grid_transform(
     cwx = float(dst_transform.a) * cc + float(dst_transform.c)
     cwy = float(dst_transform.e) * cr + float(dst_transform.f)
     cwx, cwy = transformer.transform(cwx, cwy)
+    # PROJ returns inf for out-of-domain input.  np.interp below would smear a
+    # single inf node across a whole `step`-wide cell as NaN, and the index
+    # casts after that are undefined — so fail loudly instead.
+    if not (np.all(np.isfinite(cwx)) and np.all(np.isfinite(cwy))):
+        raise ValueError(
+            "Reprojecting the destination grid produced inf/nan coordinates; "
+            "it reaches outside the source CRS's area of use."
+        )
 
     src_inv = ~src_transform
     coarse_src_col = float(src_inv.a) * cwx + float(src_inv.c)
@@ -539,7 +609,7 @@ def _cubic_weights(
     kernel.  Normalization handles the rare case where summed weights
     drift from 1 due to scaling.
     """
-    weights = []
+    weights: list[np.ndarray] = []
     for k in offsets:
         d = np.abs(k - frac) / scale
         d2 = d * d
@@ -590,9 +660,7 @@ def _accumulate_separable(
     inb_cols = [(base_col + dx >= 0) & (base_col + dx < w) for dx in x_offsets]
 
     acc_val = np.empty((n_bands, dst_h, dst_w), dtype=np.float64)
-    acc_wt = (
-        np.empty((dst_h, dst_w), dtype=np.float64) if nodata is not None else None
-    )
+    acc_wt = np.empty((dst_h, dst_w), dtype=np.float64) if nodata is not None else None
 
     # Source-pixel validity (all bands non-nodata), shared by every block.
     valid_src: np.ndarray | None = None
@@ -731,10 +799,9 @@ def _finalize_kernel(
             center_sample = src_array[
                 :, center_safe_row[:, None], center_safe_col[None, :]
             ]
-            in_bounds_center = (
-                ((center_row >= 0) & (center_row < h))[:, None]
-                & ((center_col >= 0) & (center_col < w))[None, :]
-            )
+            in_bounds_center = ((center_row >= 0) & (center_row < h))[:, None] & (
+                (center_col >= 0) & (center_col < w)
+            )[None, :]
         if nodata_is_nan:
             center_is_nodata = np.isnan(center_sample).any(axis=0)
         else:
@@ -749,6 +816,10 @@ def _finalize_kernel(
         out_f = acc_val
 
     src_dtype = src_array.dtype
+    # Bool is not an np.integer, so it would skip the round below and let any
+    # non-zero accumulation become True — dilating the mask.
+    if src_dtype.kind == "b":
+        return out_f >= 0.5
     if np.issubdtype(src_dtype, np.integer):
         info = np.iinfo(src_dtype)
         np.clip(out_f, info.min, info.max, out=out_f)
@@ -778,6 +849,8 @@ def _two_pass_work_dtype(dtype: np.dtype) -> np.dtype:
     """
     if np.issubdtype(dtype, np.floating):
         return dtype
+    if dtype.kind == "b":
+        return np.dtype(np.float32)
     info = np.iinfo(dtype)
     if info.min >= -(2**24) and info.max <= 2**24:
         return np.dtype(np.float32)
@@ -863,6 +936,8 @@ def _resample_two_pass(
     )
 
     # Both passes ran in float; clip+round+cast back to the source dtype once.
+    if orig_dtype.kind == "b":
+        return out >= 0.5
     if np.issubdtype(orig_dtype, np.integer):
         info = np.iinfo(orig_dtype)
         out = out.astype(np.float64, copy=False)

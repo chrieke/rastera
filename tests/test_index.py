@@ -3,14 +3,20 @@
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
-import geopandas as gpd
 import numpy as np
 import pytest
 from affine import Affine
-from shapely.geometry import box
 
-from rastera.index import HeaderCacheStore, _obstore_key, build_index, open_from_index
-from rastera.reader import AsyncGeoTIFF
+gpd = pytest.importorskip("geopandas")
+box = pytest.importorskip("shapely.geometry").box
+
+from rastera.index import (  # noqa: E402
+    HeaderCacheStore,
+    _obstore_key,
+    build_index,
+    open_from_index,
+)
+from rastera.reader import AsyncGeoTIFF  # noqa: E402
 
 # ── Helpers ──────────────────────────────────────────────────────────────
 
@@ -54,7 +60,9 @@ def _make_mock_async_geotiff(
     return obj
 
 
-def _make_index_gdf(entries: list[dict[str, Any]]) -> gpd.GeoDataFrame:
+# Return type is Any, not gpd.GeoDataFrame: gpd comes from importorskip, so it
+# is a variable rather than a module symbol usable in a type expression.
+def _make_index_gdf(entries: list[dict[str, Any]]) -> Any:
     """Build a GeoDataFrame matching the build_index schema.
 
     Each entry is a dict with keys: uri, crs_epsg, minx, miny, maxx, maxy.
@@ -331,3 +339,26 @@ class TestObstoreKey:
         ]
         for url in urls:
             assert _obstore_key(url) == _extract_key(url), f"Mismatch for {url}"
+
+
+class TestBuildIndexStore:
+    @pytest.mark.asyncio
+    @patch("rastera.index._build_obstore")
+    @patch("rastera.index.AsyncGeoTIFF.open", new_callable=AsyncMock)
+    @patch("rastera.index.obstore.get_range_async", new_callable=AsyncMock)
+    async def test_honours_explicit_store(
+        self, mock_get_range: Any, mock_open: Any, mock_build_obs: Any
+    ) -> None:
+        """`store` was declared and documented but never read, so a caller's
+        authenticated store was silently replaced by a default unsigned one.
+        `open_from_index` already honoured it."""
+        mock_get_range.return_value = b"\x00" * 32768
+        mock_open.return_value = _make_mock_async_geotiff(uri="s3://bucket/key.tif")
+        sentinel = MagicMock(name="caller_store")
+
+        await build_index(["s3://bucket/key.tif"], store=sentinel)
+
+        mock_build_obs.assert_not_called()
+        # The header fetch goes through the caller's store, not a rebuilt one.
+        assert mock_get_range.await_args is not None
+        assert mock_get_range.await_args.args[0] is sentinel

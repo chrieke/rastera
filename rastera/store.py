@@ -185,7 +185,7 @@ async def _fetch_descriptor_bytes(uri: str, **store_kwargs: Any) -> bytes:
     DIMAP readers — both just GET the whole document once at open time."""
     local = _resolve_local_path(uri)
     if local is not None:
-        return Path(local).read_bytes()
+        return local.read_bytes()
     store = _build_store_with(uri, obstore_from_url, **store_kwargs)
     key = _obstore_key(uri)
     result = await obstore.get_async(store, key)

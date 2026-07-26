@@ -1,6 +1,6 @@
 """Unit tests for merge and helpers."""
 
-from typing import Any
+from typing import Any, Literal
 from unittest.mock import AsyncMock, MagicMock
 
 import numpy as np
@@ -599,7 +599,10 @@ class TestMergeConcurrencyInvariance:
     @pytest.mark.parametrize("n", [1, 2, 8])
     @pytest.mark.parametrize("mosaic_method", ["first", "last"])
     async def test_pixel_equal_across_n(
-        self, n, mosaic_method, _reset_merge_concurrency
+        self,
+        n: int,
+        mosaic_method: Literal["first", "last"],
+        _reset_merge_concurrency: None,
     ):
         """Output must match the n=1 baseline pixel-for-pixel for any n."""
         import rastera
@@ -630,9 +633,11 @@ class TestMergeConcurrencyInvariance:
             mosaic_method=mosaic_method,
             snap_to_grid=True,
         )
-        assert np.array_equal(result.data, baseline.data)
+        result_data: np.ndarray[Any, Any] = result.data  # type: ignore[reportUnknownMemberType]
+        baseline_data: np.ndarray[Any, Any] = baseline.data  # type: ignore[reportUnknownMemberType]
+        assert np.array_equal(result_data, baseline_data)
 
-    async def test_first_mode_still_early_exits(self, _reset_merge_concurrency):
+    async def test_first_mode_still_early_exits(self, _reset_merge_concurrency: None):
         """With mosaic_method='first', first batch fully fills output → later
         batches should not be read at all."""
         import rastera
@@ -659,3 +664,107 @@ class TestMergeConcurrencyInvariance:
         called = [c._read_native.await_count for c in cogs]
         assert called[:4] == [1, 1, 1, 1]
         assert called[4:] == [0] * 8
+
+
+# ── cross-input compatibility ────────────────────────────────────────────
+
+
+class TestMixedInputs:
+    def _cog_at(self, origin_x: float, value: int, **kw: Any):
+        """A 10x10 COG at 10m/px filled with *value*, ready for merge."""
+        cog = _make_cog(width=10, height=10, bands=1, origin_x=origin_x, **kw)
+        data = np.full((1, 10, 10), value, dtype=cog._geotiff.dtype)
+        arr = _make_array(
+            data,
+            Affine(10, 0, origin_x, 0, -10, 100),
+            geotiff=cog._geotiff,
+        )
+        cog._read_native = AsyncMock(return_value=arr)
+        return cog
+
+    async def test_mixed_nodata_masks_per_contributor(self):
+        """_gather_and_paste applied cogs[0]'s sentinel to every contributor, so
+        a second COG's nodata was pasted as real data."""
+        a = self._cog_at(0.0, 7, nodata=0, dtype=np.dtype("u1"))
+        b = self._cog_at(100.0, 255, nodata=255, dtype=np.dtype("u1"))
+
+        out = await merge(
+            [a, b],
+            bbox=(0, 0, 200, 100),
+            bbox_crs=32632,
+            target_resolution=10.0,
+            fill_value=0,
+        )
+        # A is fully valid; B is entirely its own nodata, so it contributes
+        # nothing and its half stays at fill_value.
+        out_data: np.ndarray[Any, Any] = out.data  # type: ignore[reportUnknownMemberType]
+        assert np.all(out_data[0, :, :10] == 7)
+        assert np.all(out_data[0, :, 10:] == 0)
+
+    async def test_mixed_dtype_rejected(self):
+        """A float32 contribution into a uint16 output raised an opaque
+        TypeError from np.copyto; a narrowing cast truncated silently."""
+        a = self._cog_at(0.0, 7, dtype=np.dtype("u2"))
+        b = self._cog_at(100.0, 1, dtype=np.dtype("f4"))
+        with pytest.raises(ValueError, match="same dtype"):
+            await merge(
+                [a, b], bbox=(0, 0, 200, 100), bbox_crs=32632, target_resolution=10.0
+            )
+
+    async def test_mixed_band_count_rejected(self):
+        a = _make_cog(width=10, height=10, bands=1)
+        b = _make_cog(width=10, height=10, bands=3, origin_x=100.0)
+        with pytest.raises(ValueError, match="same band count"):
+            await merge(
+                [a, b], bbox=(0, 0, 200, 100), bbox_crs=32632, target_resolution=10.0
+            )
+
+    def _cog_with_bands(self, origin_x: float, n_bands: int, n_read_bands: int):
+        """A COG advertising *n_bands* whose mocked read returns *n_read_bands*."""
+        cog = _make_cog(width=10, height=10, bands=n_bands, origin_x=origin_x)
+        data = np.full((n_read_bands, 10, 10), 5, dtype=cog._geotiff.dtype)
+        arr = _make_array(
+            data, Affine(10, 0, origin_x, 0, -10, 100), geotiff=cog._geotiff
+        )
+        cog._read_native = AsyncMock(return_value=arr)
+        return cog
+
+    async def test_band_subset_allows_mixed_counts(self):
+        """Explicit band_indices are resolved against each COG separately, so
+        the counts need not agree — only the requested bands must exist."""
+        a = self._cog_with_bands(0.0, n_bands=4, n_read_bands=3)
+        b = self._cog_with_bands(100.0, n_bands=3, n_read_bands=3)
+        out = await merge(
+            [a, b],
+            bbox=(0, 0, 200, 100),
+            bbox_crs=32632,
+            target_resolution=20.0,
+            band_indices=[1, 2, 3],
+        )
+        out_data: np.ndarray[Any, Any] = out.data  # type: ignore[reportUnknownMemberType]
+        assert out_data.shape[0] == 3
+
+    async def test_band_subset_missing_band_rejected(self):
+        a = self._cog_with_bands(0.0, n_bands=3, n_read_bands=3)
+        b = self._cog_with_bands(100.0, n_bands=2, n_read_bands=3)
+        with pytest.raises(ValueError, match="requested bands"):
+            await merge(
+                [a, b],
+                bbox=(0, 0, 200, 100),
+                bbox_crs=32632,
+                target_resolution=20.0,
+                band_indices=[1, 2, 3],
+            )
+
+    async def test_mixed_dtype_rejected_on_reprojected_path(self):
+        """The reprojected path ran no compatibility check at all."""
+        a = self._cog_at(0.0, 7, dtype=np.dtype("u2"))
+        b = self._cog_at(100.0, 1, dtype=np.dtype("f4"))
+        with pytest.raises(ValueError, match="same dtype"):
+            await merge(
+                [a, b],
+                bbox=(0, 0, 200, 100),
+                bbox_crs=32632,
+                # Non-native resolution forces _merge_reprojected.
+                target_resolution=20.0,
+            )

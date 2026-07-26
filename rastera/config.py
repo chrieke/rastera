@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable
+from collections.abc import Awaitable, Coroutine
 from typing import Literal, TypeVar
 
 _merge_concurrency: int = 1
@@ -70,39 +70,20 @@ def set_concurrency(
 def set_warp_strategy(strategy: WarpStrategy) -> None:
     """Select how a cross-CRS warp (a reprojecting resample) is carried out.
 
-    This is a process-wide setting read by :func:`rastera.resampling.resample`.
-    **It applies only to bilinear and cubic, and only when reprojecting
-    (different source/target CRS) while downsampling.**  It has NO effect on:
+    Process-wide setting read by :func:`rastera.resampling.resample`. Applies
+    only to bilinear/cubic when reprojecting *and* downsampling — nearest,
+    same-CRS resamples, and upsampling are unaffected.
 
-    - ``nearest`` resampling — any CRS, any scale (it reads a single source
-      pixel, so there is no kernel to widen and nothing to speed up);
-    - same-CRS resamples (already use the fast separable path);
-    - upsampling.
+    - ``"auto"`` (default): above a downsample scale of 2.0, downsample in the
+      source CRS first (fast separable path) then reproject the smaller
+      intermediate at near-unit scale. ~3-4x faster than widening the kernel
+      into an ``O(taps_x · taps_y)`` 2-D loop. Below that threshold two-pass is
+      break-even-to-slower, so single-pass is used.
+    - ``"single_pass"``: always the single non-separable warp. Bit-exact with
+      releases predating two-pass; use when reproducibility matters.
 
-    A cross-CRS downsample widens the resampling kernel to anti-alias (e.g. a
-    16cm→50cm reproject uses a ~14-tap cubic / ~7-tap bilinear kernel per axis)
-    and runs a non-separable 2-D loop, which is ``O(taps_x · taps_y)``.  The
-    two-pass strategy instead downsamples in the *source* CRS first (the fast
-    separable same-CRS path), then reprojects the smaller intermediate at
-    near-unit scale (a narrow kernel) — far cheaper for heavy downsamples
-    (~3-4x for cubic, ~3x for bilinear at scale 3).
-
-    Values:
-
-    - ``"auto"`` (default): take the two-pass route only above a conservative
-      downsample scale (> 2.0), where the kernel blow-up clearly dominates the
-      small quality difference; single-pass otherwise.  Below ~1.75 two-pass is
-      break-even-to-slower (its fixed intermediate-allocation + near-unit
-      reproject cost is not yet repaid), so the conservative cutoff also avoids
-      a needless quality hit where there is no speed win.
-    - ``"single_pass"``: always the single non-separable warp.  Bit-exact with
-      releases before two-pass existed.  Use this when exact reproducibility
-      against older output matters.
-
-    Two-pass output is *not* bit-identical to single-pass: it applies two
-    resampling kernels, so it is marginally softer at the highest spatial
-    frequencies (measured RMS < 1 DN for typical imagery).  Low-frequency
-    content is unchanged.
+    Two-pass applies two kernels, so it is marginally softer at the highest
+    spatial frequencies (measured RMS < 1 DN for typical imagery).
     """
     valid = ("auto", "single_pass")
     if strategy not in valid:
@@ -117,7 +98,18 @@ T = TypeVar("T")
 async def _gather_bounded(n: int, coros: list[Awaitable[T]]) -> list[T]:
     """Run *coros* with at most n in flight. Returns results in input order."""
     if n <= 1 or len(coros) <= 1:
-        return [await c for c in coros]
+        results: list[T] = []
+        try:
+            for c in coros:
+                results.append(await c)
+        except BaseException:
+            # The caller built every coroutine up front; abandoning the ones
+            # after the failure would emit "never awaited" warnings.
+            for pending in coros[len(results) + 1 :]:
+                if isinstance(pending, Coroutine):
+                    pending.close()
+            raise
+        return results
     sem = asyncio.Semaphore(n)
 
     async def _run(c: Awaitable[T]) -> T:

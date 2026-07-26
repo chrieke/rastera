@@ -205,13 +205,14 @@ class AsyncGeoTIFF:
             target_crs: Output EPSG code or ``pyproj.CRS``. When set,
                 data is reprojected.
             target_resolution: Output pixel size in target CRS units.
-            snap_to_grid: When True (default), the output grid snaps to
-                the source pixel grid for exact 1:1 copies (no resampling);
-                the bbox may shift by up to 1 pixel. When False, the bbox
-                is rounded to the nearest source-pixel boundary instead of
-                snapping outward. Note: ``snap_to_grid`` alone does not
-                trigger interpolation — set ``target_resolution`` or
-                ``target_crs`` to invoke the ``resampling`` kernel.
+            snap_to_grid: Only applies when neither ``target_crs`` nor
+                ``target_resolution`` forces resampling. When True
+                (default), the output grid snaps to the source pixel grid
+                for an exact 1:1 copy; the bbox may shift by up to 1
+                pixel. When False, the transform is anchored at the
+                requested bbox instead. Once resampling is involved there
+                is no source grid to snap to, so the output is always
+                anchored at the requested bbox and this flag is ignored.
             use_overviews: When True, reads from pre-computed COG overview
                 levels to save bandwidth. Overview pixels are resampled
                 aggregates, not original measurements — expect reduced
@@ -444,16 +445,10 @@ class AsyncGeoTIFF:
         snap_to_grid: bool = True,
     ) -> RasterArray:
         """Read at native resolution/CRS, optionally from an overview."""
-        # async_geotiff's Window has no stride/step support, so reads
-        # always pull every pixel in the requested window at the chosen
-        # overview level; any further downsampling happens post-fetch in
-        # `_read_reprojected` / `resample`.
-
-        # Determine which readable to use (full-res GeoTIFF or an Overview)
-        if overview is not None:
-            readable = overview
-        else:
-            readable = self._geotiff
+        # async_geotiff's Window has no stride/step support, so reads always
+        # pull every pixel in the requested window at the chosen overview
+        # level; any further downsampling happens post-fetch in `resample`.
+        readable = overview if overview is not None else self._geotiff
 
         if bbox is None and window is None:
             bbox = BBox(*readable.bounds)
@@ -517,6 +512,10 @@ async def _open_many(
                 f"do not: {mismatched}"
             )
         store = _build_store(uris[0], **store_kwargs)
+    # store_kwargs is forwarded as well as consumed above: plain TIFF opens
+    # ignore it once `store` is set, but the VRT and DIMAP branches need it to
+    # build their own obstore for the descriptor fetch (the async-tiff and
+    # obstore store types are not interchangeable).
     return list(
         await asyncio.gather(
             *(
@@ -639,6 +638,8 @@ def set_cache_size(n: int) -> None:
     Shrinking below the current population evicts least-recently-used
     entries until the new bound is satisfied.
     """
+    if not isinstance(n, int) or isinstance(n, bool) or n < 0:
+        raise ValueError(f"cache size must be int >= 0, got {n!r}")
     global _cache_max_size
     _cache_max_size = n
     while len(_geotiff_cache) > _cache_max_size:
@@ -678,12 +679,11 @@ def _make_output_array(
     width: int,
     height: int,
     geotiff: GeoTIFF | _CrsNodata,
-    mask: np.ndarray[Any, Any] | None = None,
 ) -> RasterArray:
     """Construct a RasterArray for rastera output."""
     return RasterArray(
         data=data,
-        mask=mask,
+        mask=None,
         width=width,
         height=height,
         count=data.shape[0],

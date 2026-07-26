@@ -294,6 +294,7 @@ class TestProcessedRead:
         arr = await ds.read()
         assert source.read.await_count == 1
         # All output bands → forward 1-based [1, 2]
+        assert source.read.await_args is not None
         assert source.read.await_args.kwargs["band_indices"] == [1, 2]
 
         data: np.ndarray[Any, Any] = arr.data  # type: ignore[reportUnknownMemberType]
@@ -313,6 +314,7 @@ class TestProcessedRead:
         source._read_native = AsyncMock(return_value=_src_array((2, 2, 2)))
 
         arr = await ds._read_native(band_indices=[2, 0])
+        assert source._read_native.await_args is not None
         assert source._read_native.await_args.kwargs["band_indices"] == [2, 0]
 
         data: np.ndarray[Any, Any] = arr.data  # type: ignore[reportUnknownMemberType]
@@ -369,7 +371,8 @@ class TestProcessedRead:
         ds, source = _make_processed_ds(n_bands=1)
         # int32 instead of uint16 so we can push past _LUT_SIZE.
         out_of_range = _src_array((1, 2, 2), dtype=np.int32)
-        out_of_range.data[:] = _LUT_SIZE + 1
+        oor_data: np.ndarray[Any, Any] = out_of_range.data  # type: ignore[reportUnknownMemberType]
+        oor_data[:] = _LUT_SIZE + 1
         source._read_native = AsyncMock(return_value=out_of_range)
         with pytest.raises(ValueError, match="outside"):
             await ds._read_native()
@@ -402,6 +405,7 @@ class TestOpenProcessedVRT:
         assert ds.count == 2
         # The single Input is opened — once, against the resolved URI.
         assert mock_open.await_count == 1
+        assert mock_open.await_args is not None
         assert mock_open.await_args.args[0] == "s3://b/tile.xml"
 
     @pytest.mark.asyncio
@@ -424,6 +428,8 @@ class TestOpenProcessedVRT:
         ):
             ds = await _open_vrt("s3://b/x.vrt", meta_overrides={"crs": 3006})
 
+        assert mock_open.await_args is not None
         assert mock_open.await_args.kwargs["meta_overrides"] == {"crs": 3006}
+        assert isinstance(ds, _VRTProcessedDataset)
         assert ds._crs_epsg == 3006
         assert ds._source._crs_epsg == 3006
