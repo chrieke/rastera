@@ -17,12 +17,13 @@ from pyproj import CRS, Transformer
 from .geo import (
     BBox,
     _normalize_crs,
+    bounds_from_transform,
     ensure_bbox,
     normalize_band_indices,
     transform_bbox,
     window_from_bbox,
 )
-from .resampling import ResamplingMethod, resample
+from .resampling import ResamplingMethod, _kernel_halo, resample
 from .store import (
     _apply_s3_defaults,
     _bucket_url,
@@ -205,14 +206,14 @@ class AsyncGeoTIFF:
             target_crs: Output EPSG code or ``pyproj.CRS``. When set,
                 data is reprojected.
             target_resolution: Output pixel size in target CRS units.
-            snap_to_grid: Only applies when neither ``target_crs`` nor
-                ``target_resolution`` forces resampling. When True
-                (default), the output grid snaps to the source pixel grid
-                for an exact 1:1 copy; the bbox may shift by up to 1
-                pixel. When False, the transform is anchored at the
-                requested bbox instead. Once resampling is involved there
-                is no source grid to snap to, so the output is always
-                anchored at the requested bbox and this flag is ignored.
+            snap_to_grid: When True (default), pixels are copied 1:1 from
+                the source grid and the extent grows outward to whole
+                pixels, so the result contains ``bbox`` and can exceed it
+                by up to 1 pixel per edge. When False, the transform is
+                anchored at ``bbox`` and the extent matches it to within
+                half a pixel — ``rasterio.read(window=from_bounds(...))``
+                behaviour. Ignored once ``target_crs`` or
+                ``target_resolution`` forces resampling.
             use_overviews: When True, reads from pre-computed COG overview
                 levels to save bandwidth. Overview pixels are resampled
                 aggregates, not original measurements — expect reduced
@@ -308,20 +309,44 @@ class AsyncGeoTIFF:
         use_overviews: bool,
         resampling: ResamplingMethod,
     ) -> RasterArray:
-        """Read a pixel window and resample to *target_resolution*."""
+        """Read a pixel window and resample to *target_resolution*.
+
+        Resolves *window* to world coordinates up front: it is in full-
+        resolution pixels, so handing it to an overview would read a different
+        region entirely.
+        """
+        gt = self._geotiff
+        target_bbox = bounds_from_transform(
+            gt.transform * Affine.translation(window.col_off, window.row_off),
+            window.width,
+            window.height,
+        )
         overview = (
             self._best_overview_for_resolution(target_resolution)
             if use_overviews
             else None
         )
-        native = await self._read_native(
-            window=window,
-            band_indices=band_indices,
-            overview=overview,
-        )
-        target_bbox = BBox(*native.bounds)
         out_transform, out_w, out_h = _grid_for_bbox(
             target_bbox, target_resolution, use_ceil=True
+        )
+        # Read the extent the ceil'd grid spans, not the window's own, or the
+        # trailing row/column has no source behind it and comes back nodata.
+        readable = overview if overview is not None else gt
+        read_bbox = _halo_bbox(
+            BBox(
+                target_bbox.minx,
+                target_bbox.maxy - out_h * target_resolution,
+                target_bbox.minx + out_w * target_resolution,
+                target_bbox.maxy,
+            ),
+            method=resampling,
+            dst_res=(target_resolution, target_resolution),
+            src_res=(float(readable.res[0]), float(readable.res[1])),
+        )
+        native = await self._read_native(
+            bbox=read_bbox,
+            band_indices=band_indices,
+            overview=overview,
         )
         out_data = resample(
             native.data,  # type: ignore[reportUnknownMemberType]
@@ -410,6 +435,22 @@ class AsyncGeoTIFF:
             assert src_crs is not None
             read_bbox = transform_bbox(read_bbox, out_crs, src_crs)
 
+        readable = overview if overview is not None else gt
+        read_bbox = _halo_bbox(
+            read_bbox,
+            method=resampling,
+            # Target resolution in source units.
+            dst_res=(
+                (
+                    res * _ratio(src_bbox.width, target_bbox.width),
+                    res * _ratio(src_bbox.height, target_bbox.height),
+                )
+                if needs_reproject
+                else (res, res)
+            ),
+            src_res=(float(readable.res[0]), float(readable.res[1])),
+        )
+
         native = await self._read_native(
             bbox=read_bbox,
             band_indices=band_indices,
@@ -454,7 +495,7 @@ class AsyncGeoTIFF:
             bbox = BBox(*readable.bounds)
         if window is None:
             assert bbox is not None
-            window = window_from_bbox(readable, bbox)
+            window = window_from_bbox(readable, bbox, snap_to_grid=snap_to_grid)
 
         # Use async-geotiff's built-in read (handles tile fetching + stitching)
         result = await readable.read(window=window)
@@ -467,15 +508,24 @@ class AsyncGeoTIFF:
                 count=len(band_indices),
             )
 
-        # When reading by bbox, override the transform origin to match the
-        # exact requested bbox (not the pixel-snapped window origin).  This
-        # mirrors rasterio's fractional-window behaviour.
+        # Anchor on the requested bbox rather than the pixel-snapped window
+        # origin — rasterio's fractional-window behaviour.  Clamped to the
+        # image, as the window was: an edge the bbox overhangs would otherwise
+        # label the pixels somewhere they are not.
         if bbox is not None and not snap_to_grid:
             bbox = ensure_bbox(bbox)
-            res = readable.res[0]
+            res_x, res_y = readable.res
+            img = BBox(*readable.bounds)
             result = dc_replace(
                 result,
-                transform=Affine(res, 0, bbox.minx, 0, -res, bbox.maxy),
+                transform=Affine(
+                    res_x,
+                    0,
+                    max(bbox.minx, img.minx),
+                    0,
+                    -res_y,
+                    min(bbox.maxy, img.maxy),
+                ),
             )
 
         return result
@@ -690,6 +740,34 @@ def _make_output_array(
         transform=transform,
         _alpha_band_idx=None,
         _geotiff=geotiff,  # type: ignore[reportArgumentType]
+    )
+
+
+def _ratio(numerator: float, denominator: float) -> float:
+    """``numerator / denominator``, or 1.0 for a degenerate (zero-extent) bbox."""
+    return numerator / denominator if denominator else 1.0
+
+
+def _halo_bbox(
+    bbox: BBox,
+    *,
+    method: ResamplingMethod,
+    dst_res: tuple[float, float],
+    src_res: tuple[float, float],
+) -> BBox:
+    """Widen a source-read bbox by the reach of the resampling kernel.
+
+    Sized to the output extent alone, the outermost pixels come out of a
+    truncated, renormalised kernel — a biased ring, and two adjacent AOIs
+    disagreeing along their shared edge. Per axis, because a kernel widened for
+    a 10x downsample in x is not wide enough for a 2x one in y. One pixel is the
+    floor: nearest needs no kernel halo, but a cross-CRS ``read_bbox`` is a
+    densified envelope, so the slack absorbs any curvature it under-states.
+    """
+    pad_x = max(1, _kernel_halo(method, dst_res[0] / src_res[0])) * src_res[0]
+    pad_y = max(1, _kernel_halo(method, dst_res[1] / src_res[1])) * src_res[1]
+    return BBox(
+        bbox.minx - pad_x, bbox.miny - pad_y, bbox.maxx + pad_x, bbox.maxy + pad_y
     )
 
 

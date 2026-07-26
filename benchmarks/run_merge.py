@@ -17,9 +17,10 @@ SCENARIOS = [
         "target_crs": 32633,
         "target_resolution": 10.0,
         "expect": {
+            "shape_match": False,
             "max_pct_differ": 100,
             "max_rmse_pct": 2,
-            "note": "Snapping shifts origin ~0.8 px, shifting pixel selection.",
+            "note": "Snapping shifts origin ~0.8 px and rounds outward: +1 row/col vs rasterio.",
         },
     },
     {

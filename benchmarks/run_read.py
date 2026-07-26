@@ -15,7 +15,8 @@ SCENARIOS = [
         "bbox": "255804.0,4626619.0,274330.0,4644625.0",
         "bbox_crs": 32633,
         "expect": {
-            "note": "Origin/bounds shift from snap_to_grid; pixels identical.",
+            "shape_match": False,
+            "note": "snap_to_grid rounds outward: +1 row and shifted bounds vs rasterio; overlapping pixels identical.",
         },
     },
     {

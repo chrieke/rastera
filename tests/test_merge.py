@@ -8,7 +8,12 @@ import pytest
 from affine import Affine
 from async_geotiff import RasterArray
 
-from rastera.geo import BBox, WindowOutOfRangeError, bounds_from_transform
+from rastera.geo import (
+    BBox,
+    WindowOutOfRangeError,
+    bounds_from_transform,
+    window_from_bbox,
+)
 from rastera.merge import (
     _mosaic_grid_from_bbox,
     _require_compatible_merge_inputs,
@@ -136,6 +141,17 @@ class TestMosaicGridFromBbox:
         _, w, h = _mosaic_grid_from_bbox(base_transform=base_transform, bbox=bbox)
         assert w >= 1
         assert h >= 1
+
+    def test_offgrid_bbox_is_contained(self):
+        """Rounding the span rather than the far edge stopped the mosaic a
+        pixel short of a bbox its own reads had already covered."""
+        bbox = BBox(0.8, 0.0, 11.3, 10.0)
+        transform, w, h = _mosaic_grid_from_bbox(
+            base_transform=Affine(1, 0, 0, 0, -1, 10), bbox=bbox
+        )
+        bounds = bounds_from_transform(transform, w, h)
+        assert bounds.minx <= bbox.minx and bounds.maxx >= bbox.maxx
+        assert bounds.miny <= bbox.miny and bounds.maxy >= bbox.maxy
 
 
 # ── _require_compatible_merge_inputs ─────────────────────────────────────
@@ -539,6 +555,73 @@ class TestMergeReprojected:
         )
         # mosaic_method="first": cog1's values should take precedence everywhere
         assert np.all(result.data == 1)  # type: ignore[reportUnknownMemberType]
+
+
+# ── merge: seam between adjacent tiles ─────────────────────────────────
+
+
+def _make_windowed_cog(origin_x: float, width: int, value: int):
+    """A COG whose ``_read_native`` honours the real window arithmetic.
+
+    The other merge tests mock ``_read_native`` with a fixed array, which hides
+    sizing bugs in ``window_from_bbox``.
+    """
+    cog = _make_cog(
+        width=width,
+        height=20,
+        scale=1.0,
+        bands=1,
+        origin_x=origin_x,
+        origin_y=15.0,
+        nodata=0,
+    )
+    gt = cog._geotiff
+
+    async def _read_native(
+        *, bbox: Any = None, snap_to_grid: bool = True, **_: Any
+    ) -> RasterArray:
+        win = window_from_bbox(gt, bbox, snap_to_grid=snap_to_grid)
+        data = np.full((1, win.height, win.width), value, dtype=np.uint16)
+        transform = gt.transform * Affine.translation(win.col_off, win.row_off)
+        return _make_array(data, transform, geotiff=gt)
+
+    cog._read_native = _read_native
+    return cog
+
+
+class TestMergeSeam:
+    """A bbox that doesn't land on the source grid used to lose the left
+    tile's last column at the seam: rasterio's floor-offset/round-span window
+    sizing dropped it once the interval was clipped to the tile's right edge,
+    so the pixel fell through to the *next* tile — silently violating
+    mosaic_method="first".
+    """
+
+    # Left tile covers x < 10, right tile starts at x = 6. The bbox origin
+    # sits 0.8 px off the shared grid, and output column 8 (x 8.8-9.8, centre
+    # 9.3) falls in the left tile's final column.
+    BBOX = BBox(0.8, 0.0, 13.8, 10.0)
+    SEAM_COL = 8
+
+    @pytest.mark.parametrize("snap_to_grid", [True, False])
+    async def test_first_wins_at_seam(self, snap_to_grid: bool):
+        left = _make_windowed_cog(origin_x=-10.0, width=20, value=1)
+        right = _make_windowed_cog(origin_x=6.0, width=20, value=2)
+
+        result = await merge(
+            [left, right],
+            bbox=self.BBOX,
+            bbox_crs=32632,
+            target_crs=32632,
+            target_resolution=1.0,
+            snap_to_grid=snap_to_grid,
+        )
+        data: np.ndarray[Any, Any] = result.data  # type: ignore[reportUnknownMemberType]
+        # Snapping shifts the grid onto the source pixels, moving the last
+        # left-tile column one to the right.
+        col = self.SEAM_COL + 1 if snap_to_grid else self.SEAM_COL
+        assert data[0, :, col].tolist() == [1] * data.shape[1]
+        assert data[0, :, col + 1].tolist() == [2] * data.shape[1]
 
 
 # ── _resolve_target_crs ────────────────────────────────────────────────

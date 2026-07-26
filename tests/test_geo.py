@@ -1,6 +1,7 @@
 """Unit tests for pure geometry, parsing, and utility functions."""
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from affine import Affine
@@ -74,13 +75,18 @@ class TestWindow:
         with pytest.raises(WindowOutOfRangeError, match="does not intersect"):
             window_from_bbox(p, BBox(2000, 2000, 3000, 3000))  # type: ignore[reportArgumentType]
 
-    def test_from_bbox_subpixel_overlap_raises(self):
+    def test_from_bbox_subpixel_overlap_raises_unsnapped(self):
         # make_meta(): 100x100 grid at 10 m/px, x in [0, 1000].
         # bbox spans 0.1 m on x (= 0.01 px) — floor(0.01 + 0.5) = 0,
         # so the rounded window has zero width and window_from_bbox must raise.
         p = make_meta()
         with pytest.raises(WindowOutOfRangeError, match="does not intersect"):
-            window_from_bbox(p, BBox(999.9, 0, 1000.0, 1000))  # type: ignore[reportArgumentType]
+            window_from_bbox(p, BBox(999.9, 0, 1000.0, 1000), snap_to_grid=False)  # type: ignore[reportArgumentType]
+
+    def test_from_bbox_subpixel_overlap_snaps_to_whole_pixel(self):
+        p = make_meta()
+        w = window_from_bbox(p, BBox(999.9, 0, 1000.0, 1000))  # type: ignore[reportArgumentType]
+        assert w.col_off == 99 and w.width == 1
 
     def test_from_bbox_clamps(self):
         p = make_meta()
@@ -105,6 +111,51 @@ class TestWindow:
         p = make_meta()
         with pytest.raises(WindowOutOfRangeError, match="does not intersect"):
             window_from_bbox(p, bbox)  # type: ignore[reportArgumentType]
+
+    def test_snapped_keeps_pixel_wholly_inside_bbox(self):
+        """Unsnapped sizing floors the near edge but *rounds* the span, so it
+        can drop a source pixel that lies entirely within the request."""
+        p = make_meta()  # 100x100 at 10 m/px, x in [0, 1000]
+        # x 8-20 spans columns 0.8-2.0: column 1 is wholly inside the bbox.
+        bbox = BBox(8, 990, 20, 1000)
+        assert window_from_bbox(p, bbox, snap_to_grid=False).width == 1  # type: ignore[reportArgumentType]
+        assert window_from_bbox(p, bbox).width == 2  # type: ignore[reportArgumentType]
+
+    def test_snapped_keeps_last_column_at_image_edge(self):
+        """The merge-seam case: clipping the far edge to the image and then
+        rounding the span drops the image's final column."""
+        p = make_meta()
+        bbox = BBox(8, 0, 1500, 1000)  # 99.2 px, running past the right edge
+        assert window_from_bbox(p, bbox, snap_to_grid=False).width == 99  # type: ignore[reportArgumentType]
+        w = window_from_bbox(p, bbox)  # type: ignore[reportArgumentType]
+        assert w.col_off == 0 and w.width == 100
+
+    @pytest.mark.parametrize(
+        ("origin", "res"),
+        [(655000.0, 30.0), (234567.0, 30.0), (-180.0, 0.0001), (511.7, 0.5)],
+    )
+    def test_snapped_grid_aligned_bbox_is_exact(self, origin: float, res: float):
+        """Rounding outward must not buy a pixel off ``~transform`` ULP error."""
+        p = SimpleNamespace(
+            width=20000,
+            height=20000,
+            transform=Affine(res, 0, origin, 0, -res, origin + 20000 * res),
+        )
+        top = origin + 20000 * res
+        for c0, r0, size in ((11593, 0, 512), (1, 7777, 256), (19487, 19487, 513)):
+            bbox = BBox(
+                origin + c0 * res,
+                top - (r0 + size) * res,
+                origin + (c0 + size) * res,
+                top - r0 * res,
+            )
+            w = window_from_bbox(p, bbox)  # type: ignore[reportArgumentType]
+            assert (w.col_off, w.row_off, w.width, w.height) == (c0, r0, size, size)
+
+    def test_snapped_stays_within_image(self):
+        p = make_meta()
+        w = window_from_bbox(p, BBox(-500, -500, 1500, 1500))  # type: ignore[reportArgumentType]
+        assert (w.col_off, w.width, w.row_off, w.height) == (0, 100, 0, 100)
 
     def test_from_bbox_partial_overlap_stays_inside(self):
         # Overlap is x in [0, 500] -> 50 px, not the full 100 px span.

@@ -944,3 +944,15 @@ def _resample_two_pass(
         np.clip(out, info.min, info.max, out=out)
         np.round(out, out=out)
     return out.astype(orig_dtype, copy=False)
+
+
+def _kernel_halo(method: ResamplingMethod, scale: float) -> int:
+    """Source pixels a *method* kernel reaches beyond the one it samples.
+
+    Widens with the downsample factor (see the anti-aliasing note in
+    :func:`_resample_kernel`); *scale* is ``dst_res / src_res``.
+    """
+    if method == "nearest":
+        return 0
+    base_radius = 1 if method == "bilinear" else 2
+    return math.ceil(base_radius * max(1.0, scale))

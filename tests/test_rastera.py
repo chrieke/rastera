@@ -10,15 +10,46 @@ from affine import Affine
 from async_geotiff import RasterArray, Window
 
 import rastera
+from rastera.geo import BBox
 from rastera.reader import (
     AsyncGeoTIFF,
     _geotiff_cache,
+    _grid_for_bbox,
     clear_cache,
     set_cache_size,
 )
+from rastera.resampling import resample
 from tests.conftest import make_mock_geotiff
 
 # ── Helpers ──────────────────────────────────────────────────────────────
+
+
+def _slicing_read(geotiff: Any, full: np.ndarray):
+    """An async ``read(window=...)`` that really slices *full*.
+
+    ``AsyncMock(return_value=...)`` ignores the window it was handed, which
+    hides every bug about *which* pixels a read asked for.
+    """
+
+    async def _read(window: Window) -> RasterArray:
+        data = full[
+            :,
+            window.row_off : window.row_off + window.height,
+            window.col_off : window.col_off + window.width,
+        ]
+        return RasterArray(
+            data=data,
+            mask=None,
+            width=data.shape[2],
+            height=data.shape[1],
+            count=data.shape[0],
+            transform=geotiff.transform
+            * Affine.translation(window.col_off, window.row_off),
+            _alpha_band_idx=None,
+            _geotiff=geotiff,
+        )
+
+    return _read
 
 
 def _make_read_result(
@@ -291,6 +322,128 @@ class TestRead:
 
         with pytest.raises(ValueError, match="1-based"):
             await obj.read(band_indices=[0])
+
+    @pytest.mark.asyncio
+    async def test_window_resample_matches_equivalent_bbox(self):
+        """The output grid is ceil-sized, so reading only the window left the
+        trailing row/column with nothing behind it — nodata, even mid-image
+        where the source has plenty. The same region as a bbox is the oracle."""
+        gt = make_mock_geotiff(
+            width=20, height=20, scale=1.0, count=1, tile_width=20, nodata=0
+        )
+        full = (np.arange(400, dtype=np.uint16) + 1).reshape(1, 20, 20)
+        gt.read = _slicing_read(gt, full)
+        obj = AsyncGeoTIFF("s3://b/k.tif", gt)
+
+        window = Window(col_off=5, row_off=5, width=10, height=10)
+        arr = await obj.read(window=window, target_resolution=3.0)
+        assert not np.any(np.asarray(arr.data) == 0)  # type: ignore[reportUnknownMemberType]
+
+        equivalent = await obj.read(
+            bbox=(5.0, 5.0, 15.0, 15.0), bbox_crs=32632, target_resolution=3.0
+        )
+        np.testing.assert_array_equal(arr.data, equivalent.data)  # type: ignore[reportUnknownMemberType]
+        assert arr.bounds == equivalent.bounds
+
+    @pytest.mark.asyncio
+    async def test_window_resample_with_overview_reads_right_region(self):
+        """*window* is in full-resolution pixels; it used to be handed to the
+        overview unchanged, which reads a different region entirely."""
+        gt = make_mock_geotiff(width=400, height=400, scale=1.0, count=1)
+        ov = make_mock_geotiff(width=100, height=100, scale=4.0, count=1)
+        ov.transform = Affine(4, 0, 0, 0, -4, 400)
+        ov.res = (4.0, 4.0)
+        ov.bounds = (0, 0, 400, 400)
+        gt.overviews = [ov]
+        gt.read = _slicing_read(gt, np.zeros((1, 400, 400), np.uint16))
+        ov.read = _slicing_read(ov, np.zeros((1, 100, 100), np.uint16))
+
+        obj = AsyncGeoTIFF("s3://b/k.tif", gt)
+        obj._best_overview_for_resolution = lambda r: ov if r >= 4.0 else None  # type: ignore[method-assign]
+
+        arr = await obj.read(
+            window=Window(col_off=300, row_off=0, width=80, height=80),
+            target_resolution=8.0,
+            use_overviews=True,
+        )
+        assert (arr.bounds[0], arr.bounds[2]) == (300.0, 380.0)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("method", ["bilinear", "cubic"])
+    # res 1x1 downsamples 10x on both axes; 2x20 downsamples 5x in x but
+    # *up*samples in y, so an x-derived halo is too narrow for the y kernel.
+    @pytest.mark.parametrize(
+        ("res_x", "res_y"), [(1.0, 1.0), (2.0, 20.0)], ids=["square", "tall-pixels"]
+    )
+    async def test_downsample_edge_matches_full_source(
+        self, method: Any, res_x: float, res_y: float
+    ):
+        """resample widens its kernel with the downsample factor; without a
+        matching source halo the outer ring came from a truncated kernel.
+        Full-source resample is the oracle."""
+        size = 200
+        full = (np.arange(size * size, dtype=np.uint16) % 4093).reshape(1, size, size)
+        gt = make_mock_geotiff(
+            width=size, height=size, scale=1.0, count=1, tile_width=size
+        )
+        gt.transform = src_transform = Affine(res_x, 0, 0, 0, -res_y, size * res_y)
+        gt.res = (res_x, res_y)
+        gt.bounds = (0, 0, size * res_x, size * res_y)
+        gt.read = _slicing_read(gt, full)
+        obj = AsyncGeoTIFF("s3://b/k.tif", gt)
+
+        # Interior on both axes, so a halo is available to be got wrong.
+        bbox = BBox(50.0 * res_x, 50.0 * res_y, 150.0 * res_x, 150.0 * res_y)
+        got = await obj.read(
+            bbox=bbox, bbox_crs=32632, target_resolution=10.0, resampling=method
+        )
+        out_transform, out_w, out_h = _grid_for_bbox(bbox, 10.0, use_ceil=True)
+        want = resample(
+            full,
+            src_transform=src_transform,
+            dst_transform=out_transform,
+            dst_width=out_w,
+            dst_height=out_h,
+            nodata=None,
+            method=method,
+        )
+        np.testing.assert_array_equal(got.data, want)  # type: ignore[reportUnknownMemberType]
+
+    @pytest.mark.asyncio
+    async def test_unsnapped_transform_clamped_to_image(self):
+        """The window is clipped to the image, so anchoring on a bbox edge that
+        overhangs it labelled the pixels where they are not."""
+        gt = make_mock_geotiff(
+            width=16, height=16, scale=10.0, count=1, tile_width=16, tile_height=16
+        )  # world x/y in [0, 160]
+        obj = AsyncGeoTIFF("s3://b/k.tif", gt)
+        gt.read = AsyncMock(
+            return_value=_make_read_result((1, 16, 8), dtype=np.uint16, geotiff=gt)
+        )
+
+        arr = await obj.read(
+            bbox=(-500, 0, 80, 160), bbox_crs=32632, snap_to_grid=False
+        )
+        assert arr.transform.c == 0.0  # not -500
+        assert arr.transform.f == 160.0
+
+    @pytest.mark.asyncio
+    async def test_unsnapped_transform_non_square_pixels(self):
+        """res[0] was used for both axes, so tall pixels came back short."""
+        gt = make_mock_geotiff(
+            width=16, height=16, scale=10.0, count=1, tile_width=16, tile_height=16
+        )
+        gt.res = (10.0, 20.0)
+        gt.transform = Affine(10, 0, 0, 0, -20, 320)
+        gt.bounds = (0, 0, 160, 320)
+        obj = AsyncGeoTIFF("s3://b/k.tif", gt)
+        gt.read = AsyncMock(
+            return_value=_make_read_result((1, 8, 8), dtype=np.uint16, geotiff=gt)
+        )
+
+        arr = await obj.read(bbox=(0, 160, 80, 320), bbox_crs=32632, snap_to_grid=False)
+        assert arr.transform.a == 10.0
+        assert arr.transform.e == -20.0
 
 
 # ── LRU cache behaviour ────────────────────────────────────────────────

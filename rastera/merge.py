@@ -15,6 +15,7 @@ from .geo import (
     BBox,
     WindowOutOfRangeError,
     _affine_apply,
+    _denoise,
     _normalize_crs,
     bounds_from_transform,
     compute_paste_slices,
@@ -22,7 +23,13 @@ from .geo import (
     normalize_band_indices,
     transform_bbox,
 )
-from .reader import AsyncGeoTIFF, _CrsNodata, _grid_for_bbox, _make_output_array
+from .reader import (
+    AsyncGeoTIFF,
+    _CrsNodata,
+    _grid_for_bbox,
+    _halo_bbox,
+    _make_output_array,
+)
 from .resampling import ResamplingMethod, resample
 
 
@@ -66,13 +73,14 @@ async def merge(
             inputs; ``"first"`` uses the CRS of the first input.
         snap_to_grid: When True (default), and when all inputs already
             share the target CRS and resolution, the output grid snaps to
-            the source pixel grid for an exact 1:1 copy (no resampling);
-            the bbox may shift by up to 1 pixel. When False, or when any
-            input differs in CRS/resolution, the output grid is anchored
-            at the requested ``(minx, maxy)`` with width/height rounded
-            to whole pixels (so the max edges can drift by <0.5 px) and
-            resampling selects source pixels according to ``resampling``,
-            matching rasterio/GDAL behaviour.
+            the source pixel grid for an exact 1:1 copy
+            (no resampling); the bbox may shift by up to 1 pixel. When False,
+            or when any input differs in CRS/resolution, the output grid is
+            anchored at the requested ``(minx, maxy)`` with width/height
+            rounded to whole pixels (so the max edges can drift by <0.5 px)
+            and resampling selects source pixels according to ``resampling``,
+            matching rasterio/GDAL behaviour. Each input is always read on
+            its own pixel grid; this flag does not change that.
         use_overviews: When True, reads from pre-computed COG overview
             levels to save bandwidth. Overview pixels are resampled
             aggregates, not original measurements — expect reduced
@@ -176,6 +184,9 @@ async def merge(
 
     async def _read_native_bands(cog: AsyncGeoTIFF, sb: BBox) -> RasterArray:
         indices = normalize_band_indices(band_indices, cog.count)
+        # *sb* is clipped to this COG's bounds, so an unsnapped window would
+        # drop the tile's last row/column at the seam and let the next COG
+        # fill it with its own pixels.
         return await cog._read_native(bbox=sb, band_indices=indices)
 
     out_data = await _gather_and_paste(
@@ -261,25 +272,23 @@ async def _merge_reprojected(
         if needs_reproject:
             read_bbox = transform_bbox(read_bbox, out_crs, cog._crs_epsg)
 
-        # Pad by one native pixel so the resampler has source data for
-        # every output pixel even when grids are offset by a fraction.
-        pad = float(cog._geotiff.res[0])
-        read_bbox = BBox(
-            read_bbox.minx - pad,
-            read_bbox.miny - pad,
-            read_bbox.maxx + pad,
-            read_bbox.maxy + pad,
-        )
+        # Target resolution in this COG's own units.
+        src_res = res
+        if needs_reproject:
+            cog_bounds_native = BBox(*cog._geotiff.bounds)
+            cog_bounds_target = bounds_in_target[id(cog)]
+            src_res = res * (cog_bounds_native.width / cog_bounds_target.width)
 
         # Select best overview for the target resolution.
-        overview = None
-        if use_overviews:
-            src_res = res
-            if needs_reproject:
-                cog_bounds_native = BBox(*cog._geotiff.bounds)
-                cog_bounds_target = bounds_in_target[id(cog)]
-                src_res = res * (cog_bounds_native.width / cog_bounds_target.width)
-            overview = cog._best_overview_for_resolution(src_res)
+        overview = cog._best_overview_for_resolution(src_res) if use_overviews else None
+
+        readable = overview if overview is not None else cog._geotiff
+        read_bbox = _halo_bbox(
+            read_bbox,
+            method=resampling,
+            dst_res=(src_res, src_res),
+            src_res=(float(readable.res[0]), float(readable.res[1])),
+        )
 
         indices = normalize_band_indices(band_indices, cog.count)
         native = await cog._read_native(
@@ -460,7 +469,10 @@ def _mosaic_grid_from_bbox(
     """
     Create a pixel-aligned mosaic grid for `bbox` on the `base_transform` grid.
 
-    Unlike `window_from_bbox`, this does NOT clamp to any particular image size.
+    Rounds outward, the same rule ``window_from_bbox(snap_to_grid=True)`` uses
+    for the reads that fill this grid — so the mosaic contains *bbox* instead
+    of stopping a pixel short of it. Unlike ``window_from_bbox`` this does NOT
+    clamp to any particular image size.
     """
     inv = ~base_transform
 
@@ -468,21 +480,18 @@ def _mosaic_grid_from_bbox(
     col_min_f, row_max_f = _affine_apply(inv, bbox.minx, bbox.maxy)
     col_max_f, row_min_f = _affine_apply(inv, bbox.maxx, bbox.miny)
 
-    # Match rasterio/GDAL sizing: floor(offset) + round(span).
-    col_lo = min(col_min_f, col_max_f)
-    col_hi = max(col_min_f, col_max_f)
-    row_lo = min(row_min_f, row_max_f)
-    row_hi = max(row_min_f, row_max_f)
+    col_lo = _denoise(min(col_min_f, col_max_f))
+    col_hi = _denoise(max(col_min_f, col_max_f))
+    row_lo = _denoise(min(row_min_f, row_max_f))
+    row_hi = _denoise(max(row_min_f, row_max_f))
 
     col_min = math.floor(col_lo)
     row_min = math.floor(row_lo)
-    col_max = col_min + max(1, math.floor(col_hi - col_lo + 0.5))
-    row_max = row_min + max(1, math.floor(row_hi - row_lo + 0.5))
 
-    width = int(col_max - col_min)
-    height = int(row_max - row_min)
-    if width <= 0 or height <= 0:
-        raise ValueError("bbox does not cover any pixels on the base grid")
+    # max(1): a bbox thinner than a pixel still names one, and merge callers
+    # rely on getting a grid rather than an exception for a degenerate strip.
+    width = max(1, math.ceil(col_hi) - col_min)
+    height = max(1, math.ceil(row_hi) - row_min)
 
     transform = base_transform * Affine.translation(col_min, row_min)
     return transform, width, height

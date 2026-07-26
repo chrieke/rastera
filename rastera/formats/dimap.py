@@ -242,7 +242,7 @@ class _DIMAPDataset(AsyncGeoTIFF):
             bbox = BBox(*self._geotiff.bounds)
         if window is None:
             assert bbox is not None
-            window = window_from_bbox(self._geotiff, bbox)
+            window = window_from_bbox(self._geotiff, bbox, snap_to_grid=snap_to_grid)
 
         if band_indices is None:
             indices_0 = list(range(len(layout.bands)))
@@ -303,8 +303,17 @@ class _DIMAPDataset(AsyncGeoTIFF):
         )
         if bbox is not None and not snap_to_grid:
             bbox = ensure_bbox(bbox)
-            res = layout.transform.a
-            out_transform = Affine(res, 0, bbox.minx, 0, -res, bbox.maxy)
+            # Clamp to the mosaic: the window was clipped to it, so anchoring
+            # on an edge the bbox overhangs would mislabel where the pixels are.
+            img = BBox(*self._geotiff.bounds)
+            out_transform = Affine(
+                layout.transform.a,
+                0,
+                max(bbox.minx, img.minx),
+                0,
+                layout.transform.e,
+                min(bbox.maxy, img.maxy),
+            )
 
         return _make_output_array(
             out, out_transform, window.width, window.height, self._geotiff
