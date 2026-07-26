@@ -104,10 +104,16 @@ class WindowOutOfRangeError(ValueError):
 def window_from_bbox(
     meta: HasTransform,
     bbox: BBox | tuple[float, float, float, float],
+    *,
+    snap_to_grid: bool = True,
 ) -> Window:
-    """Return pixel window for a world-space bbox."""
+    """Return the pixel window for a world-space bbox.
 
-    # Map a world-space bbox to a clamped pixel window.
+    ``snap_to_grid=True`` (default) rounds outward onto the source grid, so the
+    window never holds fewer pixels than *bbox* covers — one short leaves a row
+    or column with nothing behind it. ``False`` gives ``round(span)`` pixels
+    like rasterio, for callers that re-anchor the transform on *bbox*.
+    """
     bbox = ensure_bbox(bbox)
     inv = ~meta.transform
     minx, miny, maxx, maxy = bbox.minx, bbox.miny, bbox.maxx, bbox.maxy
@@ -116,23 +122,11 @@ def window_from_bbox(
     col_min_f, row_max_f = _affine_apply(inv, minx, maxy)
     col_max_f, row_min_f = _affine_apply(inv, maxx, miny)
 
-    # Match rasterio/GDAL window sizing: floor(offset) + round(span).
-    #
-    # rasterio passes float windows to GDALRasterIOEx (e.g. offset=5539.5,
-    # height=1800.6).  GDAL starts at floor(offset) and produces
-    # round(span) pixels.  We replicate that here so that native-
-    # resolution reads return the same shape AND pixel values as
-    # rasterio (confirmed RMSE=0).
-    #
-    # An alternative (floor/ceil on individual bounds) includes every
-    # pixel partially covered by the bbox, but produces +1 pixel vs
-    # rasterio whenever the bbox doesn't align to the source grid.
-    #
     # The interval is clipped to the image first.  Clamping only the offset
     # (`max(0, floor(lo))`) leaves the span positive for a bbox lying entirely
     # left of or above the image, which yields a plausible window over the wrong
     # pixels.  For a bbox inside the image the clip is a no-op, so the sizing
-    # rule above is unaffected.
+    # rules below are unaffected.
     col_lo = max(0.0, min(col_min_f, col_max_f))
     col_hi = min(float(meta.width), max(col_min_f, col_max_f))
     row_lo = max(0.0, min(row_min_f, row_max_f))
@@ -141,10 +135,23 @@ def window_from_bbox(
     if col_hi <= col_lo or row_hi <= row_lo:
         raise WindowOutOfRangeError("BBox does not intersect image")
 
-    col_off = math.floor(col_lo)
-    row_off = math.floor(row_lo)
-    width = min(meta.width, col_off + math.floor(col_hi - col_lo + 0.5)) - col_off
-    height = min(meta.height, row_off + math.floor(row_hi - row_lo + 0.5)) - row_off
+    if snap_to_grid:
+        # A bare ceil would buy a whole extra column off ~transform's ULP error;
+        # the else branch takes a difference, which cancels it.
+        col_lo, col_hi = _denoise(col_lo), _denoise(col_hi)
+        row_lo, row_hi = _denoise(row_lo), _denoise(row_hi)
+        col_off, row_off = math.floor(col_lo), math.floor(row_lo)
+        # col_hi/row_hi are already clipped to the image, so ceil stays in range.
+        width = math.ceil(col_hi) - col_off
+        height = math.ceil(row_hi) - row_off
+    else:
+        # rasterio passes float windows to GDALRasterIOEx (e.g. offset=5539.5,
+        # height=1800.6); GDAL starts at floor(offset) and produces round(span)
+        # pixels.  Replicating it makes native reads match rasterio's shape AND
+        # pixel values (confirmed RMSE=0).
+        col_off, row_off = math.floor(col_lo), math.floor(row_lo)
+        width = min(meta.width, col_off + math.floor(col_hi - col_lo + 0.5)) - col_off
+        height = min(meta.height, row_off + math.floor(row_hi - row_lo + 0.5)) - row_off
 
     # Sub-pixel sliver: the bbox overlaps but rounds to nothing.
     if width <= 0 or height <= 0:
@@ -266,6 +273,18 @@ def _affine_apply(t: Affine, x: float, y: float) -> tuple[float, float]:
     """Apply an affine transform to a point, with correct typing."""
     rx, ry = t * (x, y)
     return float(rx), float(ry)
+
+
+def _denoise(pixel_coord: float, tol: float = 1e-6) -> float:
+    """Collapse a pixel coordinate onto an exact boundary it all but sits on.
+
+    ``~transform`` carries a few ULPs of error through the divide, so a bbox
+    edge that is exactly on the source grid arrives as 12105.000000000004.
+    *tol* is in pixels — orders of magnitude above that error and far below
+    any sub-pixel offset a caller could mean.
+    """
+    nearest = round(pixel_coord)
+    return float(nearest) if abs(pixel_coord - nearest) < tol else pixel_coord
 
 
 def _normalize_crs(crs: int | CRS) -> int:

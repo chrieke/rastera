@@ -8,13 +8,21 @@ import pytest
 from affine import Affine
 from async_geotiff import RasterArray
 
-from rastera.geo import BBox, WindowOutOfRangeError, bounds_from_transform
+from rastera.geo import (
+    BBox,
+    WindowOutOfRangeError,
+    bounds_from_transform,
+    transform_bbox,
+    window_from_bbox,
+)
 from rastera.merge import (
     _mosaic_grid_from_bbox,
     _require_compatible_merge_inputs,
     _resolve_target_crs,
     merge,
 )
+from rastera.reader import AsyncGeoTIFF, _grid_for_bbox
+from tests.conftest import slicing_read, spy_read_native
 
 # ── Helpers ──────────────────────────────────────────────────────────────
 
@@ -85,6 +93,13 @@ def _make_cog(
     cog.overviews = []
     cog.count = bands
     cog.read = AsyncMock()
+    # Bind the real warp seam: merge routes its reprojected reads through it, so
+    # auto-mocking it would skip the code under test and swallow the
+    # ``_read_native`` mocks these tests install.
+    cog._read_to_grid = AsyncGeoTIFF._read_to_grid.__get__(cog)
+    cog._best_overview_for_resolution = (
+        AsyncGeoTIFF._best_overview_for_resolution.__get__(cog)
+    )
     return cog
 
 
@@ -136,6 +151,17 @@ class TestMosaicGridFromBbox:
         _, w, h = _mosaic_grid_from_bbox(base_transform=base_transform, bbox=bbox)
         assert w >= 1
         assert h >= 1
+
+    def test_offgrid_bbox_is_contained(self):
+        """Rounding the span rather than the far edge stopped the mosaic a
+        pixel short of a bbox its own reads had already covered."""
+        bbox = BBox(0.8, 0.0, 11.3, 10.0)
+        transform, w, h = _mosaic_grid_from_bbox(
+            base_transform=Affine(1, 0, 0, 0, -1, 10), bbox=bbox
+        )
+        bounds = bounds_from_transform(transform, w, h)
+        assert bounds.minx <= bbox.minx and bounds.maxx >= bbox.maxx
+        assert bounds.miny <= bbox.miny and bounds.maxy >= bbox.maxy
 
 
 # ── _require_compatible_merge_inputs ─────────────────────────────────────
@@ -541,6 +567,73 @@ class TestMergeReprojected:
         assert np.all(result.data == 1)  # type: ignore[reportUnknownMemberType]
 
 
+# ── merge: seam between adjacent tiles ─────────────────────────────────
+
+
+def _make_windowed_cog(origin_x: float, width: int, value: int):
+    """A COG whose ``_read_native`` honours the real window arithmetic.
+
+    The other merge tests mock ``_read_native`` with a fixed array, which hides
+    sizing bugs in ``window_from_bbox``.
+    """
+    cog = _make_cog(
+        width=width,
+        height=20,
+        scale=1.0,
+        bands=1,
+        origin_x=origin_x,
+        origin_y=15.0,
+        nodata=0,
+    )
+    gt = cog._geotiff
+
+    async def _read_native(
+        *, bbox: Any = None, snap_to_grid: bool = True, **_: Any
+    ) -> RasterArray:
+        win = window_from_bbox(gt, bbox, snap_to_grid=snap_to_grid)
+        data = np.full((1, win.height, win.width), value, dtype=np.uint16)
+        transform = gt.transform * Affine.translation(win.col_off, win.row_off)
+        return _make_array(data, transform, geotiff=gt)
+
+    cog._read_native = _read_native
+    return cog
+
+
+class TestMergeSeam:
+    """A bbox that doesn't land on the source grid used to lose the left
+    tile's last column at the seam: rasterio's floor-offset/round-span window
+    sizing dropped it once the interval was clipped to the tile's right edge,
+    so the pixel fell through to the *next* tile — silently violating
+    mosaic_method="first".
+    """
+
+    # Left tile covers x < 10, right tile starts at x = 6. The bbox origin
+    # sits 0.8 px off the shared grid, and output column 8 (x 8.8-9.8, centre
+    # 9.3) falls in the left tile's final column.
+    BBOX = BBox(0.8, 0.0, 13.8, 10.0)
+    SEAM_COL = 8
+
+    @pytest.mark.parametrize("snap_to_grid", [True, False])
+    async def test_first_wins_at_seam(self, snap_to_grid: bool):
+        left = _make_windowed_cog(origin_x=-10.0, width=20, value=1)
+        right = _make_windowed_cog(origin_x=6.0, width=20, value=2)
+
+        result = await merge(
+            [left, right],
+            bbox=self.BBOX,
+            bbox_crs=32632,
+            target_crs=32632,
+            target_resolution=1.0,
+            snap_to_grid=snap_to_grid,
+        )
+        data: np.ndarray[Any, Any] = result.data  # type: ignore[reportUnknownMemberType]
+        # Snapping shifts the grid onto the source pixels, moving the last
+        # left-tile column one to the right.
+        col = self.SEAM_COL + 1 if snap_to_grid else self.SEAM_COL
+        assert data[0, :, col].tolist() == [1] * data.shape[1]
+        assert data[0, :, col + 1].tolist() == [2] * data.shape[1]
+
+
 # ── _resolve_target_crs ────────────────────────────────────────────────
 
 
@@ -768,3 +861,144 @@ class TestMixedInputs:
                 # Non-native resolution forces _merge_reprojected.
                 target_resolution=20.0,
             )
+
+
+# ── The resampling seam, shared with read() ─────────────────────────────
+
+
+def _real_utm_cog(with_overview: bool = False) -> tuple[AsyncGeoTIFF, Any]:
+    """A real AsyncGeoTIFF over a stub GeoTIFF at a UTM 33N origin.
+
+    Real, not a MagicMock, so ``read()`` and ``merge()`` can be compared on the
+    same object and both go through the production seam.
+    """
+    gt = _make_geotiff_stub(
+        width=400,
+        height=400,
+        scale=10.0,
+        count=1,
+        origin_x=300000.0,
+        origin_y=5700000.0,
+        crs_epsg=32633,
+    )
+    gt.read = slicing_read(gt, np.zeros((1, 400, 400), np.uint16))
+    ov = None
+    if with_overview:
+        ov = _make_geotiff_stub(
+            width=200,
+            height=200,
+            scale=20.0,
+            count=1,
+            origin_x=300000.0,
+            origin_y=5700000.0,
+            crs_epsg=32633,
+        )
+        ov.read = slicing_read(ov, np.zeros((1, 200, 200), np.uint16))
+        gt.overviews = [ov]
+    return AsyncGeoTIFF("s3://b/k.tif", gt), ov
+
+
+# An AOI inside the tile's 4326 footprint.
+_AOI = BBox(12.1386, 51.3893, 12.1595, 51.4042)
+
+
+class TestMergeSharesTheWarpSeam:
+    async def test_halo_is_per_axis(self):
+        """merge sized the halo from an x-only resolution ratio and applied it
+        to both axes, so the y edges came from a truncated kernel."""
+        cog, _ = _real_utm_cog()
+        calls = spy_read_native(cog)
+        res = 0.0002
+
+        await merge(
+            [cog],
+            bbox=_AOI,
+            bbox_crs=4326,
+            target_crs=4326,
+            target_resolution=res,
+            resampling="cubic",
+        )
+
+        assert len(calls) == 1
+        got = BBox(*calls[0]["bbox"])
+        # Reference frame: the output grid's own extent, unpadded.
+        out_transform, out_w, out_h = _grid_for_bbox(_AOI, res)
+        unpadded = transform_bbox(
+            bounds_from_transform(out_transform, out_w, out_h), 4326, 32633
+        )
+        pad_x = unpadded.minx - got.minx
+        pad_y = unpadded.miny - got.miny
+        # 0.0002 deg is ~14.5 m of easting but ~23 m of northing, so y needs the
+        # wider kernel and therefore the deeper halo.
+        assert pad_y > pad_x
+
+    async def test_read_and_merge_agree_on_overview(self):
+        """Both derived "target resolution in source units" from a bbox width
+        ratio, but from *different* bboxes, so the same arguments could select
+        different overviews — and overview pixels are pre-averaged aggregates.
+        """
+        # Chosen to straddle the 20 m overview under the two old denominators:
+        # merge's whole-image ratio gave 19.6 m (no overview), a read-region
+        # ratio gives 21.2 m (overview selected).
+        res = 2.9233e-04
+
+        reader_cog, _ = _real_utm_cog(with_overview=True)
+        reader_calls = spy_read_native(reader_cog)
+        await reader_cog.read(
+            bbox=_AOI,
+            bbox_crs=4326,
+            target_crs=4326,
+            target_resolution=res,
+            use_overviews=True,
+            resampling="bilinear",
+        )
+
+        merge_cog, _ = _real_utm_cog(with_overview=True)
+        merge_calls = spy_read_native(merge_cog)
+        await merge(
+            [merge_cog],
+            bbox=_AOI,
+            bbox_crs=4326,
+            target_crs=4326,
+            target_resolution=res,
+            use_overviews=True,
+            resampling="bilinear",
+        )
+
+        # Output grids differ by design (read ceils to cover the bbox, merge
+        # rounds to match GDAL), so compare the decision, not the pixels.
+        # Assert the decision itself, not just agreement: "both None" would
+        # otherwise pass while use_overviews silently stopped working.
+        assert reader_calls[0]["overview"] is not None
+        assert (reader_calls[0]["overview"] is not None) == (
+            merge_calls[0]["overview"] is not None
+        )
+
+    async def test_thin_edge_contributor_reads_a_sane_halo(self):
+        """A contributor clipping a thin column of the output gets a 1-px-wide
+        sub-grid. Sizing the source resolution from that sub-grid's *extents*
+        read the projection's curvature over the tall axis as apparent width,
+        inflating the halo ~250x (30 m -> 7330 m) and picking a wrong overview.
+        """
+        cog, _ = _real_utm_cog()
+        calls = spy_read_native(cog)
+        res = 0.0002
+        tile = transform_bbox(BBox(*cog._geotiff.bounds), 32633, 4326)
+
+        # An output bbox overlapping only a sliver of the tile's left edge, but
+        # spanning its full height.
+        await merge(
+            [cog],
+            bbox=BBox(tile.minx - 20 * res, tile.miny, tile.minx + res, tile.maxy),
+            bbox_crs=4326,
+            target_crs=4326,
+            target_resolution=res,
+            resampling="cubic",
+        )
+
+        assert len(calls) == 1
+        got = BBox(*calls[0]["bbox"])
+        # 10 m source, cubic, ~1.4x downsample -> 3 source px each way. Allow
+        # generous slack; the bug produced hundreds of pixels, not a few.
+        assert got.width < 500.0, f"halo blew up: read {got.width:.0f} m wide"
+        assert got.height < cog._geotiff.bounds[3] - cog._geotiff.bounds[1] + 500.0
