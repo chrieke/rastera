@@ -1133,11 +1133,12 @@ async def _dispatch_source_reads(
         for i, (out_idx, _) in enumerate(entries):
             out_data[out_idx] = res_data[i]
 
-    # Keep the sub-read's own ``_geotiff`` (which already reflects any
-    # reprojection) unless it reports a different nodata than the VRT carries;
-    # then swap in a stub that keeps the result's CRS. Still needed even though
-    # _VRTDataset pushes its nodata onto the sources, because a native sub-read
-    # returns the source's raw GeoTIFF, whose nodata is the file's.
+    # Keep the sub-read's own ``_geotiff`` (which already reflects the source's
+    # resolved CRS and nodata) unless it reports a different nodata than the VRT
+    # carries; then swap in a stub that keeps the result's CRS. Still needed even
+    # though _VRTDataset pushes its nodata onto the sources: the push is refused
+    # by a source whose dtype cannot carry the value, and _hides_declared_nodata
+    # zeroes the VRT's without touching the sources at all.
     geotiff_ref: Any = first._geotiff
     if output_nodata != first.nodata:
         geotiff_ref = _CrsNodata(first.crs, output_nodata)

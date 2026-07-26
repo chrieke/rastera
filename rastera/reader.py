@@ -458,15 +458,12 @@ class AsyncGeoTIFF:
             method=resampling,
         )
 
-        # The real GeoTIFF while the CRS is unchanged: RasterArray.crs/.nodata
-        # read straight off it, and vrt._dispatch_source_reads keys its nodata
-        # swap off a sub-read reporting the *file's* value.
-        geotiff_ref: GeoTIFF | _CrsNodata = self._geotiff
-        if needs_reproject:
-            assert out_crs is not None
-            geotiff_ref = _CrsNodata(CRS.from_epsg(out_crs), self._nodata)
         return _make_output_array(
-            out_data, dst_transform, dst_width, dst_height, geotiff_ref
+            out_data,
+            dst_transform,
+            dst_width,
+            dst_height,
+            self._output_geotiff_ref(out_crs),
         )
 
     async def _read_native(
@@ -520,7 +517,28 @@ class AsyncGeoTIFF:
                 ),
             )
 
+        geotiff_ref = self._output_geotiff_ref(self._crs_epsg)
+        if isinstance(geotiff_ref, _CrsNodata):
+            result = dc_replace(result, _geotiff=geotiff_ref)
         return result
+
+    def _output_geotiff_ref(self, out_crs: int | None) -> GeoTIFF | _CrsNodata:
+        """What ``RasterArray.crs``/``.nodata`` should read off for our output.
+
+        The real GeoTIFF whenever it already agrees, so ``arr._geotiff`` stays
+        a live handle. A stub otherwise, carrying what this dataset actually
+        resolved: a ``meta_overrides`` CRS, a reprojection's target, or a
+        sentinel ``_coerce_nodata`` dropped as unrepresentable. Labelling the
+        output with the file's values instead is how a uint16 array comes back
+        reporting ``nodata=-9999`` and crashes ``as_masked()``.
+        """
+        gt = self._geotiff
+        if out_crs == gt.crs.to_epsg() and _same_nodata(self._nodata, gt.nodata):
+            return gt
+        # No EPSG to build from means no override was given, so the file's own
+        # CRS object is the resolved one — possibly a WKT that has no code.
+        crs = CRS.from_epsg(out_crs) if out_crs is not None else gt.crs
+        return _CrsNodata(crs, self._nodata)
 
     def __repr__(self) -> str:
         gt = self._geotiff
@@ -806,6 +824,14 @@ def _coerce_nodata(
         info = np.iinfo(dt)
         return None if not info.min <= nodata <= info.max else int(nodata)
     return float(nodata)
+
+
+def _same_nodata(resolved: int | float | None, declared: float | None) -> bool:
+    """``==``, but NaN equals itself: a float raster's NaN sentinel comes
+    through ``_coerce_nodata`` unchanged and is still the file's own value."""
+    if resolved is None or declared is None:
+        return resolved is declared
+    return resolved == declared or (math.isnan(resolved) and math.isnan(declared))
 
 
 class MetaOverrides(TypedDict, total=False):

@@ -316,7 +316,11 @@ class _DIMAPDataset(AsyncGeoTIFF):
             )
 
         return _make_output_array(
-            out, out_transform, window.width, window.height, self._geotiff
+            out,
+            out_transform,
+            window.width,
+            window.height,
+            self._output_geotiff_ref(self._crs_epsg),
         )
 
     async def _get_tile(

@@ -542,6 +542,77 @@ class TestWarpSeam:
         assert reprojected._geotiff is not gt
 
 
+# ── The CRS and nodata the output reports ───────────────────────────────
+
+
+class TestOutputLabels:
+    """``RasterArray.crs``/``.nodata`` read straight off ``_geotiff``, so every
+    read path has to attach one that agrees with what the *dataset* resolved.
+    Logically equivalent reads disagreeing is the bug these guard."""
+
+    @staticmethod
+    def _obj(
+        meta_overrides: Any = None, **gt_kwargs: Any
+    ) -> tuple[AsyncGeoTIFF, MagicMock]:
+        gt = make_mock_geotiff(count=1, **gt_kwargs)
+        gt.read = slicing_read(gt, np.zeros((1, 100, 100), gt.dtype))
+        return AsyncGeoTIFF("s3://b/k.tif", gt, meta_overrides=meta_overrides), gt
+
+    @pytest.mark.parametrize(
+        ("read_kwargs", "expected"),
+        [
+            ({}, 3006),
+            ({"target_resolution": 20.0}, 3006),
+            # Reprojection reads *from* the override and labels with the target.
+            ({"target_crs": 4326}, 4326),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_crs_override_reaches_the_output(
+        self, read_kwargs: dict[str, Any], expected: int
+    ):
+        """meta_overrides governed windowing but never the label it exists to fix."""
+        obj, _ = self._obj(meta_overrides={"crs": 3006}, crs_epsg=32632)
+        arr = await obj.read(**read_kwargs)
+        assert arr.crs.to_epsg() == expected
+
+    @pytest.mark.parametrize(
+        "read_kwargs",
+        [{}, {"target_resolution": 20.0}, {"target_crs": 4326}],
+    )
+    @pytest.mark.asyncio
+    async def test_unrepresentable_nodata_is_not_reported(
+        self, read_kwargs: dict[str, Any]
+    ):
+        """A uint16 band declaring -9999 has no sentinel its dtype can carry, so
+        the output must report none — reporting it makes as_masked() raise."""
+        obj, _ = self._obj(nodata=-9999.0, dtype=np.dtype("u2"))
+        assert obj._nodata is None
+
+        arr = await obj.read(**read_kwargs)
+        assert arr.nodata is None
+        arr.as_masked()  # would raise TypeError on an unconvertible fill_value
+
+    @pytest.mark.parametrize(
+        ("nodata", "dtype"),
+        [
+            (0.0, np.dtype("u2")),
+            # NaN survives _coerce_nodata untouched, so it is still the file's.
+            (float("nan"), np.dtype("f4")),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_agreeing_file_keeps_the_live_geotiff(
+        self, nodata: float, dtype: np.dtype[Any]
+    ):
+        """The substitution is conditional: nothing to correct, nothing to stub.
+        vrt._dispatch_source_reads keys its nodata swap off what a sub-read
+        reports, and merge reaches through _geotiff for dtype and transform."""
+        obj, gt = self._obj(nodata=nodata, dtype=dtype)
+        assert (await obj.read())._geotiff is gt
+        assert (await obj.read(target_resolution=20.0))._geotiff is gt
+
+
 # ── LRU cache behaviour ────────────────────────────────────────────────
 
 
