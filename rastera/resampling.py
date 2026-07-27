@@ -265,7 +265,6 @@ def _resample_kernel(
         raise NotImplementedError(
             f"{method} resampling does not support complex dtype {src_array.dtype}"
         )
-    n_bands, h, w = src_array.shape
 
     # NaN-sentinel nodata needs `np.isnan` for detection (NaN != NaN means
     # `==` and `!=` both miss it) and zeroing-out before multiply (NaN * 0
@@ -361,87 +360,19 @@ def _resample_kernel(
     wy = weights_fn(frac_row, y_offsets, y_filter)
 
     # --- Accumulate kernel contributions.
-    per_dim_ok: np.ndarray | None = None
-    if coords_2d:
-        # Non-separable 2-D loop for the cross-CRS warp: the source sampling
-        # grid is not axis-aligned with the output, so weights and indices
-        # are full 2-D and cannot be reused across rows/columns.
-        acc_val = np.zeros((n_bands, dst_height, dst_width), dtype=np.float64)
-        acc_wt: np.ndarray | None = None
-        row_valid_counts: np.ndarray | None = None
-        col_valid_counts: np.ndarray | None = None
-        if nodata is not None:
-            acc_wt = np.zeros((dst_height, dst_width), dtype=np.float64)
-            if method == "cubic":
-                # int32 (not int8): a single axis can have >127 kernel taps
-                # under heavy anisotropic downsampling, which would overflow
-                # int8 and spuriously fail the >=2 gate.
-                row_valid_counts = np.zeros(
-                    (len(y_offsets), dst_height, dst_width), dtype=np.int32
-                )
-                col_valid_counts = np.zeros(
-                    (len(x_offsets), dst_height, dst_width), dtype=np.int32
-                )
-
-        for i, dy in enumerate(y_offsets):
-            src_row_idx = base_row + dy
-            safe_row = np.clip(src_row_idx, 0, h - 1)
-            in_bounds_row = (src_row_idx >= 0) & (src_row_idx < h)
-            wy_i = wy[i]
-            for j, dx in enumerate(x_offsets):
-                src_col_idx = base_col + dx
-                safe_col = np.clip(src_col_idx, 0, w - 1)
-                in_bounds_col = (src_col_idx >= 0) & (src_col_idx < w)
-                wx_j = wx[j]
-
-                sample = src_array[:, safe_row, safe_col]  # (B, H, W)
-                w_xy = wy_i * wx_j  # (H, W)
-                in_bounds = in_bounds_row & in_bounds_col  # (H, W)
-
-                if nodata is not None:
-                    # Pixel is valid only if all bands are non-nodata AND the
-                    # tap is in-bounds.  NaN-sentinel: use `np.isnan` and
-                    # zero-out NaN samples before the multiply.
-                    if nodata_is_nan:
-                        is_nodata = np.isnan(sample)
-                        sample = np.where(is_nodata, 0.0, sample)
-                    else:
-                        is_nodata = sample == nodata
-                    valid = ~is_nodata.any(axis=0) & in_bounds  # (H, W)
-                    contrib = w_xy * valid  # (H, W), bool→float promotion
-                    acc_val += sample * contrib  # broadcast (B,H,W) * (H,W)
-                    assert acc_wt is not None
-                    acc_wt += contrib
-                    if method == "cubic":
-                        assert row_valid_counts is not None
-                        assert col_valid_counts is not None
-                        row_valid_counts[i] += valid
-                        col_valid_counts[j] += valid
-                else:
-                    # No nodata: clamped (edge-replicated) samples, no renorm.
-                    acc_val += sample * w_xy
-
-        if nodata is not None and method == "cubic":
-            assert row_valid_counts is not None
-            assert col_valid_counts is not None
-            per_dim_ok = np.asarray(
-                (row_valid_counts >= 2).any(axis=0)
-                & (col_valid_counts >= 2).any(axis=0)
-            )
-    else:
-        # Same-CRS: separable two-pass, O(taps_x + taps_y).
-        acc_val, acc_wt, per_dim_ok = _accumulate_separable(
-            src_array,
-            base_col,
-            base_row,
-            wx,
-            wy,
-            x_offsets,
-            y_offsets,
-            nodata,
-            nodata_is_nan,
-            method,
-        )
+    accumulate = _accumulate_2d if coords_2d else _accumulate_separable
+    acc_val, acc_wt, per_dim_ok = accumulate(
+        src_array,
+        base_col,
+        base_row,
+        wx,
+        wy,
+        x_offsets,
+        y_offsets,
+        nodata,
+        nodata_is_nan,
+        method,
+    )
 
     return _finalize_kernel(
         acc_val,
@@ -639,6 +570,99 @@ def _cubic_weights(
         weights.append(np.where(d < 1.0, w_inner, np.where(d < 2.0, w_outer, 0.0)))
     out = np.stack(weights)
     return out / out.sum(axis=0, keepdims=True)
+
+
+def _accumulate_2d(
+    src_array: np.ndarray,
+    base_col: np.ndarray,
+    base_row: np.ndarray,
+    wx: np.ndarray,
+    wy: np.ndarray,
+    x_offsets: Sequence[int],
+    y_offsets: Sequence[int],
+    nodata: int | float | None,
+    nodata_is_nan: bool,
+    method: Literal["bilinear", "cubic"],
+) -> tuple[np.ndarray, np.ndarray | None, np.ndarray | None]:
+    """Non-separable 2-D kernel accumulation for the cross-CRS warp.
+
+    The source sampling grid is not axis-aligned with the output, so weights
+    and indices are full 2-D and cannot be reused across rows or columns —
+    hence ``O(taps_x · taps_y)`` here against :func:`_accumulate_separable`'s
+    ``O(taps_x + taps_y)``.
+
+    ``base_col``/``base_row`` and ``wx``/``wy`` are 2-D over the output grid,
+    unlike the 1-D per-axis arrays the separable path takes.
+
+    Returns ``(acc_val, acc_wt, per_dim_ok)`` for :func:`_finalize_kernel`.
+    """
+    n_bands, h, w = src_array.shape
+    dst_height, dst_width = base_row.shape
+
+    per_dim_ok: np.ndarray | None = None
+    acc_val = np.zeros((n_bands, dst_height, dst_width), dtype=np.float64)
+    acc_wt: np.ndarray | None = None
+    row_valid_counts: np.ndarray | None = None
+    col_valid_counts: np.ndarray | None = None
+    if nodata is not None:
+        acc_wt = np.zeros((dst_height, dst_width), dtype=np.float64)
+        if method == "cubic":
+            # int32 (not int8): a single axis can have >127 kernel taps
+            # under heavy anisotropic downsampling, which would overflow
+            # int8 and spuriously fail the >=2 gate.
+            row_valid_counts = np.zeros(
+                (len(y_offsets), dst_height, dst_width), dtype=np.int32
+            )
+            col_valid_counts = np.zeros(
+                (len(x_offsets), dst_height, dst_width), dtype=np.int32
+            )
+
+    for i, dy in enumerate(y_offsets):
+        src_row_idx = base_row + dy
+        safe_row = np.clip(src_row_idx, 0, h - 1)
+        in_bounds_row = (src_row_idx >= 0) & (src_row_idx < h)
+        wy_i = wy[i]
+        for j, dx in enumerate(x_offsets):
+            src_col_idx = base_col + dx
+            safe_col = np.clip(src_col_idx, 0, w - 1)
+            in_bounds_col = (src_col_idx >= 0) & (src_col_idx < w)
+            wx_j = wx[j]
+
+            sample = src_array[:, safe_row, safe_col]  # (B, H, W)
+            w_xy = wy_i * wx_j  # (H, W)
+            in_bounds = in_bounds_row & in_bounds_col  # (H, W)
+
+            if nodata is not None:
+                # Pixel is valid only if all bands are non-nodata AND the
+                # tap is in-bounds.  NaN-sentinel: use `np.isnan` and
+                # zero-out NaN samples before the multiply.
+                if nodata_is_nan:
+                    is_nodata = np.isnan(sample)
+                    sample = np.where(is_nodata, 0.0, sample)
+                else:
+                    is_nodata = sample == nodata
+                valid = ~is_nodata.any(axis=0) & in_bounds  # (H, W)
+                contrib = w_xy * valid  # (H, W), bool→float promotion
+                acc_val += sample * contrib  # broadcast (B,H,W) * (H,W)
+                assert acc_wt is not None
+                acc_wt += contrib
+                if method == "cubic":
+                    assert row_valid_counts is not None
+                    assert col_valid_counts is not None
+                    row_valid_counts[i] += valid
+                    col_valid_counts[j] += valid
+            else:
+                # No nodata: clamped (edge-replicated) samples, no renorm.
+                acc_val += sample * w_xy
+
+    if nodata is not None and method == "cubic":
+        assert row_valid_counts is not None
+        assert col_valid_counts is not None
+        per_dim_ok = np.asarray(
+            (row_valid_counts >= 2).any(axis=0) & (col_valid_counts >= 2).any(axis=0)
+        )
+
+    return acc_val, acc_wt, per_dim_ok
 
 
 def _accumulate_separable(
