@@ -39,6 +39,7 @@ dev = [
     "geopandas>=1.0.0",
     "pyarrow>=18.0.0",
     "shapely>=2.0.0",
+    "pre-commit>=4.6.1",
 ]
 
 [tool.ruff]
