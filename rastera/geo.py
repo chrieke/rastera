@@ -9,6 +9,7 @@ from affine import Affine
 from async_geotiff import Window
 from async_geotiff._transform import HasTransform
 from pyproj import CRS, Transformer
+from pyproj.exceptions import ProjError
 
 
 @dataclass(frozen=True, slots=True)
@@ -49,8 +50,25 @@ class BBox:
 
 
 def ensure_bbox(bbox: BBox | tuple[float, float, float, float]) -> BBox:
-    """Normalize a bbox argument to a BBox instance."""
-    return bbox if isinstance(bbox, BBox) else BBox(*bbox)
+    """Normalize a caller-supplied bbox argument to a validated BBox instance.
+
+    Only for bboxes that came from outside the library — the internal
+    constructions (dataset bounds, intersections, transformed envelopes) are
+    already known-good and some are legitimately degenerate.
+    """
+    box = bbox if isinstance(bbox, BBox) else BBox(*bbox)
+    if not all(math.isfinite(v) for v in box):
+        raise ValueError(f"BBox must be finite, got {tuple(box)}")
+    # Every consumer takes min()/max() of the corners, so an inverted box is
+    # silently swapped rather than rejected.  For a GeoJSON antimeridian bbox
+    # like (170, -10, -170, 10) that swap spans the complementary 340 degrees.
+    if box.minx >= box.maxx or box.miny >= box.maxy:
+        raise ValueError(
+            f"BBox must have minx < maxx and miny < maxy, got {tuple(box)}. "
+            f"An antimeridian-crossing bbox (minx > maxx) has no axis-aligned "
+            f"representation; split the request at the antimeridian."
+        )
+    return box
 
 
 def normalize_band_indices(
@@ -58,19 +76,20 @@ def normalize_band_indices(
 ) -> list[int]:
     """Return a concrete list of 0-based band indices for internal use.
 
-    Args:
-        band_indices: 1-based band indices (matching rasterio convention).
-            ``None`` selects all bands.
-        n_bands: Total number of bands in the dataset.
-
-    Returns:
-        0-based indices suitable for NumPy indexing.
+    *band_indices* is 1-based, matching the rasterio convention; ``None``
+    selects all bands.
     """
     if band_indices is None:
         return list(range(n_bands))
     if len(band_indices) == 0:
         raise ValueError("band_indices must not be empty (use None for all bands)")
     for b in band_indices:
+        # A float index passes the range checks below and then subtracts to
+        # 0.899..., which dies several frames later inside NumPy.
+        if not isinstance(b, int | np.integer) or isinstance(b, bool):
+            raise ValueError(
+                f"Band indices must be integers, got {b!r} ({type(b).__name__})."
+            )
         if b < 1:
             raise ValueError(
                 f"Band indices are 1-based (got {b}). Use 1 for the first band."
@@ -80,6 +99,25 @@ def normalize_band_indices(
                 f"Band index {b} out of range for dataset with {n_bands} band(s)."
             )
     return [b - 1 for b in band_indices]
+
+
+def validate_resolution(target_resolution: float) -> None:
+    """Reject a target resolution the grid math cannot use.
+
+    ``0`` divides by zero, a negative value yields a 1x1 array with a mirrored
+    transform, and nan/inf die inside ``round``/``ceil`` — all of them several
+    frames from the caller's mistake.
+    """
+    if not isinstance(target_resolution, int | float | np.number) or isinstance(
+        target_resolution, bool
+    ):
+        raise ValueError(
+            f"target_resolution must be a number, got {target_resolution!r}"
+        )
+    if not math.isfinite(target_resolution) or target_resolution <= 0:
+        raise ValueError(
+            f"target_resolution must be a finite value > 0, got {target_resolution!r}"
+        )
 
 
 def bounds_from_transform(transform: Affine, width: int, height: int) -> BBox:
@@ -118,7 +156,6 @@ def window_from_bbox(
     inv = ~meta.transform
     minx, miny, maxx, maxy = bbox.minx, bbox.miny, bbox.maxx, bbox.maxy
 
-    # top-left and bottom-right in pixel coords
     col_min_f, row_max_f = _affine_apply(inv, minx, maxy)
     col_max_f, row_min_f = _affine_apply(inv, maxx, miny)
 
@@ -167,29 +204,21 @@ def compute_paste_slices(
     dst_width: int,
     dst_height: int,
 ) -> tuple[slice, slice, slice, slice] | None:
-    """
-    Compute aligned source/target slices for pasting a read window into a mosaic.
+    """Compute aligned source/target slices for pasting a read window into a mosaic.
 
-    This is used when you have already read a window (described by `src`)
-    and want to paste it into a destination array whose pixel grid is described
-    by `dst_transform` (pixel -> world for the destination).
-
-    `src` must have `.transform`, `.width`, `.height` attributes.
-
-    Returns (dst_rows, dst_cols, src_rows, src_cols) or None if there is no
-    overlap after clipping to destination bounds.
+    For a window already read (described by *src*) that is to be pasted into a
+    destination array whose grid is *dst_transform*. Returns
+    ``(dst_rows, dst_cols, src_rows, src_cols)``, or ``None`` when clipping to
+    the destination leaves no overlap.
     """
     dst_inv_transform = ~dst_transform
 
-    # Top-left world coordinate of the source window.
     wx0, wy0 = _affine_apply(src.transform, 0, 0)
 
-    # Map into destination pixel coordinates.
     dst_c0_f, dst_r0_f = _affine_apply(dst_inv_transform, wx0, wy0)
     dst_c0 = math.floor(dst_c0_f + 0.5)
     dst_r0 = math.floor(dst_r0_f + 0.5)
 
-    # Initial (unclipped) target indices in destination pixel coordinates.
     dst_c1 = dst_c0 + src.width
     dst_r1 = dst_r0 + src.height
 
@@ -204,7 +233,6 @@ def compute_paste_slices(
     if clipped_dst_c0 >= clipped_dst_c1 or clipped_dst_r0 >= clipped_dst_r1:
         return None
 
-    # Corresponding crop on the source window.
     src_c0 = clipped_dst_c0 - dst_c0
     src_r0 = clipped_dst_r0 - dst_r0
     src_c1 = src_c0 + (clipped_dst_c1 - clipped_dst_c0)
@@ -223,50 +251,43 @@ def transform_bbox(
 ) -> BBox:
     """Transform a BBox between CRS (EPSG codes).
 
-    Densifies all 4 edges with *densify_pts* samples each (default 21,
-    matching rasterio's ``transform_bounds``). This captures the curvature
-    of projected edges at high latitudes and near polar singularities.
+    Delegates to pyproj's ``transform_bounds``, which densifies each edge with
+    *densify_pts* samples to capture projected curvature *and* accounts for a
+    pole or antimeridian falling in the box's interior. Hulling densified edges
+    alone misses those: an EPSG:3413 sea-ice grid reaches lat 90 through its
+    interior, and edge sampling tops out around 56.
     """
     if from_crs == to_crs:
         return bbox
     transformer = Transformer.from_crs(from_crs, to_crs, always_xy=True)
-    t = np.linspace(0, 1, densify_pts)
-    dx = t * (bbox.maxx - bbox.minx)
-    dy = t * (bbox.maxy - bbox.miny)
-    xs = np.concatenate(
-        [
-            bbox.minx + dx,  # bottom edge
-            np.full_like(t, bbox.maxx),  # right edge
-            bbox.maxx - dx,  # top edge
-            np.full_like(t, bbox.minx),  # left edge
-        ]
-    )
-    ys = np.concatenate(
-        [
-            np.full_like(t, bbox.miny),  # bottom edge
-            bbox.miny + dy,  # right edge
-            np.full_like(t, bbox.maxy),  # top edge
-            bbox.maxy - dy,  # left edge
-        ]
-    )
-    xs_out, ys_out = transformer.transform(xs, ys)
-    # Any non-finite edge point means the bbox reaches outside the target CRS's
-    # domain, so no finite envelope is correct.  Taking the hull of just the
-    # finite subset would silently under-cover the request.
-    n_bad = int(np.count_nonzero(~(np.isfinite(xs_out) & np.isfinite(ys_out))))
-    if n_bad:
-        raise ValueError(
-            f"{n_bad}/{xs_out.size} densified edge points became inf/nan "
-            f"transforming bbox {tuple(bbox)} from EPSG:{from_crs} to "
-            f"EPSG:{to_crs}; the bbox reaches outside the target CRS's area "
-            f"of use. Clip it first."
+    try:
+        minx, miny, maxx, maxy = transformer.transform_bounds(
+            *bbox, densify_pts=densify_pts, errcheck=True
         )
-    return BBox(
-        float(np.min(xs_out)),
-        float(np.min(ys_out)),
-        float(np.max(xs_out)),
-        float(np.max(ys_out)),
-    )
+    except ProjError as exc:
+        raise ValueError(
+            f"Cannot transform bbox {tuple(bbox)} from EPSG:{from_crs} to "
+            f"EPSG:{to_crs}; the bbox reaches outside the target CRS's area "
+            f"of use. Clip it first. ({exc})"
+        ) from exc
+    # errcheck only fires on hard PROJ errors; a bbox that merely leaves the
+    # domain can still come back inf/nan, and no finite envelope is correct.
+    if not all(math.isfinite(v) for v in (minx, miny, maxx, maxy)):
+        raise ValueError(
+            f"Transforming bbox {tuple(bbox)} from EPSG:{from_crs} to "
+            f"EPSG:{to_crs} produced inf/nan bounds; the bbox reaches outside "
+            f"the target CRS's area of use. Clip it first."
+        )
+    # transform_bounds signals an antimeridian crossing by returning minx > maxx.
+    # No axis-aligned BBox represents that, and silently hulling it would span
+    # the wrong 340 degrees of the globe.
+    if minx > maxx:
+        raise ValueError(
+            f"Bbox {tuple(bbox)} crosses the antimeridian in EPSG:{to_crs} "
+            f"(wrapped bounds {minx} > {maxx}); no single axis-aligned bbox "
+            f"covers it. Split the request at the antimeridian."
+        )
+    return BBox(float(minx), float(miny), float(maxx), float(maxy))
 
 
 def _affine_apply(t: Affine, x: float, y: float) -> tuple[float, float]:
@@ -275,16 +296,19 @@ def _affine_apply(t: Affine, x: float, y: float) -> tuple[float, float]:
     return float(rx), float(ry)
 
 
-def _denoise(pixel_coord: float, tol: float = 1e-6) -> float:
+# In pixels: orders of magnitude above ``~transform``'s ULP error and far below
+# any sub-pixel offset a caller could mean.
+_DENOISE_TOL = 1e-6
+
+
+def _denoise(pixel_coord: float) -> float:
     """Collapse a pixel coordinate onto an exact boundary it all but sits on.
 
     ``~transform`` carries a few ULPs of error through the divide, so a bbox
     edge that is exactly on the source grid arrives as 12105.000000000004.
-    *tol* is in pixels — orders of magnitude above that error and far below
-    any sub-pixel offset a caller could mean.
     """
     nearest = round(pixel_coord)
-    return float(nearest) if abs(pixel_coord - nearest) < tol else pixel_coord
+    return float(nearest) if abs(pixel_coord - nearest) < _DENOISE_TOL else pixel_coord
 
 
 def _normalize_crs(crs: int | CRS) -> int:

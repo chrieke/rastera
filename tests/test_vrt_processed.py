@@ -18,7 +18,7 @@ from rastera.vrt import (
     _VRTProcessedDataset,
     _VRTProcessedSpec,
 )
-from tests.conftest import make_mock_geotiff
+from tests.conftest import make_mock_geotiff, make_raster_array
 
 # ── fixtures ────────────────────────────────────────────────────────────────
 
@@ -72,16 +72,7 @@ def _src_array(shape: tuple[int, int, int], *, dtype: Any = np.uint16) -> Raster
         data[i] = (i + 1) * 100
     geotiff = MagicMock()
     geotiff.nodata = 0
-    return RasterArray(
-        data=data,
-        mask=None,
-        width=shape[2],
-        height=shape[1],
-        count=shape[0],
-        transform=Affine(1, 0, 0, 0, -1, shape[1]),
-        _alpha_band_idx=None,
-        _geotiff=geotiff,
-    )
+    return make_raster_array(data, Affine(1, 0, 0, 0, -1, shape[1]), geotiff)
 
 
 # ── LUT compiler ────────────────────────────────────────────────────────────
@@ -286,7 +277,6 @@ class TestProcessedRead:
         ds, _ = _make_processed_ds(n_bands=4)
         assert ds.count == 4
 
-    @pytest.mark.asyncio
     async def test_read_applies_per_band_lut(self):
         ds, source = _make_processed_ds(n_bands=2)
         source.read = AsyncMock(return_value=_src_array((2, 3, 3)))
@@ -306,7 +296,6 @@ class TestProcessedRead:
         np.testing.assert_array_equal(data[0], expected_0)
         np.testing.assert_array_equal(data[1], expected_1)
 
-    @pytest.mark.asyncio
     async def test_read_native_subset_bands(self):
         """_read_native is the internal path used by merge; 0-based indexing,
         per-band LUT selection must follow the requested bands."""
@@ -326,7 +315,6 @@ class TestProcessedRead:
         # apply lut_1 (index 0) to it.
         np.testing.assert_array_equal(data[1], ds._spec.luts[0][200])
 
-    @pytest.mark.asyncio
     async def test_reprojected_read_reports_the_target_crs(self):
         """The LUT does not move pixels, but ``target_crs`` reprojection happens
         inside the source read — so the result's CRS is whatever the sub-read
@@ -343,19 +331,16 @@ class TestProcessedRead:
         # nodata still comes from the LUT step, which is what writes it.
         assert arr.nodata == ds._spec.dst_nodata
 
-    @pytest.mark.asyncio
     async def test_use_overviews_rejected(self):
         ds, _ = _make_processed_ds()
         with pytest.raises(NotImplementedError, match="use_overviews"):
             await ds.read(use_overviews=True)
 
-    @pytest.mark.asyncio
     async def test_read_native_overview_rejected(self):
         ds, _ = _make_processed_ds()
         with pytest.raises(NotImplementedError, match="overview"):
             await ds._read_native(overview=MagicMock())
 
-    @pytest.mark.asyncio
     async def test_rejects_float_source(self):
         ds, source = _make_processed_ds(n_bands=1, src_dtype=np.float32)
         source._read_native = AsyncMock(
@@ -364,7 +349,6 @@ class TestProcessedRead:
         with pytest.raises(NotImplementedError, match="not integer"):
             await ds._read_native()
 
-    @pytest.mark.asyncio
     async def test_rejects_source_out_of_range(self):
         """A source value outside the LUT domain is a real error — we
         won't silently saturate."""
@@ -382,7 +366,6 @@ class TestProcessedRead:
 
 
 class TestOpenProcessedVRT:
-    @pytest.mark.asyncio
     async def test_opens_input_via_async_geotiff_open(self):
         """``<Input>`` resolution flows through ``AsyncGeoTIFF.open`` so the
         normal ``.xml`` → DIMAP auto-routing applies for free."""
@@ -408,7 +391,6 @@ class TestOpenProcessedVRT:
         assert mock_open.await_args is not None
         assert mock_open.await_args.args[0] == "s3://b/tile.xml"
 
-    @pytest.mark.asyncio
     async def test_forwards_meta_overrides_to_source(self):
         """``meta_overrides`` must reach the source open so the wrapper's
         CRS and the source agree."""

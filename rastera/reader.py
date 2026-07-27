@@ -11,7 +11,6 @@ from typing import Any, TypedDict, overload
 import numpy as np
 from affine import Affine
 from async_geotiff import GeoTIFF, RasterArray, Window
-from async_tiff.store import from_url  # type: ignore[reportMissingImports]
 from pyproj import CRS, Transformer
 
 from .geo import (
@@ -21,15 +20,19 @@ from .geo import (
     ensure_bbox,
     normalize_band_indices,
     transform_bbox,
+    validate_resolution,
     window_from_bbox,
 )
-from .resampling import ResamplingMethod, _kernel_halo, resample
+from .resampling import (
+    ResamplingMethod,
+    _kernel_halo,
+    resample,
+    validate_resampling,
+)
 from .store import (
-    _apply_s3_defaults,
-    _bucket_url,
     _build_store,
     _extract_key,
-    _resolve_local_path,
+    _require_same_bucket,
 )
 
 # LRU cache for parsed GeoTIFF objects, keyed by URI.
@@ -78,7 +81,6 @@ class AsyncGeoTIFF:
 
     @property
     def count(self) -> int:
-        """Number of bands exposed by this dataset."""
         return self._geotiff.count
 
     def _best_overview_for_resolution(self, target_resolution: float):
@@ -157,20 +159,9 @@ class AsyncGeoTIFF:
             if gt is not None:
                 return cls(uri, gt, meta_overrides=meta_overrides)
 
-        if store is not None:
-            key = _extract_key(uri)
-            geotiff = await GeoTIFF.open(key, store=store, prefetch=prefetch)
-        else:
-            local_path = _resolve_local_path(uri)
-            if local_path is not None:
-                store = from_url(local_path.parent.as_uri(), **store_kwargs)
-                geotiff = await GeoTIFF.open(
-                    local_path.name, store=store, prefetch=prefetch
-                )
-            else:
-                _apply_s3_defaults(store_kwargs, uri)
-                store = from_url(uri, **store_kwargs)
-                geotiff = await GeoTIFF.open("", store=store, prefetch=prefetch)
+        if store is None:
+            store = _build_store(uri, **store_kwargs)
+        geotiff = await GeoTIFF.open(_extract_key(uri), store=store, prefetch=prefetch)
 
         if cache and _cache_max_size > 0:
             if len(_geotiff_cache) >= _cache_max_size:
@@ -194,18 +185,10 @@ class AsyncGeoTIFF:
         """Read image data, optionally reprojecting and resampling.
 
         Args:
-            bbox: (minx, miny, maxx, maxy). Must be in target_crs if set,
-                else dataset CRS.
-            bbox_crs: EPSG code or ``pyproj.CRS`` of the bbox coordinate
-                system. Must match target_crs (or the dataset CRS when
-                target_crs is not set).
-            window: Pixel window (col_off, row_off, width, height). Can
-                combine with target_resolution for resampling but not with
-                target_crs.
-            band_indices: 1-based band indices to read.
-            target_crs: Output EPSG code or ``pyproj.CRS``. When set,
-                data is reprojected.
-            target_resolution: Output pixel size in target CRS units.
+            bbox: Must be in *bbox_crs*, which must equal *target_crs* if set,
+                else the dataset CRS.
+            window: Combines with *target_resolution* but not with *target_crs*.
+            band_indices: 1-based.
             snap_to_grid: When True (default), pixels are copied 1:1 from
                 the source grid and the extent grows outward to whole
                 pixels, so the result contains ``bbox`` and can exceed it
@@ -222,21 +205,13 @@ class AsyncGeoTIFF:
                 or coarse segmentation; avoid for tasks requiring precise
                 pixel values such as spectral index computation or
                 per-pixel regression.
-            resampling: Method used when reprojecting or changing
-                resolution. One of ``"nearest"`` (default; fast, exact,
-                blocky), ``"bilinear"`` (separable linear kernel,
-                smooth, no overshoot), or ``"cubic"`` (Keys cubic,
-                sharper than bilinear, can overshoot the source value
-                range). For bilinear/cubic the kernel widens
-                proportionally when downsampling to act as an
-                anti-aliasing low-pass filter, matching GDAL's warp
-                behaviour. Bilinear and cubic use GDAL-style kernel
-                renormalization around nodata; see
-                :func:`rastera.resampling.resample` for the precise
-                rules.
-
-        Returns:
-            An ``async_geotiff.RasterArray`` containing pixel data and spatial metadata.
+            resampling: Used when reprojecting or changing resolution.
+                ``"nearest"`` (default) is fast, exact and blocky;
+                ``"bilinear"`` is smooth with no overshoot; ``"cubic"`` is
+                sharper but can overshoot the source value range. Both
+                kernels widen when downsampling, to anti-alias as GDAL's
+                warp does, and renormalize around nodata GDAL-style — see
+                :func:`rastera.resampling.resample` for the precise rules.
         """
         gt = self._geotiff
         band_indices = normalize_band_indices(band_indices, gt.count)
@@ -246,6 +221,12 @@ class AsyncGeoTIFF:
             raise ValueError("bbox_crs is required when bbox is provided")
         if window is not None and target_crs is not None:
             raise ValueError("Cannot combine window with target_crs")
+        # ``resampling`` is checked here rather than left to ``resample()``: the
+        # native path never calls it, so an unknown method was silently ignored
+        # on exactly the reads where it looked like it had been honoured.
+        validate_resampling(resampling)
+        if target_resolution is not None:
+            validate_resolution(target_resolution)
 
         if bbox_crs is not None:
             bbox_crs = _normalize_crs(bbox_crs)
@@ -348,7 +329,6 @@ class AsyncGeoTIFF:
         use_overviews: bool,
         resampling: ResamplingMethod,
     ) -> RasterArray:
-        """Read with reprojection and/or resampling."""
         gt = self._geotiff
         src_crs = self._crs_epsg
         out_crs = target_crs or src_crs
@@ -367,7 +347,6 @@ class AsyncGeoTIFF:
         else:
             target_bbox = BBox(*gt.bounds)
 
-        # Determine output resolution
         if target_resolution is not None:
             res = target_resolution
         elif needs_reproject:
@@ -458,15 +437,12 @@ class AsyncGeoTIFF:
             method=resampling,
         )
 
-        # The real GeoTIFF while the CRS is unchanged: RasterArray.crs/.nodata
-        # read straight off it, and vrt._dispatch_source_reads keys its nodata
-        # swap off a sub-read reporting the *file's* value.
-        geotiff_ref: GeoTIFF | _CrsNodata = self._geotiff
-        if needs_reproject:
-            assert out_crs is not None
-            geotiff_ref = _CrsNodata(CRS.from_epsg(out_crs), self._nodata)
         return _make_output_array(
-            out_data, dst_transform, dst_width, dst_height, geotiff_ref
+            out_data,
+            dst_transform,
+            dst_width,
+            dst_height,
+            self._output_geotiff_ref(out_crs),
         )
 
     async def _read_native(
@@ -489,10 +465,8 @@ class AsyncGeoTIFF:
             assert bbox is not None
             window = window_from_bbox(readable, bbox, snap_to_grid=snap_to_grid)
 
-        # Use async-geotiff's built-in read (handles tile fetching + stitching)
         result = await readable.read(window=window)
 
-        # Select requested bands
         if band_indices is not None:
             result = dc_replace(
                 result,
@@ -520,7 +494,28 @@ class AsyncGeoTIFF:
                 ),
             )
 
+        geotiff_ref = self._output_geotiff_ref(self._crs_epsg)
+        if isinstance(geotiff_ref, _CrsNodata):
+            result = dc_replace(result, _geotiff=geotiff_ref)
         return result
+
+    def _output_geotiff_ref(self, out_crs: int | None) -> GeoTIFF | _CrsNodata:
+        """What ``RasterArray.crs``/``.nodata`` should read off for our output.
+
+        The real GeoTIFF whenever it already agrees, so ``arr._geotiff`` stays
+        a live handle. A stub otherwise, carrying what this dataset actually
+        resolved: a ``meta_overrides`` CRS, a reprojection's target, or a
+        sentinel ``_coerce_nodata`` dropped as unrepresentable. Labelling the
+        output with the file's values instead is how a uint16 array comes back
+        reporting ``nodata=-9999`` and crashes ``as_masked()``.
+        """
+        gt = self._geotiff
+        if out_crs == gt.crs.to_epsg() and _same_nodata(self._nodata, gt.nodata):
+            return gt
+        # No EPSG to build from means no override was given, so the file's own
+        # CRS object is the resolved one — possibly a WKT that has no code.
+        crs = CRS.from_epsg(out_crs) if out_crs is not None else gt.crs
+        return _CrsNodata(crs, self._nodata)
 
     def __repr__(self) -> str:
         gt = self._geotiff
@@ -529,50 +524,6 @@ class AsyncGeoTIFF:
             f"width={gt.width}, height={gt.height}, "
             f"crs={self._crs_epsg})"
         )
-
-
-async def _open_many(
-    uris: Sequence[str],
-    *,
-    store: Any = None,
-    prefetch: int = 32768,
-    cache: bool = True,
-    meta_overrides: MetaOverrides | None = None,
-    **store_kwargs: Any,
-) -> list[AsyncGeoTIFF]:
-    """Open multiple GeoTIFFs concurrently with a shared store."""
-    uris = list(uris)
-    if not uris:
-        return []
-    if store is None:
-        bucket = _bucket_url(uris[0])
-        mismatched = [u for u in uris[1:] if _bucket_url(u) != bucket]
-        if mismatched:
-            raise ValueError(
-                f"All URIs must belong to the same bucket/host when using a "
-                f"shared store. First URI resolves to {bucket!r}, but these "
-                f"do not: {mismatched}"
-            )
-        store = _build_store(uris[0], **store_kwargs)
-    # store_kwargs is forwarded as well as consumed above: plain TIFF opens
-    # ignore it once `store` is set, but the VRT and DIMAP branches need it to
-    # build their own obstore for the descriptor fetch (the async-tiff and
-    # obstore store types are not interchangeable).
-    return list(
-        await asyncio.gather(
-            *(
-                AsyncGeoTIFF.open(
-                    u,
-                    store=store,
-                    prefetch=prefetch,
-                    cache=cache,
-                    meta_overrides=meta_overrides,
-                    **store_kwargs,
-                )
-                for u in uris
-            )
-        )
-    )
 
 
 @overload
@@ -641,6 +592,43 @@ async def open(
         cache=cache,
         meta_overrides=meta_overrides,
         **store_kwargs,
+    )
+
+
+async def _open_many(
+    uris: Sequence[str],
+    *,
+    store: Any = None,
+    prefetch: int = 32768,
+    cache: bool = True,
+    meta_overrides: MetaOverrides | None = None,
+    **store_kwargs: Any,
+) -> list[AsyncGeoTIFF]:
+    """Open multiple GeoTIFFs concurrently with a shared store."""
+    uris = list(uris)
+    if not uris:
+        return []
+    if store is None:
+        _require_same_bucket(uris, "using a shared store")
+        store = _build_store(uris[0], **store_kwargs)
+    # store_kwargs is forwarded as well as consumed above: plain TIFF opens
+    # ignore it once `store` is set, but the VRT and DIMAP branches need it to
+    # build their own obstore for the descriptor fetch (the async-tiff and
+    # obstore store types are not interchangeable).
+    return list(
+        await asyncio.gather(
+            *(
+                AsyncGeoTIFF.open(
+                    u,
+                    store=store,
+                    prefetch=prefetch,
+                    cache=cache,
+                    meta_overrides=meta_overrides,
+                    **store_kwargs,
+                )
+                for u in uris
+            )
+        )
     )
 
 
@@ -722,7 +710,6 @@ def _make_output_array(
     height: int,
     geotiff: GeoTIFF | _CrsNodata,
 ) -> RasterArray:
-    """Construct a RasterArray for rastera output."""
     return RasterArray(
         data=data,
         mask=None,
@@ -806,6 +793,14 @@ def _coerce_nodata(
         info = np.iinfo(dt)
         return None if not info.min <= nodata <= info.max else int(nodata)
     return float(nodata)
+
+
+def _same_nodata(resolved: int | float | None, declared: float | None) -> bool:
+    """``==``, but NaN equals itself: a float raster's NaN sentinel comes
+    through ``_coerce_nodata`` unchanged and is still the file's own value."""
+    if resolved is None or declared is None:
+        return resolved is declared
+    return resolved == declared or (math.isnan(resolved) and math.isnan(declared))
 
 
 class MetaOverrides(TypedDict, total=False):

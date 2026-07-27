@@ -1,8 +1,8 @@
 """Unit tests for pure geometry, parsing, and utility functions."""
 
-from pathlib import Path
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 from affine import Affine
 
@@ -11,10 +11,12 @@ from rastera.geo import (
     WindowOutOfRangeError,
     bounds_from_transform,
     compute_paste_slices,
+    ensure_bbox,
+    normalize_band_indices,
     transform_bbox,
+    validate_resolution,
     window_from_bbox,
 )
-from rastera.reader import _extract_key
 from tests.conftest import make_meta
 
 # ── BBox ──────────────────────────────────────────────────────────────────
@@ -32,26 +34,135 @@ class TestBBox:
         minx, miny, maxx, maxy = b
         assert (minx, miny, maxx, maxy) == (1, 2, 3, 4)
 
-    def test_intersect_overlap(self):
-        a = BBox(0, 0, 10, 10)
-        b = BBox(5, 5, 15, 15)
-        c = a.intersect(b)
-        assert c == BBox(5, 5, 10, 10)
+    @pytest.mark.parametrize(
+        ("a", "b", "expected"),
+        [
+            (BBox(0, 0, 10, 10), BBox(5, 5, 15, 15), BBox(5, 5, 10, 10)),
+            (BBox(0, 0, 5, 5), BBox(10, 10, 15, 15), None),
+            (BBox(0, 0, 5, 5), BBox(5, 0, 10, 5), None),  # touching edge = no area
+            (BBox(0, 0, 10, 10), BBox(2, 2, 8, 8), BBox(2, 2, 8, 8)),
+        ],
+    )
+    def test_intersect(self, a: BBox, b: BBox, expected: BBox | None):
+        assert a.intersect(b) == expected
 
-    def test_intersect_no_overlap(self):
-        a = BBox(0, 0, 5, 5)
-        b = BBox(10, 10, 15, 15)
-        assert a.intersect(b) is None
 
-    def test_intersect_edge_touch(self):
-        a = BBox(0, 0, 5, 5)
-        b = BBox(5, 0, 10, 5)
-        assert a.intersect(b) is None  # touching edge = no area
+# ── ensure_bbox ───────────────────────────────────────────────────────────
 
-    def test_intersect_contained(self):
-        outer = BBox(0, 0, 10, 10)
-        inner = BBox(2, 2, 8, 8)
-        assert outer.intersect(inner) == inner
+
+class TestEnsureBbox:
+    """Every consumer takes min()/max() of the corners, so an inverted box used
+    to be silently swapped into a different — often enormous — extent."""
+
+    def test_tuple_and_bbox_agree(self):
+        assert ensure_bbox((0, 1, 2, 3)) == BBox(0, 1, 2, 3)
+        b = BBox(0, 1, 2, 3)
+        assert ensure_bbox(b) is b
+
+    def test_antimeridian_bbox_rejected(self):
+        """A GeoJSON dateline bbox: min()/max() turned this into the
+        complementary 340 degrees of longitude, 17x the requested width."""
+        with pytest.raises(ValueError, match="minx < maxx"):
+            ensure_bbox((170.0, -10.0, -170.0, 10.0))
+
+    @pytest.mark.parametrize(
+        "bbox",
+        [
+            (10.0, 0.0, 5.0, 10.0),  # minx > maxx
+            (0.0, 10.0, 10.0, 5.0),  # miny > maxy
+            (5.0, 0.0, 5.0, 10.0),  # zero width
+            (0.0, 5.0, 10.0, 5.0),  # zero height
+        ],
+    )
+    def test_degenerate_rejected(self, bbox: tuple[float, float, float, float]):
+        with pytest.raises(ValueError, match="minx < maxx"):
+            ensure_bbox(bbox)
+
+    def test_already_a_bbox_is_still_validated(self):
+        """The isinstance short-circuit used to skip the checks entirely."""
+        with pytest.raises(ValueError, match="minx < maxx"):
+            ensure_bbox(BBox(10.0, 0.0, 5.0, 10.0))
+
+    @pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+    def test_non_finite_rejected(self, bad: float):
+        with pytest.raises(ValueError, match="finite"):
+            ensure_bbox((0.0, 0.0, bad, 10.0))
+
+    def test_internal_constructions_are_not_validated(self):
+        """Only caller-supplied bboxes route through ensure_bbox; BBox itself
+        stays permissive because intersect() builds empty boxes on purpose."""
+        assert BBox(10, 0, 5, 10).width == -5
+
+
+# ── normalize_band_indices ────────────────────────────────────────────────
+
+
+class TestNormalizeBandIndices:
+    def test_none_selects_all(self):
+        assert normalize_band_indices(None, 3) == [0, 1, 2]
+
+    def test_converts_to_zero_based(self):
+        assert normalize_band_indices([1, 3], 3) == [0, 2]
+
+    def test_empty_rejected(self):
+        with pytest.raises(ValueError, match="must not be empty"):
+            normalize_band_indices([], 3)
+
+    @pytest.mark.parametrize("bad", [0, -1])
+    def test_below_one_rejected(self, bad: int):
+        with pytest.raises(ValueError, match="1-based"):
+            normalize_band_indices([bad], 3)
+
+    def test_above_count_rejected(self):
+        with pytest.raises(ValueError, match="out of range"):
+            normalize_band_indices([4], 3)
+
+    def test_float_rejected(self):
+        """1.9 passed the range checks and subtracted to 0.899..., which died
+        several frames later inside NumPy's indexing."""
+        with pytest.raises(ValueError, match="must be integers"):
+            normalize_band_indices([1.9, 2.1], 4)  # type: ignore[list-item]
+
+    def test_whole_float_also_rejected(self):
+        """2.0 would happen to work; accepting it makes the contract fuzzy."""
+        with pytest.raises(ValueError, match="must be integers"):
+            normalize_band_indices([2.0], 4)  # type: ignore[list-item]
+
+    def test_numpy_integer_accepted(self):
+        """np.integer is not int to a type checker, but it indexes fine and
+        arrives this way from any array-derived band list."""
+        assert normalize_band_indices([np.int64(2)], 3) == [1]  # type: ignore[list-item]
+
+    def test_bool_rejected(self):
+        """bool is an int subclass, so True would silently mean "first band"."""
+        with pytest.raises(ValueError, match="must be integers"):
+            normalize_band_indices([True], 3)
+
+
+# ── validate_resolution ───────────────────────────────────────────────────
+
+
+class TestValidateResolution:
+    def test_positive_accepted(self):
+        validate_resolution(10.0)
+        validate_resolution(1)
+
+    @pytest.mark.parametrize(
+        ("bad", "match"),
+        [
+            (0.0, "> 0"),  # ZeroDivisionError deep in _grid_for_bbox
+            (-1.0, "> 0"),  # silent 1x1 array with a mirrored transform
+            (float("nan"), "> 0"),  # "cannot convert float NaN to integer"
+            (float("inf"), "> 0"),  # silent 1x1 array with an inf transform
+        ],
+    )
+    def test_rejected(self, bad: float, match: str):
+        with pytest.raises(ValueError, match=match):
+            validate_resolution(bad)
+
+    def test_non_number_rejected(self):
+        with pytest.raises(ValueError, match="must be a number"):
+            validate_resolution("10")  # type: ignore[arg-type]
 
 
 # ── Window ────────────────────────────────────────────────────────────────
@@ -208,40 +319,6 @@ class TestComputePasteSlices:
         assert result is None
 
 
-# ── _extract_key ─────────────────────────────────────────────────────────
-
-
-class TestExtractKey:
-    def test_s3_scheme(self):
-        assert _extract_key("s3://my-bucket/path/to/file.tif") == "path/to/file.tif"
-
-    def test_virtual_hosted_style(self):
-        assert (
-            _extract_key(
-                "https://my-bucket.s3.us-west-2.amazonaws.com/path/to/file.tif"
-            )
-            == "path/to/file.tif"
-        )
-
-    def test_path_style(self):
-        assert (
-            _extract_key(
-                "https://s3.us-west-2.amazonaws.com/my-bucket/path/to/file.tif"
-            )
-            == "path/to/file.tif"
-        )
-
-    def test_local_path(self, tmp_path: Path):
-        f = tmp_path / "file.tif"
-        f.write_bytes(b"")
-        assert _extract_key(str(f)) == "file.tif"
-
-    def test_file_scheme(self, tmp_path: Path):
-        f = tmp_path / "file.tif"
-        f.write_bytes(b"")
-        assert _extract_key(f.as_uri()) == "file.tif"
-
-
 # ── transform_bbox ───────────────────────────────────────────────────────
 
 
@@ -256,8 +333,22 @@ class TestTransformBbox:
         the finite subset, under-covering the request. A grid rounded outward
         past the pole (ceil in _grid_for_bbox) reaches this.
         """
-        with pytest.raises(ValueError, match="inf/nan"):
+        with pytest.raises(ValueError, match="area of use"):
             transform_bbox(BBox(0.0, 80.0, 10.0, 95.0), 4326, 32632)
+
+    def test_interior_pole_reaches_90(self):
+        """The NSIDC EPSG:3413 sea-ice grid contains the north pole as an
+        interior point; hulling densified *edges* tops out near lat 56.
+        """
+        result = transform_bbox(BBox(-3850000, -5350000, 3750000, 5850000), 3413, 4326)
+        assert result.maxy == pytest.approx(90.0)  # type: ignore[reportUnknownMemberType]
+        assert result.minx == pytest.approx(-180.0)  # type: ignore[reportUnknownMemberType]
+        assert result.maxx == pytest.approx(180.0)  # type: ignore[reportUnknownMemberType]
+
+    def test_antimeridian_crossing_raises(self):
+        """UTM zone 60N straddles the dateline; its 4326 envelope wraps."""
+        with pytest.raises(ValueError, match="antimeridian"):
+            transform_bbox(BBox(166021, 0, 833978, 9329005), 32601, 4326)
 
     def test_roundtrip(self):
         bbox = BBox(10.0, 50.0, 11.0, 51.0)  # lon/lat

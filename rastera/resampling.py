@@ -1,7 +1,10 @@
 """Pixel resampling for resolution changes and reprojection.
 
-Exposes a single public entry point :func:`resample`, which dispatches on a
-``method`` argument to one of three implementations:
+:func:`resample` is the entry point, dispatching on ``method`` to one of three
+implementations. :func:`validate_resampling` is public alongside it so callers
+with a fast path that never reaches :func:`resample` — ``AsyncGeoTIFF.read``'s
+native read, ``merge`` — can still reject an unknown method at their own
+boundary rather than silently ignoring it.
 
 - ``"nearest"`` — nearest-neighbor, memory-tight 1D/2D index path.
 - ``"bilinear"`` — separable linear kernel; 2×2 at upsampling/identity,
@@ -30,6 +33,7 @@ from . import config
 from .config import WarpStrategy
 
 ResamplingMethod = Literal["nearest", "bilinear", "cubic"]
+_RESAMPLING_METHODS = ("nearest", "bilinear", "cubic")
 
 # Local downsample scale above which the ``"auto"`` strategy takes the two-pass
 # cross-CRS route.  Set conservatively: benchmarking cross-CRS warps across
@@ -40,6 +44,10 @@ ResamplingMethod = Literal["nearest", "bilinear", "cubic"]
 # slower).  Below the threshold (and at scale <= 1 — upsampling — where the
 # two-pass split has no benefit) the single-pass warp is used.
 _AUTO_SCALE_THRESHOLD = 2.0
+
+# Kernel half-width in source pixels at unit scale: bilinear samples 2x2, cubic
+# 4x4.  Downsampling widens it (see the anti-aliasing expansion below).
+_BASE_RADIUS = {"bilinear": 1, "cubic": 2}
 
 
 def resample(
@@ -85,28 +93,19 @@ def resample(
     behave identically across sentinel types.
 
     Args:
-        src_array: (bands, h, w) source data.
-        src_transform: Affine pixel→world for source.
-        dst_transform: Affine pixel→world for destination.
-        dst_width: Output width in pixels.
-        dst_height: Output height in pixels.
-        nodata: Fill value for out-of-bounds pixels. Also drives kernel
-            renormalization for bilinear/cubic when set.
-        transformer: pyproj Transformer (target CRS → source CRS).
-            ``None`` if same CRS.
-        method: One of ``"nearest"``, ``"bilinear"``, ``"cubic"``.
+        src_array: ``(bands, h, w)``.
+        src_transform: Pixel→world for the source; *dst_transform* likewise for
+            the destination.
+        nodata: Fill for out-of-bounds pixels, and the sentinel the
+            bilinear/cubic renormalization keys off.
+        transformer: Target CRS → source CRS; ``None`` if same CRS.
         warp_strategy: How a cross-CRS bilinear/cubic warp is carried out.
             ``None`` (default) reads the process-wide setting from
             :func:`rastera.set_warp_strategy`; pass an explicit value to
-            override it for this call (useful in tests). See that function for
-            the ``"auto"`` / ``"single_pass"`` semantics. No effect on nearest
+            override it for this call (useful in tests). No effect on nearest
             (any CRS/scale), same-CRS, or upsampling.
     """
-    if method not in ("nearest", "bilinear", "cubic"):
-        raise ValueError(
-            f"Unknown resampling method {method!r}; "
-            "expected 'nearest', 'bilinear', or 'cubic'."
-        )
+    validate_resampling(method)
     if warp_strategy is None:
         warp_strategy = config._warp_strategy
 
@@ -138,6 +137,15 @@ def resample(
         method,
         warp_strategy,
     )
+
+
+def validate_resampling(method: str) -> None:
+    """Reject an unknown resampling method."""
+    if method not in _RESAMPLING_METHODS:
+        expected = ", ".join(repr(m) for m in _RESAMPLING_METHODS)
+        raise ValueError(
+            f"Unknown resampling method {method!r}; expected one of {expected}."
+        )
 
 
 def _resample_nearest(
@@ -219,7 +227,7 @@ def _resample_kernel(
     nodata: int | float | None,
     transformer: Transformer | None,
     method: Literal["bilinear", "cubic"],
-    warp_strategy: WarpStrategy = "single_pass",
+    warp_strategy: WarpStrategy,
 ) -> np.ndarray:
     """Bilinear or cubic resampling with GDAL-style nodata renormalization
     and anti-aliasing kernel expansion for downsampling.
@@ -255,7 +263,6 @@ def _resample_kernel(
         raise NotImplementedError(
             f"{method} resampling does not support complex dtype {src_array.dtype}"
         )
-    n_bands, h, w = src_array.shape
 
     # NaN-sentinel nodata needs `np.isnan` for detection (NaN != NaN means
     # `==` and `!=` both miss it) and zeroing-out before multiply (NaN * 0
@@ -341,9 +348,8 @@ def _resample_kernel(
     # upsampling (scale < 1) the kernel keeps its default radius.
     x_filter = max(1.0, x_scale_local)
     y_filter = max(1.0, y_scale_local)
-    base_radius = 1 if method == "bilinear" else 2
-    n_x_radius = math.ceil(base_radius * x_filter)
-    n_y_radius = math.ceil(base_radius * y_filter)
+    n_x_radius = math.ceil(_BASE_RADIUS[method] * x_filter)
+    n_y_radius = math.ceil(_BASE_RADIUS[method] * y_filter)
     x_offsets = tuple(range(1 - n_x_radius, n_x_radius + 1))
     y_offsets = tuple(range(1 - n_y_radius, n_y_radius + 1))
 
@@ -352,87 +358,19 @@ def _resample_kernel(
     wy = weights_fn(frac_row, y_offsets, y_filter)
 
     # --- Accumulate kernel contributions.
-    per_dim_ok: np.ndarray | None = None
-    if coords_2d:
-        # Non-separable 2-D loop for the cross-CRS warp: the source sampling
-        # grid is not axis-aligned with the output, so weights and indices
-        # are full 2-D and cannot be reused across rows/columns.
-        acc_val = np.zeros((n_bands, dst_height, dst_width), dtype=np.float64)
-        acc_wt: np.ndarray | None = None
-        row_valid_counts: np.ndarray | None = None
-        col_valid_counts: np.ndarray | None = None
-        if nodata is not None:
-            acc_wt = np.zeros((dst_height, dst_width), dtype=np.float64)
-            if method == "cubic":
-                # int32 (not int8): a single axis can have >127 kernel taps
-                # under heavy anisotropic downsampling, which would overflow
-                # int8 and spuriously fail the >=2 gate.
-                row_valid_counts = np.zeros(
-                    (len(y_offsets), dst_height, dst_width), dtype=np.int32
-                )
-                col_valid_counts = np.zeros(
-                    (len(x_offsets), dst_height, dst_width), dtype=np.int32
-                )
-
-        for i, dy in enumerate(y_offsets):
-            src_row_idx = base_row + dy
-            safe_row = np.clip(src_row_idx, 0, h - 1)
-            in_bounds_row = (src_row_idx >= 0) & (src_row_idx < h)
-            wy_i = wy[i]
-            for j, dx in enumerate(x_offsets):
-                src_col_idx = base_col + dx
-                safe_col = np.clip(src_col_idx, 0, w - 1)
-                in_bounds_col = (src_col_idx >= 0) & (src_col_idx < w)
-                wx_j = wx[j]
-
-                sample = src_array[:, safe_row, safe_col]  # (B, H, W)
-                w_xy = wy_i * wx_j  # (H, W)
-                in_bounds = in_bounds_row & in_bounds_col  # (H, W)
-
-                if nodata is not None:
-                    # Pixel is valid only if all bands are non-nodata AND the
-                    # tap is in-bounds.  NaN-sentinel: use `np.isnan` and
-                    # zero-out NaN samples before the multiply.
-                    if nodata_is_nan:
-                        is_nodata = np.isnan(sample)
-                        sample = np.where(is_nodata, 0.0, sample)
-                    else:
-                        is_nodata = sample == nodata
-                    valid = ~is_nodata.any(axis=0) & in_bounds  # (H, W)
-                    contrib = w_xy * valid  # (H, W), bool→float promotion
-                    acc_val += sample * contrib  # broadcast (B,H,W) * (H,W)
-                    assert acc_wt is not None
-                    acc_wt += contrib
-                    if method == "cubic":
-                        assert row_valid_counts is not None
-                        assert col_valid_counts is not None
-                        row_valid_counts[i] += valid
-                        col_valid_counts[j] += valid
-                else:
-                    # No nodata: clamped (edge-replicated) samples, no renorm.
-                    acc_val += sample * w_xy
-
-        if nodata is not None and method == "cubic":
-            assert row_valid_counts is not None
-            assert col_valid_counts is not None
-            per_dim_ok = np.asarray(
-                (row_valid_counts >= 2).any(axis=0)
-                & (col_valid_counts >= 2).any(axis=0)
-            )
-    else:
-        # Same-CRS: separable two-pass, O(taps_x + taps_y).
-        acc_val, acc_wt, per_dim_ok = _accumulate_separable(
-            src_array,
-            base_col,
-            base_row,
-            wx,
-            wy,
-            x_offsets,
-            y_offsets,
-            nodata,
-            nodata_is_nan,
-            method,
-        )
+    accumulate = _accumulate_2d if coords_2d else _accumulate_separable
+    acc_val, acc_wt, per_dim_ok = accumulate(
+        src_array,
+        base_col,
+        base_row,
+        wx,
+        wy,
+        x_offsets,
+        y_offsets,
+        nodata,
+        nodata_is_nan,
+        method,
+    )
 
     return _finalize_kernel(
         acc_val,
@@ -486,6 +424,13 @@ def _validate_dtype_nodata(dtype: np.dtype, nodata: int | float | None) -> None:
             f"nodata=NaN cannot be represented in {dtype}; pass a finite "
             f"sentinel or nodata=None"
         )
+    if math.isinf(nodata) or nodata != int(nodata):
+        # A fractional sentinel matches no pixel and lands differently per
+        # method — nearest truncates it on the cast, the kernels round it.
+        raise ValueError(
+            f"nodata={nodata!r} is not an integer and so cannot be represented "
+            f"in {dtype}; no pixel can equal it"
+        )
     if dtype.kind == "b":
         return  # np.iinfo has no bool entry, and there is no range to check
     info = np.iinfo(dtype)
@@ -493,6 +438,14 @@ def _validate_dtype_nodata(dtype: np.dtype, nodata: int | float | None) -> None:
         raise ValueError(
             f"nodata={nodata!r} is outside the range of {dtype} "
             f"[{info.min}, {info.max}]; no pixel can equal it"
+        )
+    # The kernels accumulate in float64 and write the sentinel back through
+    # ``float(nodata)``, so a 64-bit sentinel past the mantissa comes back
+    # altered — bilinear marks nodata with a value nearest never produces.
+    if abs(int(nodata)) > 2**53:
+        raise ValueError(
+            f"nodata={nodata!r} exceeds 2**53 and is not exactly representable "
+            f"in the float64 the resampling kernels use; pick a smaller sentinel"
         )
 
 
@@ -509,25 +462,21 @@ def _coarse_grid_transform(
     dst_transform: Affine,
     src_transform: Affine,
     transformer: Transformer,
-    step: int = _WARP_GRID_STEP,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Transform dst pixels to src pixel coords via coarse-grid interpolation.
 
     Instead of transforming every destination pixel through pyproj, transforms a
-    coarse grid (every ``step`` pixels) and bilinearly interpolates the rest.
-
-    Returns ``(src_col_f, src_row_f)`` as float arrays of shape
-    ``(dst_height, dst_width)``.
+    coarse grid (every ``_WARP_GRID_STEP`` pixels) and bilinearly interpolates
+    the rest.
     """
-    # Build coarse grid nodes, always including the last pixel.
-    coarse_cols = np.arange(0, dst_width, step, dtype=np.float64)
+    # The last pixel is always a node, so interpolation never extrapolates.
+    coarse_cols = np.arange(0, dst_width, _WARP_GRID_STEP, dtype=np.float64)
     if coarse_cols[-1] < dst_width - 1:
         coarse_cols = np.append(coarse_cols, dst_width - 1)
-    coarse_rows = np.arange(0, dst_height, step, dtype=np.float64)
+    coarse_rows = np.arange(0, dst_height, _WARP_GRID_STEP, dtype=np.float64)
     if coarse_rows[-1] < dst_height - 1:
         coarse_rows = np.append(coarse_rows, dst_height - 1)
 
-    # Transform coarse grid: dst pixel centers → world → source CRS → source pixels
     cc, cr = np.meshgrid(coarse_cols + 0.5, coarse_rows + 0.5)
     cwx = float(dst_transform.a) * cc + float(dst_transform.c)
     cwy = float(dst_transform.e) * cr + float(dst_transform.f)
@@ -619,6 +568,99 @@ def _cubic_weights(
         weights.append(np.where(d < 1.0, w_inner, np.where(d < 2.0, w_outer, 0.0)))
     out = np.stack(weights)
     return out / out.sum(axis=0, keepdims=True)
+
+
+def _accumulate_2d(
+    src_array: np.ndarray,
+    base_col: np.ndarray,
+    base_row: np.ndarray,
+    wx: np.ndarray,
+    wy: np.ndarray,
+    x_offsets: Sequence[int],
+    y_offsets: Sequence[int],
+    nodata: int | float | None,
+    nodata_is_nan: bool,
+    method: Literal["bilinear", "cubic"],
+) -> tuple[np.ndarray, np.ndarray | None, np.ndarray | None]:
+    """Non-separable 2-D kernel accumulation for the cross-CRS warp.
+
+    The source sampling grid is not axis-aligned with the output, so weights
+    and indices are full 2-D and cannot be reused across rows or columns —
+    hence ``O(taps_x · taps_y)`` here against :func:`_accumulate_separable`'s
+    ``O(taps_x + taps_y)``.
+
+    ``base_col``/``base_row`` and ``wx``/``wy`` are 2-D over the output grid,
+    unlike the 1-D per-axis arrays the separable path takes.
+
+    Returns ``(acc_val, acc_wt, per_dim_ok)`` for :func:`_finalize_kernel`.
+    """
+    n_bands, h, w = src_array.shape
+    dst_height, dst_width = base_row.shape
+
+    per_dim_ok: np.ndarray | None = None
+    acc_val = np.zeros((n_bands, dst_height, dst_width), dtype=np.float64)
+    acc_wt: np.ndarray | None = None
+    row_valid_counts: np.ndarray | None = None
+    col_valid_counts: np.ndarray | None = None
+    if nodata is not None:
+        acc_wt = np.zeros((dst_height, dst_width), dtype=np.float64)
+        if method == "cubic":
+            # int32 (not int8): a single axis can have >127 kernel taps
+            # under heavy anisotropic downsampling, which would overflow
+            # int8 and spuriously fail the >=2 gate.
+            row_valid_counts = np.zeros(
+                (len(y_offsets), dst_height, dst_width), dtype=np.int32
+            )
+            col_valid_counts = np.zeros(
+                (len(x_offsets), dst_height, dst_width), dtype=np.int32
+            )
+
+    for i, dy in enumerate(y_offsets):
+        src_row_idx = base_row + dy
+        safe_row = np.clip(src_row_idx, 0, h - 1)
+        in_bounds_row = (src_row_idx >= 0) & (src_row_idx < h)
+        wy_i = wy[i]
+        for j, dx in enumerate(x_offsets):
+            src_col_idx = base_col + dx
+            safe_col = np.clip(src_col_idx, 0, w - 1)
+            in_bounds_col = (src_col_idx >= 0) & (src_col_idx < w)
+            wx_j = wx[j]
+
+            sample = src_array[:, safe_row, safe_col]  # (B, H, W)
+            w_xy = wy_i * wx_j  # (H, W)
+            in_bounds = in_bounds_row & in_bounds_col  # (H, W)
+
+            if nodata is not None:
+                # Pixel is valid only if all bands are non-nodata AND the
+                # tap is in-bounds.  NaN-sentinel: use `np.isnan` and
+                # zero-out NaN samples before the multiply.
+                if nodata_is_nan:
+                    is_nodata = np.isnan(sample)
+                    sample = np.where(is_nodata, 0.0, sample)
+                else:
+                    is_nodata = sample == nodata
+                valid = ~is_nodata.any(axis=0) & in_bounds  # (H, W)
+                contrib = w_xy * valid  # (H, W), bool→float promotion
+                acc_val += sample * contrib  # broadcast (B,H,W) * (H,W)
+                assert acc_wt is not None
+                acc_wt += contrib
+                if method == "cubic":
+                    assert row_valid_counts is not None
+                    assert col_valid_counts is not None
+                    row_valid_counts[i] += valid
+                    col_valid_counts[j] += valid
+            else:
+                # No nodata: clamped (edge-replicated) samples, no renorm.
+                acc_val += sample * w_xy
+
+    if nodata is not None and method == "cubic":
+        assert row_valid_counts is not None
+        assert col_valid_counts is not None
+        per_dim_ok = np.asarray(
+            (row_valid_counts >= 2).any(axis=0) & (col_valid_counts >= 2).any(axis=0)
+        )
+
+    return acc_val, acc_wt, per_dim_ok
 
 
 def _accumulate_separable(
@@ -886,7 +928,6 @@ def _resample_two_pass(
     runs and how its output relates to the single-pass warp.
     """
     n_bands, h, w = src_array.shape
-    base_radius = 1 if method == "bilinear" else 2
 
     # Per-axis: only ever downsample (scale <= 1 axes keep source resolution).
     sx = max(1.0, x_scale)
@@ -901,7 +942,7 @@ def _resample_two_pass(
 
     # Halo (intermediate pixels) >= Pass A's edge reach, plus one for the
     # cubic gate's slightly longer reach at nodata boundaries.
-    halo = base_radius + 1
+    halo = _BASE_RADIUS[method] + 1
     inter_w = core_w + 2 * halo
     inter_h = core_h + 2 * halo
     origin_x = float(src_transform.c) - halo * inter_a
@@ -954,5 +995,4 @@ def _kernel_halo(method: ResamplingMethod, scale: float) -> int:
     """
     if method == "nearest":
         return 0
-    base_radius = 1 if method == "bilinear" else 2
-    return math.ceil(base_radius * max(1.0, scale))
+    return math.ceil(_BASE_RADIUS[method] * max(1.0, scale))

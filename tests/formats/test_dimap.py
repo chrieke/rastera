@@ -341,7 +341,6 @@ class TestSingleGroupDIMAP:
         with pytest.raises(ValueError, match="Raster_Index_List"):
             _parse_dimap_xml(two_group)
 
-    @pytest.mark.asyncio
     async def test_full_read_via_mocked_tiles(self):
         """End-to-end open + window read: route the PHR fixture through
         ``_maybe_open_dimap`` (the production entry point), then stitch
@@ -632,7 +631,6 @@ class TestDIMAPRead:
         ds._get_tile = _get_tile  # type: ignore[assignment]
         return ds
 
-    @pytest.mark.asyncio
     async def test_single_tile_single_group(self):
         """Window inside tile (1,1); only RGB bands → one tile opened."""
         opened: list[tuple[int, int, int]] = []
@@ -656,7 +654,6 @@ class TestDIMAPRead:
         assert data.shape == (3, 40, 50)
         assert opened == [(0, 1, 1)]
 
-    @pytest.mark.asyncio
     async def test_cross_group_band_order_preserved(self):
         """band_indices=[5, 0] selects band 6 (group 1, src_band 3) then
         band 1 (group 0, src_band 1). Output must be [DB, R] — NOT sorted
@@ -687,7 +684,6 @@ class TestDIMAPRead:
         # out[1] = band 1 = group 0, source_band 1 → tag 1
         np.testing.assert_array_equal(data[1], 1)
 
-    @pytest.mark.asyncio
     async def test_cross_tile_stitch(self):
         """Window that straddles the seam between tile (1,1) and (1,2)
         for a single group → two tile reads, correctly pasted."""
@@ -714,7 +710,6 @@ class TestDIMAPRead:
         np.testing.assert_array_equal(data[0, :, :20], 10)
         np.testing.assert_array_equal(data[0, :, 20:], 20)
 
-    @pytest.mark.asyncio
     async def test_full_extent_all_groups_sequential(self):
         """Full-extent read across both groups (4 tiles × 2 groups = 8 tile
         reads) must complete and return correctly stitched output. Tracks
@@ -789,7 +784,6 @@ class TestDIMAPRead:
         # NED band 5 (group 1, src_band 3) at tile (1,1) → 1*1000 + 100 + 10 + 3 = 1113.
         assert data[5, 0, 0] == 1113
 
-    @pytest.mark.asyncio
     async def test_window_past_mosaic_edge_fills_nodata(self):
         """Window extending past the mosaic's right edge → the out-of-extent
         pixels must be filled with nodata (0 by default)."""
@@ -812,7 +806,6 @@ class TestDIMAPRead:
         np.testing.assert_array_equal(data[0, :, :50], 42)  # inside mosaic
         np.testing.assert_array_equal(data[0, :, 50:], 0)  # nodata fill
 
-    @pytest.mark.asyncio
     async def test_read_rejects_use_overviews(self):
         """DIMAP per-tile overviews cannot safely mix across tiles; the
         public ``read`` must refuse rather than silently produce shape-
@@ -827,7 +820,6 @@ class TestDIMAPRead:
         with pytest.raises(NotImplementedError, match="use_overviews"):
             await ds.read(use_overviews=True)
 
-    @pytest.mark.asyncio
     async def test_read_native_rejects_overview(self):
         ds = self._make_ds(
             lambda g, r, c: _mock_tile_ds(
@@ -839,7 +831,6 @@ class TestDIMAPRead:
         with pytest.raises(NotImplementedError, match="overview"):
             await ds._read_native(overview=MagicMock())
 
-    @pytest.mark.asyncio
     async def test_tile_opens_are_single_flight(self):
         """Two reads that both touch tile (1,1) must share one tile open
         across the dataset's lifetime — otherwise every read re-fetches
@@ -893,7 +884,6 @@ class TestDetection:
     """``_maybe_open_dimap`` is the sniff-hook used by ``AsyncGeoTIFF.open``
     to route recognized ``.xml`` descriptors to the DIMAP reader."""
 
-    @pytest.mark.asyncio
     async def test_returns_dataset_for_dimap_xml(self):
         with (
             patch(
@@ -906,7 +896,6 @@ class TestDetection:
         assert isinstance(ds, _DIMAPDataset)
         assert ds.count == 6
 
-    @pytest.mark.asyncio
     async def test_returns_none_for_non_dimap_xml(self):
         """Any other .xml (e.g. STAC item, sidecar, xmp) falls through to
         the normal TIFF open path — which surfaces the real "not a TIFF"
@@ -917,7 +906,6 @@ class TestDetection:
         ):
             assert await _maybe_open_dimap("s3://bucket/random.xml") is None
 
-    @pytest.mark.asyncio
     async def test_async_geotiff_open_routes_dimap_xml(self):
         """``.xml`` URIs go through the DIMAP branch inside
         ``AsyncGeoTIFF.open``; non-DIMAP XMLs fall through to the normal
@@ -932,7 +920,6 @@ class TestDetection:
             ds = await AsyncGeoTIFF.open("s3://bucket/DIM_PNEO.XML")
         assert isinstance(ds, _DIMAPDataset)
 
-    @pytest.mark.asyncio
     async def test_open_inherits_nodata_from_first_tile(self):
         """DIMAP XML carries no canonical nodata value, so the dataset's
         nodata must come from the first tile's TIFF nodata tag — not the
@@ -1016,7 +1003,6 @@ class TestCRSParsing:
 class TestReadDefaults:
     """Default-argument behaviour for ``_DIMAPDataset._read_native``."""
 
-    @pytest.mark.asyncio
     async def test_band_indices_none_reads_all_bands(self):
         """``band_indices=None`` must return one output band per virtual
         band, in layout order — not fall through to a zero-band read."""
@@ -1044,7 +1030,6 @@ class TestReadDefaults:
         for i, tag in enumerate(expected):
             np.testing.assert_array_equal(data[i], tag)
 
-    @pytest.mark.asyncio
     async def test_non_zero_nodata_fills_past_edge(self):
         """When the first tile carries a non-zero nodata (common for uint16
         Airbus products), pixels past the mosaic edge must be filled with
@@ -1078,14 +1063,6 @@ class TestReadDefaults:
 # ── concurrency: dimap ─────────────────────────────────────────────
 
 
-@pytest.fixture
-def _reset_dimap_concurrency():
-    yield
-    import rastera
-
-    rastera.set_concurrency(merge=1, vrt=1, dimap=1)
-
-
 class TestDIMAPConcurrencyInvariance:
     """Output across (group, tile) fan-out must match the n=1 baseline."""
 
@@ -1112,7 +1089,7 @@ class TestDIMAPConcurrencyInvariance:
         return ds
 
     @pytest.mark.parametrize("n", [1, 2, 8])
-    async def test_pixel_equal_across_n(self, n: int, _reset_dimap_concurrency: None):
+    async def test_pixel_equal_across_n(self, n: int):
         import rastera
 
         rastera.set_concurrency(dimap=1)
@@ -1136,7 +1113,6 @@ class TestTileCache:
     def _layout() -> _DIMAPLayout:
         return _parse_dimap_xml(PNEO_DIMAP)
 
-    @pytest.mark.asyncio
     async def test_failed_open_is_retried(self):
         """A rejected Future used to stay in the cache, so one transient error
         poisoned that tile for the dataset's lifetime."""
@@ -1157,7 +1133,6 @@ class TestTileCache:
             assert await ds._get_tile(0, 0, 0) is tile
         assert calls == 2
 
-    @pytest.mark.asyncio
     async def test_successful_open_is_cached(self):
         ds = _DIMAPDataset("s3://bucket/DIM_PNEO.XML", self._layout())
         tile = MagicMock()

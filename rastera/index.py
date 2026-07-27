@@ -20,8 +20,24 @@ from .reader import (
 from .store import (
     _build_store_with,
     _extract_key,
-    _obstore_key,
+    _require_same_bucket,
     _resolve_local_path,
+)
+
+# Written by build_index, read back by open_from_index; the geometry column is
+# added separately by GeoDataFrame.
+_INDEX_COLUMNS = (
+    "uri",
+    "header_bytes",
+    "crs_epsg",
+    "width",
+    "height",
+    "count",
+    "res_x",
+    "res_y",
+    "dtype",
+    "nodata",
+    "overviews",
 )
 
 
@@ -39,20 +55,25 @@ async def build_index(
     bytes needed for zero-network reconstruction via ``open_from_index``.
 
     Args:
-        uris: COG URIs to index.
-        store: Optional pre-constructed obstore store for connection reuse
-            (not the async-tiff store ``rastera.open`` takes).
-        prefetch: Number of header bytes to store per file (default 32KB).
-        concurrency: Maximum number of concurrent file opens (default 100).
-        **store_kwargs: Extra kwargs forwarded to ``obstore.store.from_url``.
+        store: A pre-constructed *obstore* store for connection reuse — not the
+            async-tiff store ``rastera.open`` takes.
+        prefetch: Header bytes stored per file.
+        **store_kwargs: Forwarded to ``obstore.store.from_url``.
 
     Returns:
-        A GeoDataFrame with geometry in EPSG:4326.
-        Write with ``gdf.to_parquet(path)`` for geoparquet.
+        A GeoDataFrame with geometry in EPSG:4326. Write with
+        ``gdf.to_parquet(path)`` for geoparquet.
+
+    Raises:
+        ValueError: If *uris* span more than one bucket/host. Index each
+            bucket separately and concatenate the frames.
     """
     uris = list(uris)
     if not uris:
         return _empty_geodataframe()
+    # Checked even when the caller supplies a store: the header cache below is
+    # keyed by object key, so two buckets mirroring a key path would collapse.
+    _require_same_bucket(uris, "building an index")
     obs = store if store is not None else _build_obstore(uris[0], **store_kwargs)
     sem = asyncio.Semaphore(concurrency)
 
@@ -60,7 +81,7 @@ async def build_index(
     # reads from memory instead of making a second network request.
     async def _fetch_header(uri: str) -> tuple[str, str, bytes]:
         async with sem:
-            key = _obstore_key(uri)
+            key = _extract_key(uri)
             hdr = bytes(await obstore.get_range_async(obs, key, start=0, end=prefetch))
             return uri, key, hdr
 
@@ -83,19 +104,7 @@ async def build_index(
 
     results = await asyncio.gather(*(_open_one(u, hdr) for u, _, hdr in fetched))
 
-    rows: dict[str, list[Any]] = {
-        "uri": [],
-        "header_bytes": [],
-        "crs_epsg": [],
-        "width": [],
-        "height": [],
-        "count": [],
-        "res_x": [],
-        "res_y": [],
-        "dtype": [],
-        "nodata": [],
-        "overviews": [],
-    }
+    rows: dict[str, list[Any]] = {c: [] for c in _INDEX_COLUMNS}
     geometries: list[Any] = []
 
     for src, hdr in results:
@@ -111,7 +120,6 @@ async def build_index(
         rows["dtype"].append(str(gt.dtype))
         rows["nodata"].append(src._nodata)
         rows["overviews"].append(json.dumps(src.overviews or []))
-        # Reproject bounds to EPSG:4326 for a consistent geometry column
         b = gt.bounds  # (minx, miny, maxx, maxy)
         geom = box(b[0], b[1], b[2], b[3])
         if src._crs_epsg is not None and src._crs_epsg != 4326:
@@ -139,17 +147,14 @@ async def open_from_index(
     files are never read.
 
     Args:
-        gdf_or_path: A GeoDataFrame or path to a ``.parquet`` geoparquet file.
-        bbox: Optional (minx, miny, maxx, maxy) spatial filter.
-        bbox_crs: EPSG code of the bbox. When omitted, the bbox is assumed
-            to be in the same CRS as the index geometry column (EPSG:4326).
-        store: Optional pre-constructed object store.
-        prefetch: Must match the prefetch value used when building the index.
-        concurrency: Maximum number of concurrent file opens (default 100).
-        **store_kwargs: Extra kwargs forwarded to ``obstore.store.from_url``.
+        bbox_crs: When omitted, the bbox is assumed to be in the same CRS as
+            the index geometry column (EPSG:4326).
+        prefetch: Must match the value used when building the index.
+        **store_kwargs: Forwarded to ``obstore.store.from_url``.
 
-    Returns:
-        List of AsyncGeoTIFF instances ready for ``.read()`` calls.
+    Raises:
+        ValueError: If the selected rows span more than one bucket/host.
+            Narrow the selection with *bbox* or open each bucket separately.
     """
     if isinstance(gdf_or_path, str):
         gdf = _read_geoparquet(gdf_or_path, bbox=bbox, bbox_crs=bbox_crs)
@@ -164,12 +169,15 @@ async def open_from_index(
     uris: list[str] = gdf["uri"].tolist()  # type: ignore[reportUnknownMemberType]
     headers: list[bytes] = gdf["header_bytes"].tolist()  # type: ignore[reportUnknownMemberType]
 
-    if store is not None:
-        shared_store = store
-        keys = [_extract_key(u) for u in uris]
-    else:
-        shared_store = _build_obstore(uris[0], **store_kwargs)
-        keys = [_obstore_key(u) for u in uris]
+    # An index may legitimately span buckets (rows concatenated from several
+    # builds), but a single open pass cannot: one store, and a header cache
+    # keyed by object key. Reject rather than serve one file's bytes as another's.
+    _require_same_bucket(uris, "opening from an index")
+
+    shared_store = (
+        store if store is not None else _build_obstore(uris[0], **store_kwargs)
+    )
+    keys = [_extract_key(u) for u in uris]
 
     cache = dict(zip(keys, headers))
     cached_store = HeaderCacheStore(shared_store, cache)
@@ -183,9 +191,6 @@ async def open_from_index(
             return await AsyncGeoTIFF.open(uri, store=cached_store, prefetch=prefetch)
 
     return list(await asyncio.gather(*(_open_one(u) for u in uris)))
-
-
-# ---- Internal helpers ----
 
 
 class HeaderCacheStore:
@@ -271,6 +276,9 @@ class HeaderCacheStore:
         return cast(list[bytes], results)
 
 
+# ---- Internal helpers ----
+
+
 def _read_geoparquet(
     path: str,
     bbox: tuple[float, float, float, float] | None = None,
@@ -309,7 +317,6 @@ def _filter_gdf(
     bbox: tuple[float, float, float, float],
     bbox_crs: int | None = None,
 ) -> gpd.GeoDataFrame:
-    """Filter a GeoDataFrame by bounding box intersection."""
     minx, miny, maxx, maxy = bbox
     query_geom = box(minx, miny, maxx, maxy)
 
@@ -323,25 +330,11 @@ def _filter_gdf(
 
 
 def _build_obstore(uri: str, **store_kwargs: Any) -> Any:
-    """Build an obstore-compatible object store for the given URI."""
     return _build_store_with(uri, obstore_from_url, **store_kwargs)
 
 
 def _empty_geodataframe() -> gpd.GeoDataFrame:
+    # A fresh list per column: one shared list would alias all eleven.
     return gpd.GeoDataFrame(
-        {
-            "uri": [],
-            "header_bytes": [],
-            "crs_epsg": [],
-            "width": [],
-            "height": [],
-            "count": [],
-            "res_x": [],
-            "res_y": [],
-            "dtype": [],
-            "nodata": [],
-            "overviews": [],
-        },
-        geometry=[],
-        crs="EPSG:4326",
+        {c: [] for c in _INDEX_COLUMNS}, geometry=[], crs="EPSG:4326"
     )

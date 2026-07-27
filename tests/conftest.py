@@ -3,7 +3,27 @@ from typing import Any
 from unittest.mock import MagicMock
 
 import numpy as np
+import pytest
 from affine import Affine
+from async_geotiff import RasterArray
+
+
+@pytest.fixture(autouse=True)
+def _clear_aws_region(monkeypatch: pytest.MonkeyPatch):
+    """Region resolution consults the environment, so a developer's AWS_REGION
+    would otherwise decide what the offline tests assert."""
+    monkeypatch.delenv("AWS_REGION", raising=False)
+    monkeypatch.delenv("AWS_DEFAULT_REGION", raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _reset_concurrency():
+    """Concurrency is process-wide, so a test that raises it would otherwise
+    decide how the next one fans out."""
+    yield
+    import rastera
+
+    rastera.set_concurrency(merge=1, vrt=1, dimap=1)
 
 
 def make_meta(
@@ -23,9 +43,18 @@ def make_mock_geotiff(
     tile_height: int = 256,
     dtype: np.dtype[Any] = np.dtype("u2"),
     nodata: float | None = None,
-    crs_epsg: int = 32632,
+    crs_epsg: int | None = 32632,
+    origin_x: float = 0.0,
+    origin_y: float | None = None,
 ) -> MagicMock:
-    """Build a mock async_geotiff.GeoTIFF."""
+    """Build a mock async_geotiff.GeoTIFF.
+
+    *origin_y* defaults to the north edge of a scene whose south edge sits on
+    zero, so the default grid is the familiar (0, 0, w*scale, h*scale) box.
+    """
+    if origin_y is None:
+        origin_y = height * scale
+
     gt = MagicMock()
     gt.width = width
     gt.height = height
@@ -35,18 +64,38 @@ def make_mock_geotiff(
     gt.tile_width = tile_width
     gt.tile_height = tile_height
 
-    transform = Affine(scale, 0, 0, 0, -scale, height * scale)
-    gt.transform = transform
+    gt.transform = Affine(scale, 0, origin_x, 0, -scale, origin_y)
     gt.res = (scale, scale)
 
     crs_mock = MagicMock()
     crs_mock.to_epsg.return_value = crs_epsg
     gt.crs = crs_mock
 
-    gt.bounds = (0, 0, width * scale, height * scale)
+    gt.bounds = (
+        origin_x,
+        origin_y - height * scale,
+        origin_x + width * scale,
+        origin_y,
+    )
     gt.overviews = []
 
     return gt
+
+
+def make_raster_array(
+    data: np.ndarray[Any, Any], transform: Affine, geotiff: Any
+) -> RasterArray:
+    """RasterArray over *data*, with width/height/count taken from its shape."""
+    return RasterArray(
+        data=data,
+        mask=None,
+        width=data.shape[2],
+        height=data.shape[1],
+        count=data.shape[0],
+        transform=transform,
+        _alpha_band_idx=None,
+        _geotiff=geotiff,
+    )
 
 
 def slicing_read(geotiff: Any, full: np.ndarray[Any, Any]):
@@ -55,7 +104,6 @@ def slicing_read(geotiff: Any, full: np.ndarray[Any, Any]):
     ``AsyncMock(return_value=...)`` ignores the window it was handed, which
     hides every bug about *which* pixels a read asked for.
     """
-    from async_geotiff import RasterArray
 
     async def _read(window: Any) -> Any:
         data = full[
@@ -63,16 +111,10 @@ def slicing_read(geotiff: Any, full: np.ndarray[Any, Any]):
             window.row_off : window.row_off + window.height,
             window.col_off : window.col_off + window.width,
         ]
-        return RasterArray(
-            data=data,
-            mask=None,
-            width=data.shape[2],
-            height=data.shape[1],
-            count=data.shape[0],
-            transform=geotiff.transform
-            * Affine.translation(window.col_off, window.row_off),
-            _alpha_band_idx=None,
-            _geotiff=geotiff,
+        return make_raster_array(
+            data,
+            geotiff.transform * Affine.translation(window.col_off, window.row_off),
+            geotiff,
         )
 
     return _read

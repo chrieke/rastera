@@ -7,9 +7,10 @@ Measures wall-clock time, peak RSS, output accuracy (pixel comparison),
 result consistency (mean, dtype, shape), and spatial alignment (transform,
 pixel size, bounds).
 
-Usage:
-    python -m benchmarks.read [--runs 5]
-    python -m benchmarks.merge [--runs 5]
+Usage (as scripts, not ``-m``: run_read/run_merge import this module as a
+sibling, which needs their own directory on sys.path):
+    python benchmarks/run_read.py [--runs 5]
+    python benchmarks/run_merge.py [--runs 5]
 """
 
 from __future__ import annotations
@@ -24,6 +25,7 @@ from pathlib import Path
 from statistics import median
 
 import numpy as np
+from _worker import _corner_hull
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 PYTHON = str(_PROJECT_ROOT / ".venv" / "bin" / "python")
@@ -74,15 +76,9 @@ def run_once(
         and library == "rastera"
         and "target_crs" in scenario
     ):
-        from pyproj import Transformer as ProjTransformer
-
         target_crs = scenario["target_crs"]
-        minx, miny, maxx, maxy = (float(x) for x in bbox_str.split(","))
-        t = ProjTransformer.from_crs(bbox_crs, target_crs, always_xy=True)
-        xs = [minx, maxx, minx, maxx]
-        ys = [miny, miny, maxy, maxy]
-        txs, tys = t.transform(xs, ys)
-        bbox_str = f"{min(txs)},{min(tys)},{max(txs)},{max(tys)}"
+        bbox = tuple(float(x) for x in bbox_str.split(","))
+        bbox_str = ",".join(str(v) for v in _corner_hull(bbox, bbox_crs, target_crs))
         bbox_crs = target_crs
 
     cmd = [
@@ -491,7 +487,6 @@ def run_benchmarks(scenarios: list[dict]):
         out(f"\n  Result: {'✅ AS EXPECTED' if passed else '❌ UNEXPECTED DIFFERENCE'}")
         out(f"  Reason: {reason}")
 
-        # Consistency
         if consistency:
             c = consistency
             out("\n  Result consistency:")
@@ -509,13 +504,11 @@ def run_benchmarks(scenarios: list[dict]):
                 f"shape: rastera={c['shape_ra']}  rasterio={c['shape_rio']}"
             )
 
-        # Spatial alignment
         if spatial_lines:
             out("\n  Spatial alignment:")
             for line in spatial_lines:
                 out(line)
 
-        # Border sanity
         if border_check:
             if border_check["ok"]:
                 out("\n  Border sanity: ✅ no suspect edges")
@@ -528,13 +521,11 @@ def run_benchmarks(scenarios: list[dict]):
                             f"is value {info['dominant_value']}"
                         )
 
-        # Accuracy
         if accuracy:
             out("\n  Accuracy:")
             for line in format_accuracy(accuracy):
                 out(line)
 
-        # Speed summary
         out(f"\n  Speed ({args.runs} run{'s' if args.runs > 1 else ''}):")
         for library in ["rastera", "rasterio"]:
             t = timings[library]
@@ -560,7 +551,6 @@ def run_benchmarks(scenarios: list[dict]):
             )
             out(f"    memory ratio (rasterio/rastera): {mem_ratio:.2f}x")
 
-        # Export paths
         if export_dir:
             out("\n  Exported to:")
             for path in export_paths:

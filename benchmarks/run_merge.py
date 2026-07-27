@@ -8,11 +8,14 @@ from __future__ import annotations
 
 from run import URI, URI_32TQM, run_benchmarks
 
+# UTM 33N strip spanning the seam between the two tiles.
+BBOX = "283838.0,4629464.7,326626.2,4648263.2"
+
 SCENARIOS = [
     {
         "name": "Merge: 2 tiles, same CRS, 10m resolution, snapped to raster grid (rastera default)",
         "mode": "merge",
-        "bbox": "283838.0,4629464.7,326626.2,4648263.2",
+        "bbox": BBOX,
         "bbox_crs": 32633,
         "target_crs": 32633,
         "target_resolution": 10.0,
@@ -26,7 +29,7 @@ SCENARIOS = [
     {
         "name": "Merge: 2 tiles, same CRS, 10m resolution, not snapped - raster matches bbox exactly (rasterio default)",
         "mode": "merge",
-        "bbox": "283838.0,4629464.7,326626.2,4648263.2",
+        "bbox": BBOX,
         "bbox_crs": 32633,
         "target_crs": 32633,
         "target_resolution": 10.0,
@@ -36,7 +39,7 @@ SCENARIOS = [
     {
         "name": "Merge: 2 tiles, same CRS, downsampled to 60m, no overviews (default)",
         "mode": "merge",
-        "bbox": "283838.0,4629464.7,326626.2,4648263.2",
+        "bbox": BBOX,
         "bbox_crs": 32633,
         "target_crs": 32633,
         "target_resolution": 60.0,
@@ -49,7 +52,7 @@ SCENARIOS = [
     {
         "name": "Merge: 2 tiles, same CRS, downsampled to 60m, via overviews (rastera)",
         "mode": "merge",
-        "bbox": "283838.0,4629464.7,326626.2,4648263.2",
+        "bbox": BBOX,
         "bbox_crs": 32633,
         "target_crs": 32633,
         "target_resolution": 60.0,

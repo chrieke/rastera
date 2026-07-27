@@ -1,7 +1,6 @@
 """Unit tests for internal band-stack VRT support."""
 
 import math
-from collections.abc import Iterator
 from pathlib import Path
 from typing import Any, TypedDict
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -23,7 +22,7 @@ from rastera.vrt import (
     _VRTBand,
     _VRTDataset,
 )
-from tests.conftest import make_mock_geotiff
+from tests.conftest import make_mock_geotiff, make_raster_array
 
 # ── fixtures / helpers ──────────────────────────────────────────────────────
 
@@ -79,16 +78,7 @@ def _read_result(
     geotiff.nodata = None
     geotiff.crs = MagicMock()
     geotiff.crs.to_epsg.return_value = 3006
-    return RasterArray(
-        data=data,
-        mask=None,
-        width=shape[2],
-        height=shape[1],
-        count=shape[0],
-        transform=Affine(1, 0, 0, 0, -1, shape[1]),
-        _alpha_band_idx=None,
-        _geotiff=geotiff,
-    )
+    return make_raster_array(data, Affine(1, 0, 0, 0, -1, shape[1]), geotiff)
 
 
 # ── parser ──────────────────────────────────────────────────────────────────
@@ -451,12 +441,10 @@ class TestDeclaredNodata:
         assert isinstance(ds, _VRTDataset)
         return ds
 
-    @pytest.mark.asyncio
     async def test_vrt_nodata_used_when_source_declares_none(self):
         ds = await self._open(_one_band_vrt(band_inner="<NoDataValue>0</NoDataValue>"))
         assert ds._nodata == 0
 
-    @pytest.mark.asyncio
     async def test_vrt_nodata_overrides_source(self):
         """GDAL renders the VRT band, so its NoDataValue wins over the TIFF's."""
         ds = await self._open(
@@ -465,12 +453,10 @@ class TestDeclaredNodata:
         )
         assert ds._nodata == 65535
 
-    @pytest.mark.asyncio
     async def test_source_nodata_kept_when_vrt_declares_none(self):
         ds = await self._open(_one_band_vrt(), source_nodata=7)
         assert ds._nodata == 7
 
-    @pytest.mark.asyncio
     async def test_unrepresentable_vrt_nodata_does_not_clear_source(self):
         """NaN nodata on an integer band coerces to None. Letting that through
         as "the VRT says no nodata" would discard the source's real value —
@@ -481,7 +467,6 @@ class TestDeclaredNodata:
         )
         assert ds._nodata == 7
 
-    @pytest.mark.asyncio
     async def test_out_of_dtype_nodata_leaves_source_value_alone(self):
         """-9999 on a uint16 band is a sentinel no pixel can hold. Adopting it
         anyway made ``np.array(nodata, dtype=...)`` inside resample raise
@@ -493,7 +478,6 @@ class TestDeclaredNodata:
         assert ds._nodata == 0
         assert ds._band_sources[0][0]._nodata == 0
 
-    @pytest.mark.asyncio
     async def test_declared_nodata_reaches_sources(self):
         """The sources do the resampling on the VRT's behalf, so they need the
         value too — not just the VRT's own metadata. Pixel-level consequence in
@@ -501,7 +485,6 @@ class TestDeclaredNodata:
         ds = await self._open(_one_band_vrt(band_inner="<NoDataValue>0</NoDataValue>"))
         assert ds._band_sources[0][0]._nodata == 0
 
-    @pytest.mark.asyncio
     async def test_hidden_nodata_is_not_reported(self):
         """``gdalbuildvrt -hidenodata`` writes <NoDataValue> *and*
         <HideNoDataValue>, and GDAL then reports no nodata — the flag exists so
@@ -517,7 +500,6 @@ class TestDeclaredNodata:
         assert ds._nodata is None
         assert ds._band_sources[0][0]._nodata is None
 
-    @pytest.mark.asyncio
     async def test_hidden_nodata_suppresses_the_source_value_too(self):
         """The shape `gdalbuildvrt -separate -hidenodata` actually emits: the
         sources declare a nodata, and gdalbuildvrt copies it into
@@ -537,7 +519,6 @@ class TestDeclaredNodata:
         # resamples around its own value, which GDAL also still fills with.
         assert ds._band_sources[0][0]._nodata == 0
 
-    @pytest.mark.asyncio
     async def test_partly_hidden_nodata_still_reports_the_visible_band(self):
         """A mix is not a suppression claim — the un-hidden band still declares
         a value, and `_declared_nodata` picks it up as usual."""
@@ -565,7 +546,6 @@ class TestDeclaredNodata:
         assert isinstance(bands, list)
         assert _declared_nodata(bands) == 5
 
-    @pytest.mark.asyncio
     async def test_declared_nodata_reaches_nested_vrt_sources(self):
         """A VRT over a VRT: the push has to recurse to whoever holds real
         pixels, which it does by dispatching through ``_override_nodata``."""
@@ -587,7 +567,6 @@ class TestDeclaredNodata:
         assert inner._nodata == 3
         assert inner._band_sources[0][0]._nodata == 3
 
-    @pytest.mark.asyncio
     async def test_bilinear_read_honours_declared_nodata(self):
         """The pixel-level consequence of pushing the value to the sources.
 
@@ -619,7 +598,6 @@ class TestDeclaredNodata:
         # input can only ever emit those two values.
         assert set(np.unique(got).tolist()) <= {0, 100}
 
-    @pytest.mark.asyncio
     async def test_read_result_carries_vrt_nodata(self):
         """Not just the dataset: the returned array must report it too, since
         callers (and merge) key masking off the result."""
@@ -628,7 +606,6 @@ class TestDeclaredNodata:
         arr = await ds.read()
         assert arr.nodata == 0
 
-    @pytest.mark.asyncio
     async def test_undeclared_bands_do_not_veto(self):
         """A band with no <NoDataValue> is not a claim of "no nodata" — GDAL
         reports the dataset value off band 1 regardless."""
@@ -771,44 +748,42 @@ class TestRejectOutOfScopeFeatures:
 
 
 class TestResolveSourceURI:
-    def test_vsis3(self):
-        assert (
-            _resolve_source_uri("/vsis3/bucket/path/to/f.tif", False, "s3://b/x.vrt")
-            == "s3://bucket/path/to/f.tif"
-        )
-
-    def test_vsigs(self):
-        assert (
-            _resolve_source_uri("/vsigs/bucket/key.tif", False, "gs://b/x.vrt")
-            == "gs://bucket/key.tif"
-        )
-
-    def test_vsicurl(self):
-        assert (
-            _resolve_source_uri(
-                "/vsicurl/https://example.com/a.tif", False, "s3://b/x.vrt"
-            )
-            == "https://example.com/a.tif"
-        )
-
-    def test_absolute_s3(self):
-        # relativeToVRT="0" with an already-scheme URI: pass through
-        assert (
-            _resolve_source_uri("s3://other/f.tif", False, "s3://b/x.vrt")
-            == "s3://other/f.tif"
-        )
-
-    def test_relative_s3(self):
-        assert (
-            _resolve_source_uri("sub/f.tif", True, "s3://bucket/vrt/dir/x.vrt")
-            == "s3://bucket/vrt/dir/sub/f.tif"
-        )
-
-    def test_relative_with_parent_traversal(self):
-        assert (
-            _resolve_source_uri("../other/f.tif", True, "s3://bucket/vrt/dir/x.vrt")
-            == "s3://bucket/vrt/other/f.tif"
-        )
+    @pytest.mark.parametrize(
+        ("href", "relative", "vrt_uri", "expected"),
+        [
+            (
+                "/vsis3/bucket/path/to/f.tif",
+                False,
+                "s3://b/x.vrt",
+                "s3://bucket/path/to/f.tif",
+            ),
+            ("/vsigs/bucket/key.tif", False, "gs://b/x.vrt", "gs://bucket/key.tif"),
+            (
+                "/vsicurl/https://example.com/a.tif",
+                False,
+                "s3://b/x.vrt",
+                "https://example.com/a.tif",
+            ),
+            # relativeToVRT="0" with an already-scheme URI: pass through
+            ("s3://other/f.tif", False, "s3://b/x.vrt", "s3://other/f.tif"),
+            (
+                "sub/f.tif",
+                True,
+                "s3://bucket/vrt/dir/x.vrt",
+                "s3://bucket/vrt/dir/sub/f.tif",
+            ),
+            (
+                "../other/f.tif",
+                True,
+                "s3://bucket/vrt/dir/x.vrt",
+                "s3://bucket/vrt/other/f.tif",
+            ),
+        ],
+    )
+    def test_resolves(
+        self, href: str, relative: bool, vrt_uri: str, expected: str
+    ) -> None:
+        assert _resolve_source_uri(href, relative, vrt_uri) == expected
 
     def test_relative_local(self, tmp_path: Path):
         vrt = tmp_path / "sub" / "x.vrt"
@@ -825,7 +800,6 @@ class TestResolveSourceURI:
 
 
 class TestOpenVRT:
-    @pytest.mark.asyncio
     async def test_opens_unique_sources_once(self):
         gt_rgb = make_mock_geotiff(count=3, **_RGBNIR_DIMS)
         gt_nir = make_mock_geotiff(count=1, **_RGBNIR_DIMS)
@@ -851,7 +825,6 @@ class TestOpenVRT:
         assert ds._band_sources[0][0] is ds._band_sources[2][0]
         assert ds._band_sources[0][0] is not ds._band_sources[3][0]
 
-    @pytest.mark.asyncio
     async def test_forwards_meta_overrides_to_sources(self):
         """meta_overrides must reach each source open — otherwise the VRT
         wrapper's CRS override is inconsistent with the sources the reads
@@ -880,7 +853,6 @@ class TestOpenVRT:
         for src, _ in ds._band_sources:
             assert src._crs_epsg == 3006
 
-    @pytest.mark.asyncio
     async def test_vrt_with_dimap_source_routes_through_detection(self):
         """When a VRT's <SourceFilename> points to a DIMAP .XML, the chain
         VRT → AsyncGeoTIFF.open → .xml branch → _maybe_open_dimap must
@@ -920,7 +892,6 @@ class TestOpenVRT:
 
         assert isinstance(ds._band_sources[0][0], _DIMAPDataset)
 
-    @pytest.mark.asyncio
     async def test_declared_nodata_reaches_a_dimap_source(self):
         """The shape the whole feature exists for: a band-stack VRT declaring
         `<NoDataValue>0</NoDataValue>` over a DIMAP descriptor that declares
@@ -953,7 +924,6 @@ class TestOpenVRT:
         assert ds._nodata == 0
         assert ds._band_sources[0][0]._nodata == 0
 
-    @pytest.mark.asyncio
     async def test_non_tiff_source_raises_informative_error(self):
         """A VRT source that isn't a TIFF (e.g. an Airbus DIMAP .XML) must
         produce an error that names both URIs and hints at the cause —
@@ -1005,7 +975,6 @@ class TestValidateSourceWindows:
         ):
             return await _open_vrt("s3://bucket/v.vrt")
 
-    @pytest.mark.asyncio
     async def test_src_rect_windowing_larger_source_rejected(self):
         """SrcRect sizes match DstRect and offsets are 0, so the parse-time
         guard passes — but the source is physically bigger, so this VRT wants a
@@ -1018,7 +987,6 @@ class TestValidateSourceWindows:
         with pytest.raises(NotImplementedError, match="<SrcRect> of 500x500"):
             await self._open(xml, width=1000, height=1000)
 
-    @pytest.mark.asyncio
     async def test_lone_dst_rect_smaller_than_source_rejected(self):
         """With no SrcRect to compare against, the parse-time rescaling guard
         can't fire — but GDAL reads the whole source and squeezes it into the
@@ -1027,19 +995,16 @@ class TestValidateSourceWindows:
         with pytest.raises(NotImplementedError, match="<DstRect> of 50x50"):
             await self._open(xml, width=100, height=100)
 
-    @pytest.mark.asyncio
     async def test_declared_size_mismatch_rejected(self):
         """No rects at all: the VRT just declares a canvas that differs from
         its source, which GDAL would resample onto and rastera would not."""
         with pytest.raises(NotImplementedError, match="declares a 500x500 raster"):
             await self._open(_one_band_vrt(size=500), width=1000, height=1000)
 
-    @pytest.mark.asyncio
     async def test_consistent_sizes_pass(self):
         ds = await self._open(_one_band_vrt(size=500), width=500, height=500)
         assert isinstance(ds, _VRTDataset)
 
-    @pytest.mark.asyncio
     async def test_mismatched_sources_rejected_at_open(self):
         """Previously only surfaced lazily, as a generic shape error on read."""
         gt_small = make_mock_geotiff(count=3, width=10000, height=10000)
@@ -1079,26 +1044,22 @@ class TestValidateSourceWindows:
         ):
             return await _open_vrt("s3://bucket/v.vrt")
 
-    @pytest.mark.asyncio
     async def test_mismatched_source_dtype_rejected(self):
         """Equal size alone doesn't make sources stackable: bands go into one
         array typed from band 1, so a differing dtype was silently cast."""
         with pytest.raises(NotImplementedError, match="identical dtype"):
             await self._open_rgbnir({"dtype": np.dtype("f4")})
 
-    @pytest.mark.asyncio
     async def test_mismatched_source_crs_rejected(self):
         with pytest.raises(NotImplementedError, match="in one CRS"):
             await self._open_rgbnir({"crs_epsg": 32633})
 
-    @pytest.mark.asyncio
     async def test_mismatched_source_transform_rejected(self):
         """Same size, same CRS, different origin — the bands cover different
         ground but were returned under band 1's transform."""
         with pytest.raises(NotImplementedError, match="same extent"):
             await self._open_rgbnir({"scale": 20.0})
 
-    @pytest.mark.asyncio
     async def test_matching_sources_pass(self):
         ds = await self._open_rgbnir({})
         assert isinstance(ds, _VRTDataset)
@@ -1130,7 +1091,6 @@ class TestTransformsMatch:
 
 
 class TestVRTCycle:
-    @pytest.mark.asyncio
     async def test_self_referencing_vrt_rejected(self):
         """A VRT source may itself be a VRT, so without a guard this recursed to
         RecursionError, issuing a network GET per level."""
@@ -1168,7 +1128,6 @@ def _make_rgbnir_ds() -> _VRTDataset:
 
 
 class TestVRTRead:
-    @pytest.mark.asyncio
     async def test_read_all_bands_groups_by_source(self):
         ds = _make_rgbnir_ds()
         rgb_src, nir_src = ds._band_sources[0][0], ds._band_sources[3][0]
@@ -1191,7 +1150,6 @@ class TestVRTRead:
         np.testing.assert_array_equal(data[:3], 10)
         np.testing.assert_array_equal(data[3], 99)
 
-    @pytest.mark.asyncio
     async def test_read_reordered_bands(self):
         """band_indices=[4,1] → one NIR read + one RGB read; output order preserved."""
         ds = _make_rgbnir_ds()
@@ -1225,7 +1183,6 @@ class TestVRTRead:
         # out[1] is VRT band 1 → RGB band 1
         np.testing.assert_array_equal(data[1], rgb_data[0])
 
-    @pytest.mark.asyncio
     async def test_read_single_source(self):
         """Reading only bands from one source issues just one sub-read."""
         ds = _make_rgbnir_ds()
@@ -1240,13 +1197,11 @@ class TestVRTRead:
         data: np.ndarray[Any, Any] = arr.data  # type: ignore[reportUnknownMemberType]
         assert data.shape == (2, 4, 4)
 
-    @pytest.mark.asyncio
     async def test_invalid_band_index_raises(self):
         ds = _make_rgbnir_ds()
         with pytest.raises(ValueError, match="out of range"):
             await ds.read(band_indices=[5])
 
-    @pytest.mark.asyncio
     async def test_read_native_dispatches_to_sources(self):
         """_read_native is the primitive merge uses — groups by source like read()."""
         ds = _make_rgbnir_ds()
@@ -1271,13 +1226,11 @@ class TestVRTRead:
         np.testing.assert_array_equal(data[:3], 5)
         np.testing.assert_array_equal(data[3], 77)
 
-    @pytest.mark.asyncio
     async def test_read_native_rejects_overview(self):
         ds = _make_rgbnir_ds()
         with pytest.raises(NotImplementedError, match="overview"):
             await ds._read_native(overview=MagicMock())
 
-    @pytest.mark.asyncio
     async def test_read_rejects_use_overviews(self):
         """Public read() refuses use_overviews=True — independent overview
         selection across sources can yield mismatched shapes."""
@@ -1358,7 +1311,6 @@ def _vrt_with_one_source(
 
 
 class TestMergeOnVRT:
-    @pytest.mark.asyncio
     async def test_merge_two_vrts_native_fast_path(self):
         """merge() dispatches through each VRT's `_read_native`, which groups
         by source. Two adjacent VRTs should stitch cleanly."""
@@ -1402,7 +1354,6 @@ class TestMergeOnVRT:
         # Overlap (cols 5-9) with mosaic_method="last": vrt_b wins
         np.testing.assert_array_equal(data[0, :, 5:10], 2)
 
-    @pytest.mark.asyncio
     async def test_merge_native_fast_path_reports_vrt_nodata(self):
         """The native path used to report the *source's* nodata, so a caller
         masking off `merged.nodata` saw nodata pixels as valid — even though the
@@ -1431,7 +1382,6 @@ class TestMergeOnVRT:
         )
         assert result.nodata == 0
 
-    @pytest.mark.asyncio
     async def test_merge_vrt_with_use_overviews_raises(self):
         """use_overviews=True passes an `overview` object to `_read_native`,
         which VRTs can't support across multiple sources."""
@@ -1480,7 +1430,6 @@ class TestMergeOnVRT:
 
 
 class TestDispatch:
-    @pytest.mark.asyncio
     async def test_open_vrt_returns_vrtdataset(self):
         """`.vrt` URIs route through _open_vrt rather than async_tiff."""
         sentinel = MagicMock(spec=_VRTDataset)
@@ -1491,7 +1440,6 @@ class TestDispatch:
         mock_open_vrt.assert_awaited_once()
         assert result is sentinel
 
-    @pytest.mark.asyncio
     async def test_open_many_forwards_store_kwargs_to_vrt(self):
         """List-open must forward store_kwargs so _open_vrt can rebuild its
         obstore with the caller's credentials/region, not empty defaults."""
@@ -1512,14 +1460,13 @@ class TestDispatch:
             assert call.kwargs["skip_signature"] is False
             assert call.kwargs["region"] == "eu-north-1"
 
-    @pytest.mark.asyncio
     async def test_non_vrt_does_not_dispatch(self):
         """Non-`.vrt` URIs never reach _open_vrt."""
         gt = make_mock_geotiff()
         with (
             patch("rastera.vrt._open_vrt", new=AsyncMock()) as mock_open_vrt,
             patch("rastera.reader.GeoTIFF") as mock_geotiff_cls,
-            patch("rastera.reader.from_url"),
+            patch("rastera.store.from_url"),
         ):
             mock_geotiff_cls.open = AsyncMock(return_value=gt)
             await rastera.open("s3://bucket/plain.tif", cache=False)
@@ -1530,7 +1477,6 @@ class TestDispatch:
 
 
 class TestFetchLocal:
-    @pytest.mark.asyncio
     async def test_local_file(self, tmp_path: Path):
         vrt = tmp_path / "x.vrt"
         vrt.write_bytes(RGBNIR_VRT)
@@ -1539,12 +1485,6 @@ class TestFetchLocal:
 
 
 # ── concurrency: vrt ─────────────────────────────────────────────
-
-
-@pytest.fixture
-def _reset_vrt_concurrency() -> Iterator[None]:
-    yield
-    rastera.set_concurrency(vrt=1)
 
 
 def _mocked_rgbnir_ds() -> _VRTDataset:
@@ -1559,9 +1499,7 @@ def _mocked_rgbnir_ds() -> _VRTDataset:
 
 class TestVRTConcurrencyInvariance:
     @pytest.mark.parametrize("n", [1, 8])
-    async def test_pixel_equal_across_n(
-        self, n: int, _reset_vrt_concurrency: None
-    ) -> None:
+    async def test_pixel_equal_across_n(self, n: int) -> None:
         rastera.set_concurrency(vrt=1)
         baseline = await _mocked_rgbnir_ds().read()
 

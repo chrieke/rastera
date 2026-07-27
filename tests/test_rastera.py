@@ -19,7 +19,12 @@ from rastera.reader import (
     set_cache_size,
 )
 from rastera.resampling import resample
-from tests.conftest import make_mock_geotiff, slicing_read, spy_read_native
+from tests.conftest import (
+    make_mock_geotiff,
+    make_raster_array,
+    slicing_read,
+    spy_read_native,
+)
 
 # ── Helpers ──────────────────────────────────────────────────────────────
 
@@ -40,16 +45,7 @@ def _make_read_result(
         geotiff.nodata = None
         geotiff.crs = MagicMock()
         geotiff.crs.to_epsg.return_value = 32632
-    return RasterArray(
-        data=data,
-        mask=None,
-        width=shape[2],
-        height=shape[1],
-        count=shape[0],
-        transform=transform,
-        _alpha_band_idx=None,
-        _geotiff=geotiff,
-    )
+    return make_raster_array(data, transform, geotiff)
 
 
 # ── Construction & properties ────────────────────────────────────────────
@@ -69,13 +65,6 @@ class TestAsyncGeoTIFFInit:
         assert "AsyncGeoTIFF" in r
         assert "s3://bucket/key.tif" in r
 
-    def test_geotiff_attrs(self):
-        gt = make_mock_geotiff(width=200, height=150, count=4)
-        obj = AsyncGeoTIFF("s3://b/k.tif", gt)
-        assert obj._geotiff.width == 200
-        assert obj._geotiff.height == 150
-        assert obj._geotiff.count == 4
-
     def test_overviews_populated(self):
         gt = make_mock_geotiff()
         ovr = MagicMock()
@@ -90,11 +79,10 @@ class TestAsyncGeoTIFFInit:
 
 
 class TestOpen:
-    @pytest.mark.asyncio
     @patch("rastera.reader.GeoTIFF")
-    @patch("rastera.reader.from_url")
+    @patch("rastera.store.from_url")
     async def test_open_auto_store(self, mock_from_url: Any, mock_geotiff_cls: Any):
-        """Without an explicit store, from_url builds one from the URI."""
+        """Without an explicit store, one is built rooted at the bucket."""
         gt = make_mock_geotiff()
         mock_store = MagicMock()
         mock_from_url.return_value = mock_store
@@ -103,15 +91,14 @@ class TestOpen:
         obj = await AsyncGeoTIFF.open("s3://bucket/key.tif", skip_signature=True)
 
         mock_from_url.assert_called_once_with(
-            "s3://bucket/key.tif", skip_signature=True, region="us-west-2"
+            "s3://bucket", skip_signature=True, region="us-west-2"
         )
         mock_geotiff_cls.open.assert_awaited_once_with(
-            "", store=mock_store, prefetch=32768
+            "key.tif", store=mock_store, prefetch=32768
         )
         assert obj.uri == "s3://bucket/key.tif"
         assert isinstance(obj, AsyncGeoTIFF)
 
-    @pytest.mark.asyncio
     @patch("rastera.reader.GeoTIFF")
     async def test_open_with_store(self, mock_geotiff_cls: Any):
         """With an explicit store, from_url is NOT called; key is extracted from URI."""
@@ -128,7 +115,6 @@ class TestOpen:
         )
         assert obj.uri == "s3://bucket/path/to/key.tif"
 
-    @pytest.mark.asyncio
     async def test_open_multi_uri_cross_bucket_raises(self):
         """Cross-bucket URIs without explicit store should raise."""
         with pytest.raises(ValueError, match="same bucket/host"):
@@ -139,7 +125,6 @@ class TestOpen:
                 ]
             )
 
-    @pytest.mark.asyncio
     @patch("rastera.reader.GeoTIFF")
     @patch("rastera.store.from_url")
     async def test_open_many_accepts_sibling_local_paths(
@@ -196,9 +181,8 @@ class TestMetaOverrides:
         with pytest.raises(ValueError, match="Unknown meta_overrides key"):
             AsyncGeoTIFF("s3://b/k.tif", gt, meta_overrides={"csr": 3006})  # type: ignore[typeddict-unknown-key]
 
-    @pytest.mark.asyncio
     @patch("rastera.reader.GeoTIFF")
-    @patch("rastera.reader.from_url")
+    @patch("rastera.store.from_url")
     async def test_open_forwards_override(
         self, mock_from_url: Any, mock_geotiff_cls: Any
     ):
@@ -216,8 +200,51 @@ class TestMetaOverrides:
 # ── read() ───────────────────────────────────────────────────────────────
 
 
+class TestReadArgumentValidation:
+    """read() shares merge()'s validators, so the same bad argument is rejected
+    the same way on both entry points instead of failing deep in NumPy."""
+
+    @staticmethod
+    def _obj():
+        gt = make_mock_geotiff(width=16, height=16, scale=1.0, count=1)
+        obj = AsyncGeoTIFF("s3://b/k.tif", gt)
+        # No case here should reach I/O.
+        gt.read = AsyncMock(side_effect=AssertionError("read was issued"))
+        return obj
+
+    async def test_unknown_resampling_rejected_on_native_path(self):
+        """The native path never calls resample(), so this argument was
+        accepted and then silently ignored."""
+        with pytest.raises(ValueError, match="Unknown resampling method"):
+            await self._obj().read(resampling="lanczos")  # type: ignore[arg-type]
+
+    @pytest.mark.parametrize("bad", [0.0, -1.0, float("nan"), float("inf")])
+    async def test_bad_target_resolution_rejected(self, bad: float):
+        with pytest.raises(ValueError, match="target_resolution"):
+            await self._obj().read(target_resolution=bad)
+
+    async def test_inverted_bbox_rejected(self):
+        with pytest.raises(ValueError, match="minx < maxx"):
+            await self._obj().read(bbox=(10, 0, 0, 10), bbox_crs=32632)
+
+    async def test_float_band_index_rejected(self):
+        with pytest.raises(ValueError, match="must be integers"):
+            await self._obj().read(band_indices=[1.5])  # type: ignore[list-item]
+
+    async def test_native_resolution_is_not_rejected(self):
+        """target_resolution equal to the source res is a no-op, not an error."""
+        gt = make_mock_geotiff(
+            width=16, height=16, scale=1.0, count=1, tile_width=16, tile_height=16
+        )
+        obj = AsyncGeoTIFF("s3://b/k.tif", gt)
+        gt.read = AsyncMock(
+            return_value=_make_read_result((1, 16, 16), dtype=np.uint16, geotiff=gt)
+        )
+        arr = await obj.read(target_resolution=1.0, resampling="bilinear")
+        assert arr.data.shape == (1, 16, 16)  # type: ignore[reportUnknownMemberType]
+
+
 class TestRead:
-    @pytest.mark.asyncio
     async def test_read_bbox_and_window_raises(self):
         gt = make_mock_geotiff()
         obj = AsyncGeoTIFF("s3://b/k.tif", gt)
@@ -228,7 +255,6 @@ class TestRead:
                 window=Window(col_off=0, row_off=0, width=10, height=10),
             )
 
-    @pytest.mark.asyncio
     async def test_read_full_image(self):
         """Read with no bbox/window should use full image bounds."""
         gt = make_mock_geotiff(
@@ -246,7 +272,6 @@ class TestRead:
         assert arr.height == 16
         np.testing.assert_array_equal(arr.data, 1)  # type: ignore[reportUnknownMemberType]
 
-    @pytest.mark.asyncio
     async def test_read_with_window(self):
         gt = make_mock_geotiff(
             width=32, height=32, scale=1.0, count=2, tile_width=32, tile_height=32
@@ -261,7 +286,6 @@ class TestRead:
         assert arr.data.shape == (2, 16, 16)  # type: ignore[reportUnknownMemberType]
         np.testing.assert_array_equal(arr.data, 42)  # type: ignore[reportUnknownMemberType]
 
-    @pytest.mark.asyncio
     async def test_read_band_indices(self):
         gt = make_mock_geotiff(
             width=16, height=16, scale=1.0, count=3, tile_width=16, tile_height=16
@@ -287,7 +311,6 @@ class TestRead:
         np.testing.assert_array_equal(arr.data[0], data[0])  # type: ignore[reportUnknownMemberType]
         np.testing.assert_array_equal(arr.data[1], data[2])  # type: ignore[reportUnknownMemberType]
 
-    @pytest.mark.asyncio
     async def test_read_band_index_zero_raises(self):
         gt = make_mock_geotiff(width=16, height=16, scale=1.0, count=3)
         obj = AsyncGeoTIFF("s3://b/k.tif", gt)
@@ -295,7 +318,6 @@ class TestRead:
         with pytest.raises(ValueError, match="1-based"):
             await obj.read(band_indices=[0])
 
-    @pytest.mark.asyncio
     async def test_window_resample_matches_equivalent_bbox(self):
         """The output grid is ceil-sized, so reading only the window left the
         trailing row/column with nothing behind it — nodata, even mid-image
@@ -317,7 +339,6 @@ class TestRead:
         np.testing.assert_array_equal(arr.data, equivalent.data)  # type: ignore[reportUnknownMemberType]
         assert arr.bounds == equivalent.bounds
 
-    @pytest.mark.asyncio
     async def test_window_resample_with_overview_reads_right_region(self):
         """*window* is in full-resolution pixels; it used to be handed to the
         overview unchanged, which reads a different region entirely."""
@@ -340,7 +361,6 @@ class TestRead:
         )
         assert (arr.bounds[0], arr.bounds[2]) == (300.0, 380.0)
 
-    @pytest.mark.asyncio
     @pytest.mark.parametrize("method", ["bilinear", "cubic"])
     # res 1x1 downsamples 10x on both axes; 2x20 downsamples 5x in x but
     # *up*samples in y, so an x-derived halo is too narrow for the y kernel.
@@ -381,7 +401,6 @@ class TestRead:
         )
         np.testing.assert_array_equal(got.data, want)  # type: ignore[reportUnknownMemberType]
 
-    @pytest.mark.asyncio
     async def test_unsnapped_transform_clamped_to_image(self):
         """The window is clipped to the image, so anchoring on a bbox edge that
         overhangs it labelled the pixels where they are not."""
@@ -399,7 +418,6 @@ class TestRead:
         assert arr.transform.c == 0.0  # not -500
         assert arr.transform.f == 160.0
 
-    @pytest.mark.asyncio
     async def test_unsnapped_transform_non_square_pixels(self):
         """res[0] was used for both axes, so tall pixels came back short."""
         gt = make_mock_geotiff(
@@ -444,7 +462,6 @@ class TestWarpSeam:
             ("nearest", 10.0),
         ],
     )
-    @pytest.mark.asyncio
     async def test_same_crs_halo_is_kernel_sized(self, method: str, pad: float):
         obj, _ = self._utm_obj()
         calls = spy_read_native(obj)
@@ -465,7 +482,6 @@ class TestWarpSeam:
         )
         assert calls[0]["overview"] is None
 
-    @pytest.mark.asyncio
     async def test_cross_crs_halo_is_per_axis(self):
         """UTM->4326 compresses x and y by different factors, so a scalar
         source-resolution ratio under-pads one axis."""
@@ -495,7 +511,6 @@ class TestWarpSeam:
             atol=1e-6,
         )
 
-    @pytest.mark.asyncio
     async def test_reproject_without_target_resolution_skips_overviews(self):
         """Overviews are all coarser than native, so a density-preserving
         reprojection must not silently read one."""
@@ -519,7 +534,6 @@ class TestWarpSeam:
         assert len(calls) == 1
         assert calls[0]["overview"] is None
 
-    @pytest.mark.asyncio
     async def test_same_crs_resample_reports_source_geotiff(self):
         """Not a _CrsNodata stub: RasterArray.crs/.nodata read straight off
         this, and vrt._dispatch_source_reads keys its nodata swap off a
@@ -540,6 +554,74 @@ class TestWarpSeam:
             target_resolution=0.0002,
         )
         assert reprojected._geotiff is not gt
+
+
+# ── The CRS and nodata the output reports ───────────────────────────────
+
+
+class TestOutputLabels:
+    """``RasterArray.crs``/``.nodata`` read straight off ``_geotiff``, so every
+    read path has to attach one that agrees with what the *dataset* resolved.
+    Logically equivalent reads disagreeing is the bug these guard."""
+
+    @staticmethod
+    def _obj(
+        meta_overrides: Any = None, **gt_kwargs: Any
+    ) -> tuple[AsyncGeoTIFF, MagicMock]:
+        gt = make_mock_geotiff(count=1, **gt_kwargs)
+        gt.read = slicing_read(gt, np.zeros((1, 100, 100), gt.dtype))
+        return AsyncGeoTIFF("s3://b/k.tif", gt, meta_overrides=meta_overrides), gt
+
+    @pytest.mark.parametrize(
+        ("read_kwargs", "expected"),
+        [
+            ({}, 3006),
+            ({"target_resolution": 20.0}, 3006),
+            # Reprojection reads *from* the override and labels with the target.
+            ({"target_crs": 4326}, 4326),
+        ],
+    )
+    async def test_crs_override_reaches_the_output(
+        self, read_kwargs: dict[str, Any], expected: int
+    ):
+        """meta_overrides governed windowing but never the label it exists to fix."""
+        obj, _ = self._obj(meta_overrides={"crs": 3006}, crs_epsg=32632)
+        arr = await obj.read(**read_kwargs)
+        assert arr.crs.to_epsg() == expected
+
+    @pytest.mark.parametrize(
+        "read_kwargs",
+        [{}, {"target_resolution": 20.0}, {"target_crs": 4326}],
+    )
+    async def test_unrepresentable_nodata_is_not_reported(
+        self, read_kwargs: dict[str, Any]
+    ):
+        """A uint16 band declaring -9999 has no sentinel its dtype can carry, so
+        the output must report none — reporting it makes as_masked() raise."""
+        obj, _ = self._obj(nodata=-9999.0, dtype=np.dtype("u2"))
+        assert obj._nodata is None
+
+        arr = await obj.read(**read_kwargs)
+        assert arr.nodata is None
+        arr.as_masked()  # would raise TypeError on an unconvertible fill_value
+
+    @pytest.mark.parametrize(
+        ("nodata", "dtype"),
+        [
+            (0.0, np.dtype("u2")),
+            # NaN survives _coerce_nodata untouched, so it is still the file's.
+            (float("nan"), np.dtype("f4")),
+        ],
+    )
+    async def test_agreeing_file_keeps_the_live_geotiff(
+        self, nodata: float, dtype: np.dtype[Any]
+    ):
+        """The substitution is conditional: nothing to correct, nothing to stub.
+        vrt._dispatch_source_reads keys its nodata swap off what a sub-read
+        reports, and merge reaches through _geotiff for dtype and transform."""
+        obj, gt = self._obj(nodata=nodata, dtype=dtype)
+        assert (await obj.read())._geotiff is gt
+        assert (await obj.read(target_resolution=20.0))._geotiff is gt
 
 
 # ── LRU cache behaviour ────────────────────────────────────────────────
@@ -567,27 +649,3 @@ class TestLRUCache:
         _geotiff_cache["a"] = make_mock_geotiff()
         set_cache_size(0)
         assert len(_geotiff_cache) == 0
-
-    def test_lru_eviction_order(self):
-        """Accessing an entry promotes it; the least-recently-used entry is evicted."""
-        set_cache_size(2)
-        gt_a, gt_b, gt_c = (make_mock_geotiff() for _ in range(3))
-
-        # Insert A, then B (cache: A, B)
-        _geotiff_cache["a"] = gt_a
-        _geotiff_cache["b"] = gt_b
-
-        # Access A — promotes it (cache order: B, A)
-        _geotiff_cache.move_to_end("a")
-
-        # Insert C — should evict B (LRU), not A
-        set_cache_size(2)  # trigger eviction check if needed
-        _geotiff_cache["c"] = gt_c
-        if len(_geotiff_cache) > 2:
-            _geotiff_cache.popitem(last=False)
-
-        assert "a" in _geotiff_cache, "A was accessed recently and should survive"
-        assert "c" in _geotiff_cache, "C was just inserted and should survive"
-        assert (
-            "b" not in _geotiff_cache
-        ), "B was least-recently-used and should be evicted"

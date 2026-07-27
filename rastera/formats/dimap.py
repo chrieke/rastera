@@ -75,89 +75,6 @@ class _DIMAPLayout:
     bands: tuple[_DIMAPBand, ...]
 
 
-def _parse_dimap_xml(xml_bytes: bytes) -> _DIMAPLayout:
-    """Parse a DIMAP ``Dimap_Document`` into a ``_DIMAPLayout``.
-
-    Only the subset used for read dispatch is extracted. The MVP scope is:
-
-    - ``DATA_FILE_ORGANISATION = BAND_COMPOSITE`` (one TIFF per tile per
-      band-group; bands packed inside the TIFF).
-    - ``DATA_FILE_FORMAT = image/tiff``.
-    - ``Regular_Tiling`` with zero overlap.
-
-    Anything else raises ``NotImplementedError`` so callers get a clear
-    error instead of silent misreads.
-    """
-    root = ET.fromstring(xml_bytes)
-    if root.tag != "Dimap_Document":
-        raise ValueError(f"Not a DIMAP file (root tag {root.tag!r})")
-
-    raster_data = _require(root, "Raster_Data")
-    dims = _require(raster_data, "Raster_Dimensions")
-    width = int(_require_text(dims, "NCOLS"))
-    height = int(_require_text(dims, "NROWS"))
-
-    tile_rows, tile_cols, tile_h, tile_w = _parse_regular_tiling(dims)
-
-    data_access = _require(raster_data, "Data_Access")
-    organisation = _require_text(data_access, "DATA_FILE_ORGANISATION")
-    if organisation != "BAND_COMPOSITE":
-        raise NotImplementedError(
-            f"DIMAP DATA_FILE_ORGANISATION={organisation!r}; only "
-            f"'BAND_COMPOSITE' is supported"
-        )
-    fmt = _require_text(data_access, "DATA_FILE_FORMAT")
-    if fmt != "image/tiff":
-        raise NotImplementedError(
-            f"DIMAP DATA_FILE_FORMAT={fmt!r}; only 'image/tiff' is supported"
-        )
-
-    nbands = int(_require_text(dims, "NBANDS"))
-    groups, bands = _parse_band_groups(data_access, nbands)
-
-    transform = _parse_transform(_require(root, "Geoposition"))
-    dtype = _parse_dtype(_require(raster_data, "Raster_Encoding"))
-    crs_epsg = _parse_crs_epsg(_require(root, "Coordinate_Reference_System"))
-
-    return _DIMAPLayout(
-        width=width,
-        height=height,
-        crs_epsg=crs_epsg,
-        transform=transform,
-        dtype=dtype,
-        tile_rows=tile_rows,
-        tile_cols=tile_cols,
-        tile_width=tile_w,
-        tile_height=tile_h,
-        groups=tuple(groups),
-        bands=tuple(bands),
-    )
-
-
-@dataclass(frozen=True, slots=True)
-class _VirtualGeoTIFF:
-    """Metadata-only stand-in for an ``async_geotiff.GeoTIFF``.
-
-    Exposes just the attribute surface that ``AsyncGeoTIFF.__init__`` and
-    its reproject/resample helpers read off ``self._geotiff`` — nothing
-    more. This lets a synthesized dataset (``_DIMAPDataset``) pass
-    ``super().__init__`` and reuse the full read dispatch without
-    holding a real TIFF. Never participates in actual I/O; the dataset
-    overrides ``_read_native`` before any read path would try to.
-    """
-
-    crs: CRS
-    nodata: int | float | None
-    dtype: np.dtype
-    count: int
-    width: int
-    height: int
-    res: tuple[float, float]
-    bounds: tuple[float, float, float, float]
-    transform: Affine
-    overviews: tuple[Any, ...] = ()
-
-
 class _DIMAPDataset(AsyncGeoTIFF):
     """Read adapter for a DIMAP descriptor.
 
@@ -316,7 +233,11 @@ class _DIMAPDataset(AsyncGeoTIFF):
             )
 
         return _make_output_array(
-            out, out_transform, window.width, window.height, self._geotiff
+            out,
+            out_transform,
+            window.width,
+            window.height,
+            self._output_geotiff_ref(self._crs_epsg),
         )
 
     async def _get_tile(
@@ -422,6 +343,65 @@ async def _sniff_first_tile(
 
 
 # ---- helpers ----
+
+
+def _parse_dimap_xml(xml_bytes: bytes) -> _DIMAPLayout:
+    """Parse a DIMAP ``Dimap_Document`` into a ``_DIMAPLayout``.
+
+    Only the subset used for read dispatch is extracted. The MVP scope is:
+
+    - ``DATA_FILE_ORGANISATION = BAND_COMPOSITE`` (one TIFF per tile per
+      band-group; bands packed inside the TIFF).
+    - ``DATA_FILE_FORMAT = image/tiff``.
+    - ``Regular_Tiling`` with zero overlap.
+
+    Anything else raises ``NotImplementedError`` so callers get a clear
+    error instead of silent misreads.
+    """
+    root = ET.fromstring(xml_bytes)
+    if root.tag != "Dimap_Document":
+        raise ValueError(f"Not a DIMAP file (root tag {root.tag!r})")
+
+    raster_data = _require(root, "Raster_Data")
+    dims = _require(raster_data, "Raster_Dimensions")
+    width = int(_require_text(dims, "NCOLS"))
+    height = int(_require_text(dims, "NROWS"))
+
+    tile_rows, tile_cols, tile_h, tile_w = _parse_regular_tiling(dims)
+
+    data_access = _require(raster_data, "Data_Access")
+    organisation = _require_text(data_access, "DATA_FILE_ORGANISATION")
+    if organisation != "BAND_COMPOSITE":
+        raise NotImplementedError(
+            f"DIMAP DATA_FILE_ORGANISATION={organisation!r}; only "
+            f"'BAND_COMPOSITE' is supported"
+        )
+    fmt = _require_text(data_access, "DATA_FILE_FORMAT")
+    if fmt != "image/tiff":
+        raise NotImplementedError(
+            f"DIMAP DATA_FILE_FORMAT={fmt!r}; only 'image/tiff' is supported"
+        )
+
+    nbands = int(_require_text(dims, "NBANDS"))
+    groups, bands = _parse_band_groups(data_access, nbands)
+
+    transform = _parse_transform(_require(root, "Geoposition"))
+    dtype = _parse_dtype(_require(raster_data, "Raster_Encoding"))
+    crs_epsg = _parse_crs_epsg(_require(root, "Coordinate_Reference_System"))
+
+    return _DIMAPLayout(
+        width=width,
+        height=height,
+        crs_epsg=crs_epsg,
+        transform=transform,
+        dtype=dtype,
+        tile_rows=tile_rows,
+        tile_cols=tile_cols,
+        tile_width=tile_w,
+        tile_height=tile_h,
+        groups=tuple(groups),
+        bands=tuple(bands),
+    )
 
 
 def _require(parent: ET.Element, tag: str) -> ET.Element:
@@ -607,6 +587,30 @@ def _parse_crs_epsg(crs_root: ET.Element) -> int:
         "DIMAP Coordinate_Reference_System has neither Projected_CRS nor "
         "Geographic_CRS with an EPSG code"
     )
+
+
+@dataclass(frozen=True, slots=True)
+class _VirtualGeoTIFF:
+    """Metadata-only stand-in for an ``async_geotiff.GeoTIFF``.
+
+    Exposes just the attribute surface that ``AsyncGeoTIFF.__init__`` and
+    its reproject/resample helpers read off ``self._geotiff`` — nothing
+    more. This lets a synthesized dataset (``_DIMAPDataset``) pass
+    ``super().__init__`` and reuse the full read dispatch without
+    holding a real TIFF. Never participates in actual I/O; the dataset
+    overrides ``_read_native`` before any read path would try to.
+    """
+
+    crs: CRS
+    nodata: int | float | None
+    dtype: np.dtype
+    count: int
+    width: int
+    height: int
+    res: tuple[float, float]
+    bounds: tuple[float, float, float, float]
+    transform: Affine
+    overviews: tuple[Any, ...] = ()
 
 
 def _virtual_geotiff_for(

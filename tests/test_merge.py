@@ -22,45 +22,15 @@ from rastera.merge import (
     merge,
 )
 from rastera.reader import AsyncGeoTIFF, _grid_for_bbox
-from tests.conftest import slicing_read, spy_read_native
+from rastera.resampling import ResamplingMethod
+from tests.conftest import (
+    make_mock_geotiff,
+    make_raster_array,
+    slicing_read,
+    spy_read_native,
+)
 
 # ── Helpers ──────────────────────────────────────────────────────────────
-
-
-def _make_geotiff_stub(
-    width: int = 100,
-    height: int = 100,
-    scale: float = 10.0,
-    count: int = 1,
-    origin_x: float = 0.0,
-    origin_y: float | None = None,
-    crs_epsg: int | None = 32632,
-    dtype: np.dtype[Any] = np.dtype("u2"),
-    nodata: float | None = None,
-):
-    """Build a MagicMock that quacks like async_geotiff.GeoTIFF."""
-    if origin_y is None:
-        origin_y = height * scale
-    transform = Affine(scale, 0, origin_x, 0, -scale, origin_y)
-    bounds = (origin_x, origin_y - height * scale, origin_x + width * scale, origin_y)
-
-    gt = MagicMock()
-    gt.width = width
-    gt.height = height
-    gt.count = count
-    gt.dtype = dtype
-    gt.nodata = float(nodata) if nodata is not None else None
-    gt.transform = transform
-    gt.res = (scale, scale)
-    gt.bounds = bounds
-    gt.tile_width = 256
-    gt.tile_height = 256
-
-    crs_mock = MagicMock()
-    crs_mock.to_epsg.return_value = crs_epsg
-    gt.crs = crs_mock
-    gt.overviews = []
-    return gt
 
 
 def _make_cog(
@@ -75,7 +45,7 @@ def _make_cog(
     nodata: float | None = None,
 ):
     """Build a mock AsyncGeoTIFF."""
-    gt = _make_geotiff_stub(
+    gt = make_mock_geotiff(
         width=width,
         height=height,
         scale=scale,
@@ -84,7 +54,7 @@ def _make_cog(
         origin_y=origin_y,
         crs_epsg=crs,
         dtype=dtype,
-        nodata=nodata,
+        nodata=float(nodata) if nodata is not None else None,
     )
     cog = MagicMock()
     cog._geotiff = gt
@@ -115,16 +85,7 @@ def _make_array(
         geotiff.nodata = float(nodata) if nodata is not None else None
         geotiff.crs = MagicMock()
         geotiff.crs.to_epsg.return_value = 32632
-    return RasterArray(
-        data=data,
-        mask=None,
-        width=data.shape[2],
-        height=data.shape[1],
-        count=data.shape[0],
-        transform=transform,
-        _alpha_band_idx=None,
-        _geotiff=geotiff,
-    )
+    return make_raster_array(data, transform, geotiff)
 
 
 # ── _mosaic_grid_from_bbox ───────────────────────────────────────────────
@@ -188,6 +149,115 @@ class TestRequireCompatibleMergeInputs:
         cog1 = _make_cog(origin_x=0.0, origin_y=1000.0)
         cog2 = _make_cog(origin_x=1000.0, origin_y=1000.0)
         _require_compatible_merge_inputs([cog1, cog2])
+
+
+# ── merge argument validation ────────────────────────────────────────────
+
+
+class TestMergeArgumentValidation:
+    """These arguments used to fail either silently — by selecting the other
+    branch's semantics — or several frames deep in NumPy with an error naming
+    neither the argument nor this call. All are rejected before any read."""
+
+    @staticmethod
+    def _merge(**kwargs: Any):
+        cog = _make_cog(width=10, height=10, scale=1.0, bands=1)
+        # No read is expected to happen: every case here must fail before I/O.
+        cog._read_native = AsyncMock(side_effect=AssertionError("read was issued"))
+        defaults = dict(
+            bbox=BBox(0, 0, 10, 10),
+            bbox_crs=32632,
+            target_crs=32632,
+            target_resolution=1.0,
+        )
+        return merge([cog], **{**defaults, **kwargs})  # type: ignore[arg-type]
+
+    @pytest.mark.parametrize("bad", ["fisrt", "min", "MAX", "First"])
+    async def test_unknown_mosaic_method_rejected(self, bad: str):
+        """Anything that wasn't exactly "first" fell through to last-wins."""
+        with pytest.raises(ValueError, match="mosaic_method must be"):
+            await self._merge(mosaic_method=bad)
+
+    @pytest.mark.parametrize("bad", ["First", "common", "most-common"])
+    async def test_unknown_crs_method_rejected(self, bad: str):
+        """Anything that wasn't exactly "first" fell through to most_common,
+        which for mixed inputs reprojects the whole mosaic into another zone."""
+        with pytest.raises(ValueError, match="crs_method must be"):
+            await self._merge(crs_method=bad)
+
+    async def test_unknown_resampling_rejected(self):
+        """The native fast path never calls resample(), so its method argument
+        was never validated at all on this route."""
+        with pytest.raises(ValueError, match="Unknown resampling method"):
+            await self._merge(resampling="lanczos")
+
+    @pytest.mark.parametrize("bad", [0.0, -1.0, float("nan"), float("inf")])
+    async def test_bad_target_resolution_rejected(self, bad: float):
+        with pytest.raises(ValueError, match="target_resolution"):
+            await self._merge(target_resolution=bad)
+
+    @pytest.mark.parametrize("bad", [-1, 70000])
+    async def test_fill_value_outside_dtype_range_rejected(self, bad: int):
+        """np.full raised a bare OverflowError naming neither uint16 nor the
+        fill_value argument."""
+        with pytest.raises(ValueError, match="outside the range"):
+            await self._merge(fill_value=bad)
+
+    async def test_fractional_fill_value_rejected(self):
+        """0.5 was truncated to 0 in a uint16 mosaic — indistinguishable from
+        a deliberate fill_value=0."""
+        with pytest.raises(ValueError, match="not an integer"):
+            await self._merge(fill_value=0.5)
+
+    async def test_nan_fill_value_on_integer_rejected(self):
+        """NaN also landed on 0, with only a RuntimeWarning."""
+        with pytest.raises(ValueError, match="cannot be represented"):
+            await self._merge(fill_value=float("nan"))
+
+    async def test_nan_fill_value_on_float_dtype_allowed(self):
+        cog = _make_cog(width=10, height=10, scale=1.0, dtype=np.dtype("f4"))
+        result = await merge(
+            [cog],
+            bbox=BBox(100, 100, 110, 110),  # disjoint from the cog: pure fill
+            bbox_crs=32632,
+            target_crs=32632,
+            target_resolution=1.0,
+            fill_value=float("nan"),
+        )
+        assert np.all(np.isnan(result.data))  # type: ignore[reportUnknownMemberType]
+
+    async def test_inverted_bbox_rejected(self):
+        """min()/max() swapped this into the complementary extent."""
+        with pytest.raises(ValueError, match="minx < maxx"):
+            await self._merge(bbox=BBox(10, 0, 0, 10))
+
+    async def test_float_band_index_rejected(self):
+        with pytest.raises(ValueError, match="must be integers"):
+            await self._merge(band_indices=[1.5])
+
+    async def test_valid_arguments_still_reach_the_read(self):
+        """Guards the guard: the checks above must not reject a normal call."""
+        cog = _make_cog(width=10, height=10, scale=1.0, bands=1)
+        cog._read_native = AsyncMock(
+            return_value=_make_array(
+                np.ones((1, 10, 10), dtype=np.uint16),
+                transform=Affine(1, 0, 0, 0, -1, 10),
+                geotiff=cog._geotiff,
+            )
+        )
+        await merge(
+            [cog],
+            bbox=BBox(0, 0, 10, 10),
+            bbox_crs=32632,
+            band_indices=[1],
+            fill_value=0,
+            target_crs=32632,
+            target_resolution=1.0,
+            mosaic_method="last",
+            crs_method="first",
+            resampling="nearest",
+        )
+        cog._read_native.assert_called_once()
 
 
 # ── merge ───────────────────────────────────────────────────────────
@@ -498,8 +568,10 @@ class TestMergeReprojected:
         assert result.res[0] == pytest.approx(2.0)  # type: ignore[reportUnknownMemberType]
         cog._read_native.assert_called()
 
-    async def test_merge_resampling_bilinear(self):
-        """merge with resampling='bilinear' produces expected shape and dtype."""
+    @pytest.mark.parametrize("resampling", ["bilinear", "cubic"])
+    async def test_merge_resampling_preserves_a_constant(
+        self, resampling: ResamplingMethod
+    ):
         cog = _make_cog(width=10, height=10, scale=1.0, bands=1)
         native_arr = np.ones((1, 10, 10), dtype=np.uint16) * 7
         native_result = _make_array(native_arr, Affine(1.0, 0, 0, 0, -1.0, 10))
@@ -512,32 +584,11 @@ class TestMergeReprojected:
             band_indices=[1],
             target_crs=32632,
             target_resolution=2.0,
-            resampling="bilinear",
+            resampling=resampling,
         )
         assert result.res[0] == pytest.approx(2.0)  # type: ignore[reportUnknownMemberType]
         assert result.data.dtype == np.uint16  # type: ignore[reportUnknownMemberType]
-        # Constant input → bilinear output is the same constant.
-        assert np.all(result.data == 7)  # type: ignore[reportUnknownMemberType]
-
-    async def test_merge_resampling_cubic(self):
-        """merge with resampling='cubic' produces expected shape and dtype."""
-        cog = _make_cog(width=10, height=10, scale=1.0, bands=1)
-        native_arr = np.ones((1, 10, 10), dtype=np.uint16) * 7
-        native_result = _make_array(native_arr, Affine(1.0, 0, 0, 0, -1.0, 10))
-        cog._read_native = AsyncMock(return_value=native_result)
-
-        result = await merge(
-            [cog],
-            bbox=BBox(0, 0, 10, 10),
-            bbox_crs=32632,
-            band_indices=[1],
-            target_crs=32632,
-            target_resolution=2.0,
-            resampling="cubic",
-        )
-        assert result.res[0] == pytest.approx(2.0)  # type: ignore[reportUnknownMemberType]
-        assert result.data.dtype == np.uint16  # type: ignore[reportUnknownMemberType]
-        # Constant input → cubic output is the same constant (kernel sums to 1).
+        # Both kernels sum to 1, so a constant input survives downsampling.
         assert np.all(result.data == 7)  # type: ignore[reportUnknownMemberType]
 
     async def test_merge_method_first_reprojected(self):
@@ -638,42 +689,33 @@ class TestMergeSeam:
 
 
 class TestResolveTargetCrs:
-    def test_most_common_picks_majority(self):
-        cogs = [_make_cog(crs=32632), _make_cog(crs=32633), _make_cog(crs=32632)]
-        assert _resolve_target_crs(cogs, "most_common") == 32632
-
-    def test_first_picks_first(self):
-        cogs = [_make_cog(crs=32633), _make_cog(crs=32632), _make_cog(crs=32632)]
-        assert _resolve_target_crs(cogs, "first") == 32633
-
-    def test_first_skips_none_crs(self):
-        cogs = [_make_cog(crs=None), _make_cog(crs=32632)]
-        assert _resolve_target_crs(cogs, "first") == 32632
-
-    def test_most_common_skips_none_crs(self):
-        cogs = [_make_cog(crs=None), _make_cog(crs=32632)]
-        assert _resolve_target_crs(cogs, "most_common") == 32632
+    @pytest.mark.parametrize(
+        ("crs_list", "method", "expected"),
+        [
+            ([32632, 32633, 32632], "most_common", 32632),
+            ([32633, 32632, 32632], "first", 32633),
+            ([None, 32632], "first", 32632),
+            ([None, 32632], "most_common", 32632),
+            ([4326], "most_common", 4326),
+            ([4326], "first", 4326),
+        ],
+    )
+    def test_picks(
+        self,
+        crs_list: list[int | None],
+        method: Literal["most_common", "first"],
+        expected: int,
+    ):
+        cogs = [_make_cog(crs=c) for c in crs_list]
+        assert _resolve_target_crs(cogs, method) == expected
 
     def test_all_none_raises(self):
         cogs = [_make_cog(crs=None), _make_cog(crs=None)]
         with pytest.raises(ValueError, match="No CRS found"):
             _resolve_target_crs(cogs, "most_common")
 
-    def test_single_cog(self):
-        cogs = [_make_cog(crs=4326)]
-        assert _resolve_target_crs(cogs, "most_common") == 4326
-        assert _resolve_target_crs(cogs, "first") == 4326
-
 
 # ── concurrency: merge ─────────────────────────────────────────────
-
-
-@pytest.fixture
-def _reset_merge_concurrency():
-    yield
-    import rastera
-
-    rastera.set_concurrency(merge=1, vrt=1, dimap=1)
 
 
 def _make_strip_cog(origin_x: float, value: int):
@@ -695,7 +737,6 @@ class TestMergeConcurrencyInvariance:
         self,
         n: int,
         mosaic_method: Literal["first", "last"],
-        _reset_merge_concurrency: None,
     ):
         """Output must match the n=1 baseline pixel-for-pixel for any n."""
         import rastera
@@ -730,7 +771,7 @@ class TestMergeConcurrencyInvariance:
         baseline_data: np.ndarray[Any, Any] = baseline.data  # type: ignore[reportUnknownMemberType]
         assert np.array_equal(result_data, baseline_data)
 
-    async def test_first_mode_still_early_exits(self, _reset_merge_concurrency: None):
+    async def test_first_mode_still_early_exits(self):
         """With mosaic_method='first', first batch fully fills output → later
         batches should not be read at all."""
         import rastera
@@ -872,7 +913,7 @@ def _real_utm_cog(with_overview: bool = False) -> tuple[AsyncGeoTIFF, Any]:
     Real, not a MagicMock, so ``read()`` and ``merge()`` can be compared on the
     same object and both go through the production seam.
     """
-    gt = _make_geotiff_stub(
+    gt = make_mock_geotiff(
         width=400,
         height=400,
         scale=10.0,
@@ -884,7 +925,7 @@ def _real_utm_cog(with_overview: bool = False) -> tuple[AsyncGeoTIFF, Any]:
     gt.read = slicing_read(gt, np.zeros((1, 400, 400), np.uint16))
     ov = None
     if with_overview:
-        ov = _make_geotiff_stub(
+        ov = make_mock_geotiff(
             width=200,
             height=200,
             scale=20.0,

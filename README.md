@@ -8,7 +8,7 @@
 - Built on [async-geotiff](https://github.com/developmentseed/async-geotiff) handling GeoTIFF parsing, async tile fetching, request coalescing, and Rust-native decompression
 - Limited VRT & DIMAP support — band-stack VRTs and LUTs work, anything more exotic raises `NotImplementedError` instead of returning wrong pixels (see `rastera/vrt.py`)
 
-**Note:** Only COGs & tiled GeoTIFFs are supported. Stripped (non-tiled) TIFFs will not work.
+**Note:** Only COGs & tiled GeoTIFFs are supported. Striped (non-tiled) TIFFs will not work.
 
 ### Read a single COG
 
@@ -22,10 +22,11 @@ src = await rastera.open(uri, prefetch=32768, cache=True, meta_overrides=None)
 raster_array = await src.read()
 # raster_array.data, raster_array.transform, raster_array.bounds, raster_array.crs, raster_array.nodata, ...
 
-# Spatial subset with reprojection
+# Spatial subset with reprojection — bbox_crs must match target_crs
+# (merge transforms the bbox for you, read does not)
 raster_array = await src.read(
     bbox=(minx, miny, maxx, maxy),
-    bbox_crs=32633,
+    bbox_crs=32632,
     band_indices=[1, 2, 3],
     target_crs=32632,
     target_resolution=20,
@@ -81,12 +82,14 @@ gdf.to_parquet("index.parquet")
 
 # Open from index (reusable across sessions, ~5-6x faster opens)
 sources = await rastera.open_from_index("index.parquet", bbox=(minx, miny, maxx, maxy), region="us-west-2")
-raster_array = await rastera.merge(sources, bbox=bbox, bbox_crs=4326, target_crs=4326, target_resolution=10)
+raster_array = await rastera.merge(sources, bbox=bbox, bbox_crs=4326, target_crs=32632, target_resolution=10)
 ```
 
 `rastera.open()` also keeps an in-memory LRU cache of parsed headers within the session (default 128 entries, configurable via `set_cache_size()`), so repeated opens of the same URI skip the network fetch even without an index.
 
 By default the read path runs the *outer* fan-out across `merge` contributors, VRT sources, and DIMAP tiles sequentially — async-geotiff already parallelizes block range requests inside each source, so stacking outer concurrency on top tends to multiply the in-flight HTTP request count without adding throughput on a saturated link. Use `rastera.set_concurrency(merge=N, vrt=N, dimap=N)` to opt into outer fan-out per dispatcher; see the `set_concurrency` docstring for the per-knob trade-offs.
+
+Cross-CRS bilinear/cubic downsampling beyond 2x uses a faster two-pass warp; `rastera.set_warp_strategy("single_pass")` opts out when bit-exact reproducibility matters.
 
 ### Linting & type checking
 

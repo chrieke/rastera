@@ -91,7 +91,6 @@ def _ids(fxs: tuple[Any, ...]) -> list[str]:
 
 
 @pytest.mark.parametrize("fx", CHEAPEST_PER_FAMILY, ids=_ids(CHEAPEST_PER_FAMILY))
-@pytest.mark.asyncio
 async def test_metadata_matches_gdal(fx: Any):
     """rastera's view of the header must equal GDAL's, recorded in the fixture."""
     ds = cast(Any, await rastera.open(fx.s3_uri, skip_signature=False))
@@ -113,7 +112,6 @@ async def test_metadata_matches_gdal(fx: Any):
 
 
 @pytest.mark.parametrize("fx", CHEAPEST_PER_FAMILY, ids=_ids(CHEAPEST_PER_FAMILY))
-@pytest.mark.asyncio
 async def test_reads_match_gdal(fx: Any, tmp_path: Path):
     """Window read, bbox read, and band-subset read, all against GDAL."""
     ds = cast(Any, await rastera.open(fx.s3_uri, skip_signature=False))
@@ -141,7 +139,6 @@ async def test_reads_match_gdal(fx: Any, tmp_path: Path):
 @pytest.mark.parametrize(
     "fx", LUT_FIXTURES, ids=[f"lut{i}" for i in range(len(LUT_FIXTURES))]
 )
-@pytest.mark.asyncio
 async def test_lut_output_matches_gdal_exactly(fx: Any, tmp_path: Path):
     """Regression guard for LUT rounding.
 
@@ -164,7 +161,6 @@ async def test_lut_output_matches_gdal_exactly(fx: Any, tmp_path: Path):
 
 
 @pytest.mark.parametrize("fx", NODATA_ABSENT, ids=["nodata_absent"])
-@pytest.mark.asyncio
 async def test_nodata_absent_reads_match_gdal(fx: Any, tmp_path: Path):
     """A VRT that declares no nodata must report None, not a guessed 0."""
     ds = cast(Any, await rastera.open(fx.s3_uri, skip_signature=False))
@@ -175,7 +171,6 @@ async def test_nodata_absent_reads_match_gdal(fx: Any, tmp_path: Path):
     np.testing.assert_array_equal(got, _gdal_srcwin(fx.vsis3_uri, win, tmp_path))
 
 
-@pytest.mark.asyncio
 async def test_merge_across_seam_matches_gdal_mosaic(tmp_path: Path):
     """Two edge-adjacent VRTs, merged across the shared edge.
 
@@ -217,7 +212,6 @@ async def test_merge_across_seam_matches_gdal_mosaic(tmp_path: Path):
     assert not (got == 0).all(axis=(0, 2)).any()
 
 
-@pytest.mark.asyncio
 async def test_merge_overlap_respects_declared_nodata(tmp_path: Path):
     """Regression guard for the VRT's ``<NoDataValue>`` being honoured.
 

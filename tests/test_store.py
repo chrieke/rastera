@@ -6,241 +6,339 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from rastera.store import (
-    _apply_s3_defaults,
-    _bucket_url,
     _build_store_with,
-    _detect_region,
     _extract_key,
-    _is_s3_uri,
-    _obstore_key,
+    _parse_uri,
+    _require_same_bucket,
     _resolve_local_path,
+    _store_kwargs_for,
 )
 
-# ── _is_s3_uri ──────────────────────────────────────────────────────────
+# ── _parse_uri ───────────────────────────────────────────────────────────
+
+# uri -> (kind, root, key, region, virtual_hosted)
+AWS_URIS = [
+    ("s3://bucket/path/file.tif", "s3://bucket", "path/file.tif", None, False),
+    ("s3://my.dotted.bucket/k.tif", "s3://my.dotted.bucket", "k.tif", None, False),
+    (
+        "https://bucket.s3.us-east-1.amazonaws.com/path/file.tif",
+        "s3://bucket",
+        "path/file.tif",
+        "us-east-1",
+        True,
+    ),
+    (
+        "https://bucket.s3-us-west-2.amazonaws.com/path/file.tif",
+        "s3://bucket",
+        "path/file.tif",
+        "us-west-2",
+        True,
+    ),
+    (
+        "https://s3.ap-southeast-1.amazonaws.com/bucket/path/file.tif",
+        "s3://bucket",
+        "path/file.tif",
+        "ap-southeast-1",
+        False,
+    ),
+    (
+        "https://s3-eu-west-1.amazonaws.com/bucket/path/file.tif",
+        "s3://bucket",
+        "path/file.tif",
+        "eu-west-1",
+        False,
+    ),
+    # Legacy global endpoint carries no region; obstore does not follow S3
+    # region redirects, so it must fall through to the ladder rather than
+    # being pinned to us-east-1.
+    ("https://bucket.s3.amazonaws.com/k.tif", "s3://bucket", "k.tif", None, True),
+    ("https://s3.amazonaws.com/bucket/k.tif", "s3://bucket", "k.tif", None, False),
+    # A dotted bucket cannot go virtual-hosted: single-label wildcard cert.
+    (
+        "https://my.dotted.bucket.s3.us-east-1.amazonaws.com/k.tif",
+        "s3://my.dotted.bucket",
+        "k.tif",
+        "us-east-1",
+        False,
+    ),
+    (
+        "https://BUCKET.S3.US-EAST-1.AMAZONAWS.COM/k.tif",
+        "s3://BUCKET",
+        "k.tif",
+        "us-east-1",
+        True,
+    ),
+    (
+        "https://bucket.s3.cn-north-1.amazonaws.com.cn/k.tif",
+        "s3://bucket",
+        "k.tif",
+        "cn-north-1",
+        True,
+    ),
+    (
+        "https://bucket.s3.us-east-1.amazonaws.com/my%20key/a%2Bb.tif",
+        "s3://bucket",
+        "my key/a+b.tif",
+        "us-east-1",
+        True,
+    ),
+    (
+        "https://s3.us-east-1.amazonaws.com/bucket",
+        "s3://bucket",
+        "",
+        "us-east-1",
+        False,
+    ),
+]
+
+# Each implies an endpoint and addressing style the URL cannot convey.
+UNSUPPORTED_AWS_HOSTS = [
+    "https://bucket.s3.dualstack.us-east-1.amazonaws.com/k.tif",
+    "https://bucket.s3-accelerate.amazonaws.com/k.tif",
+    "https://s3-fips.us-east-1.amazonaws.com/bucket/k.tif",
+    "https://bucket.s3-website-us-east-1.amazonaws.com/k.tif",
+    "https://ap-123456789012.s3-accesspoint.us-east-1.amazonaws.com/k.tif",
+    "https://bucket.s3express-use1-az4.us-east-1.amazonaws.com/k.tif",
+    "https://bucket.s3.us-east-1.vpce.amazonaws.com/k.tif",
+]
 
 
-class TestIsS3Uri:
-    def test_s3_scheme(self):
-        assert _is_s3_uri("s3://bucket/key") is True
+class TestParseUriAws:
+    @pytest.mark.parametrize("uri,root,key,region,vhost", AWS_URIS)
+    def test_normalizes_to_s3_scheme(
+        self, uri: str, root: str, key: str, region: str | None, vhost: bool
+    ):
+        parsed = _parse_uri(uri)
+        assert parsed.kind == "aws"
+        assert (parsed.root, parsed.key) == (root, key)
+        assert parsed.region == region
+        assert parsed.virtual_hosted is vhost
 
-    def test_virtual_hosted_https(self):
-        assert _is_s3_uri("https://bucket.s3.us-east-1.amazonaws.com/key") is True
+    @pytest.mark.parametrize("uri", UNSUPPORTED_AWS_HOSTS)
+    def test_unsupported_endpoint_raises(self, uri: str):
+        with pytest.raises(ValueError, match="Unsupported S3 endpoint"):
+            _parse_uri(uri)
 
-    def test_virtual_hosted_dash(self):
-        assert _is_s3_uri("https://bucket.s3-us-west-2.amazonaws.com/key") is True
-
-    def test_non_s3_https(self):
-        assert _is_s3_uri("https://example.com/file.tif") is False
-
-    def test_local_path(self):
-        assert _is_s3_uri("/tmp/file.tif") is False
-
-    def test_gs_uri(self):
-        assert _is_s3_uri("gs://bucket/key") is False
-
-
-# ── _detect_region ───────────────────────────────────────────────────────
-
-
-class TestDetectRegion:
-    def test_virtual_hosted_dot(self):
-        uri = "https://bucket.s3.eu-north-1.amazonaws.com/key"
-        assert _detect_region(uri) == "eu-north-1"
-
-    def test_virtual_hosted_dash(self):
-        uri = "https://bucket.s3-us-west-2.amazonaws.com/key"
-        assert _detect_region(uri) == "us-west-2"
-
-    def test_path_style(self):
-        uri = "https://s3.ap-southeast-1.amazonaws.com/bucket/key"
-        assert _detect_region(uri) == "ap-southeast-1"
-
-    def test_no_region_in_url(self):
-        assert _detect_region("s3://bucket/key") is None
-
-    def test_non_aws_url(self):
-        assert _detect_region("https://example.com/file.tif") is None
+    def test_region_is_not_read_from_the_path(self):
+        # A substring search over the whole URI reads a region out of an
+        # attacker-controlled path segment.
+        parsed = _parse_uri("https://cdn.evil.com/a/.s3.us-east-1.amazonaws.com/x.tif")
+        assert parsed.kind == "http"
+        assert parsed.region is None
 
 
-# ── _bucket_url ──────────────────────────────────────────────────────────
+class TestParseUriOther:
+    def test_gs_and_az(self):
+        for uri, root in [("gs://b/k/a.tif", "gs://b"), ("az://c/k/a.tif", "az://c")]:
+            parsed = _parse_uri(uri)
+            assert parsed.kind == "cloud"
+            assert (parsed.root, parsed.key) == (root, "k/a.tif")
+
+    def test_generic_https_keeps_the_full_path(self):
+        parsed = _parse_uri("https://cdn.example.com/2024/scene.tif")
+        assert (parsed.kind, parsed.root) == ("http", "https://cdn.example.com")
+        assert parsed.key == "2024/scene.tif"
+
+    def test_generic_https_single_segment(self):
+        assert _extract_key("https://cdn.example.com/scene.tif") == "scene.tif"
+
+    def test_query_string_roots_at_the_full_uri(self):
+        # Host-rooting would drop the token and turn a signed URL into a 403.
+        uri = "https://cdn.example.com/k.tif?token=xyz"
+        parsed = _parse_uri(uri)
+        assert (parsed.root, parsed.key) == (uri, "")
+
+    def test_percent_decodes_generic_https(self):
+        assert _extract_key("https://cdn.example.com/my%20key/a.tif") == "my key/a.tif"
+
+    def test_non_aws_s3_compatible_host_is_plain_http(self):
+        parsed = _parse_uri("https://b.s3.wasabisys.com/k/a.tif")
+        assert (parsed.kind, parsed.root) == ("http", "https://b.s3.wasabisys.com")
+        assert parsed.key == "k/a.tif"
+
+    def test_unknown_scheme_raises(self):
+        with pytest.raises(ValueError, match="Unsupported URI scheme"):
+            _parse_uri("ftp://host/file.tif")
 
 
-class TestBucketUrl:
-    def test_s3_scheme(self):
-        assert _bucket_url("s3://my-bucket/path/to/file") == "s3://my-bucket"
-
-    def test_gs_scheme(self):
-        assert _bucket_url("gs://my-bucket/key") == "gs://my-bucket"
-
-    def test_az_scheme(self):
-        assert _bucket_url("az://container/blob") == "az://container"
-
-    def test_https_virtual_hosted(self):
-        uri = "https://bucket.s3.us-east-1.amazonaws.com/key/file.tif"
-        assert _bucket_url(uri) == "https://bucket.s3.us-east-1.amazonaws.com"
-
-    def test_local_path_returns_parent_uri(self, tmp_path: Path):
-        f = tmp_path / "a.tif"
+class TestParseUriLocal:
+    def test_absolute_path(self, tmp_path: Path):
+        f = tmp_path / "file.tif"
         f.write_bytes(b"")
-        assert _bucket_url(str(f)) == tmp_path.resolve().as_uri()
+        parsed = _parse_uri(str(f))
+        assert parsed.kind == "local"
+        assert parsed.local_path == f.resolve()
+        assert (parsed.root, parsed.key) == (tmp_path.resolve().as_uri(), "file.tif")
 
-    def test_local_siblings_share_bucket(self, tmp_path: Path):
-        a = tmp_path / "a.tif"
-        b = tmp_path / "b.tif"
+    def test_file_uri_is_percent_decoded(self, tmp_path: Path):
+        d = tmp_path / "My Scenes"
+        d.mkdir()
+        f = d / "x.tif"
+        f.write_bytes(b"")
+        parsed = _parse_uri(f.as_uri())
+        assert parsed.local_path == f.resolve()
+
+    def test_dot_s3_in_filename_is_still_local(self, tmp_path: Path):
+        # A substring match on ".s3." classifies this as remote.
+        f = tmp_path / "scene.s3.tif"
+        f.write_bytes(b"")
+        assert _resolve_local_path(str(f)) == f.resolve()
+
+    def test_remote_uris_are_not_local(self):
+        for uri in ["s3://bucket/key", "https://example.com/f.tif"]:
+            assert _resolve_local_path(uri) is None
+
+
+# ── store root ───────────────────────────────────────────────────────────
+
+
+class TestStoreRoot:
+    def test_path_style_keeps_the_bucket(self):
+        # Dropping it yields S3Store(bucket="") — constructs, reads nothing.
+        uri = "https://s3.us-east-1.amazonaws.com/my-bucket/path/file.tif"
+        assert _parse_uri(uri).root == "s3://my-bucket"
+
+    def test_path_style_buckets_do_not_collide(self):
+        a = "https://s3.us-east-1.amazonaws.com/bucket-a/x.tif"
+        b = "https://s3.us-east-1.amazonaws.com/bucket-b/y.tif"
+        assert _parse_uri(a).root != _parse_uri(b).root
+
+    def test_local_siblings_share_a_root(self, tmp_path: Path):
+        a, b = tmp_path / "a.tif", tmp_path / "b.tif"
         a.write_bytes(b"")
         b.write_bytes(b"")
-        assert _bucket_url(str(a)) == _bucket_url(str(b))
-
-    def test_file_uri_returns_parent_uri(self, tmp_path: Path):
-        f = tmp_path / "a.tif"
-        f.write_bytes(b"")
-        assert _bucket_url(f.as_uri()) == tmp_path.resolve().as_uri()
+        root = tmp_path.resolve().as_uri()
+        assert _parse_uri(str(a)).root == _parse_uri(str(b)).root == root
 
 
-# ── _resolve_local_path ─────────────────────────────────────────────────
+# ── _require_same_bucket ─────────────────────────────────────────────────
 
 
-class TestResolveLocalPath:
-    def test_absolute_path(self):
-        result = _resolve_local_path("/tmp/file.tif")
-        assert result is not None
-        assert str(result).endswith("file.tif")
+class TestRequireSameBucket:
+    def test_addressing_style_is_not_a_mismatch(self):
+        """Both spellings of one bucket name the same objects."""
+        _require_same_bucket(
+            [
+                "https://b.s3.eu-north-1.amazonaws.com/a.tif",
+                "https://s3.eu-north-1.amazonaws.com/b/c.tif",
+            ],
+            "testing",
+        )
 
-    def test_s3_uri_returns_none(self):
-        assert _resolve_local_path("s3://bucket/key") is None
+    def test_different_buckets_still_raise(self):
+        with pytest.raises(ValueError, match="same bucket/host"):
+            _require_same_bucket(["s3://bucket-a/x.tif", "s3://bucket-b/x.tif"], "x")
 
-    def test_https_returns_none(self):
-        assert _resolve_local_path("https://example.com/f.tif") is None
-
-    def test_virtual_hosted_s3_returns_none(self):
-        assert _resolve_local_path("https://b.s3.us-east-1.amazonaws.com/k") is None
-
-
-# ── _extract_key ─────────────────────────────────────────────────────────
-
-
-class TestExtractKey:
-    def test_s3_scheme(self):
-        assert _extract_key("s3://bucket/path/to/file.tif") == "path/to/file.tif"
-
-    def test_virtual_hosted_https(self):
-        uri = "https://bucket.s3.us-east-1.amazonaws.com/path/file.tif"
-        assert _extract_key(uri) == "path/file.tif"
-
-    def test_path_style_https(self):
-        uri = "https://s3.us-east-1.amazonaws.com/bucket/path/file.tif"
-        assert _extract_key(uri) == "path/file.tif"
-
-    def test_local_path_returns_filename(self, tmp_path: Path):
-        f = tmp_path / "file.tif"
-        f.write_bytes(b"")
-        assert _extract_key(str(f)) == "file.tif"
-
-    def test_file_uri_returns_filename(self, tmp_path: Path):
-        f = tmp_path / "file.tif"
-        f.write_bytes(b"")
-        assert _extract_key(f.as_uri()) == "file.tif"
-
-    def test_matches_obstore_key_for_cloud_schemes(self):
-        for uri in ["s3://b/k/a.tif", "gs://b/k/a.tif", "az://c/k/a.tif"]:
-            assert _extract_key(uri) == _obstore_key(uri) == "k/a.tif"
+    def test_region_only_some_uris_state_raises(self):
+        """Matched on the region, not the bucket: they agree here, and a message
+        naming only the bucket reads as a bucket mismatch."""
+        with pytest.raises(ValueError, match="in region None"):
+            _require_same_bucket(
+                ["s3://b/a.tif", "https://b.s3.eu-north-1.amazonaws.com/c.tif"], "x"
+            )
 
 
-# ── _apply_s3_defaults ──────────────────────────────────────────────────
+# ── _store_kwargs_for ────────────────────────────────────────────────────
 
 
-class TestApplyS3Defaults:
-    def test_non_s3_uri_is_noop(self):
-        kwargs: dict[str, Any] = {}
-        _apply_s3_defaults(kwargs, "https://example.com/file.tif")
-        assert kwargs == {}
+def _kwargs(uri: str, **caller: Any) -> dict[str, Any]:
+    return _store_kwargs_for(_parse_uri(uri), caller)
 
-    def test_non_s3_uri_strips_skip_signature(self):
-        kwargs: dict[str, Any] = {"skip_signature": False}
-        _apply_s3_defaults(kwargs, "https://example.com/file.tif")
-        assert "skip_signature" not in kwargs
 
-    def test_local_uri_strips_skip_signature(self):
-        kwargs: dict[str, Any] = {"skip_signature": False}
-        _apply_s3_defaults(kwargs, "/tmp/foo.tif")
-        assert "skip_signature" not in kwargs
+class TestStoreKwargs:
+    def test_defaults_to_unsigned(self):
+        assert _kwargs("s3://bucket/key")["skip_signature"] is True
 
-    def test_s3_uri_sets_skip_signature(self):
-        kwargs: dict[str, Any] = {}
-        _apply_s3_defaults(kwargs, "s3://bucket/key")
-        assert kwargs["skip_signature"] is True
+    def test_fallback_region(self):
+        # The autouse _clear_aws_region fixture already unset both vars.
+        assert _kwargs("s3://bucket/key")["region"] == "us-west-2"
 
-    def test_s3_uri_sets_fallback_region(self):
-        kwargs: dict[str, Any] = {}
-        _apply_s3_defaults(kwargs, "s3://bucket/key")
-        assert kwargs["region"] == "us-west-2"
+    def test_env_region_beats_the_fallback(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setenv("AWS_REGION", "eu-west-3")
+        assert _kwargs("s3://bucket/key")["region"] == "eu-west-3"
 
-    def test_region_from_url_takes_precedence(self):
-        kwargs: dict[str, Any] = {}
-        _apply_s3_defaults(kwargs, "https://b.s3.eu-north-1.amazonaws.com/k")
-        assert kwargs["region"] == "eu-north-1"
+    def test_host_region_beats_the_env(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setenv("AWS_REGION", "eu-west-3")
+        uri = "https://b.s3.eu-north-1.amazonaws.com/k"
+        assert _kwargs(uri)["region"] == "eu-north-1"
 
-    def test_explicit_region_not_overwritten(self):
-        kwargs: dict[str, Any] = {"region": "ap-south-1"}
-        _apply_s3_defaults(kwargs, "https://b.s3.eu-north-1.amazonaws.com/k")
-        assert kwargs["region"] == "ap-south-1"
+    def test_conflicting_explicit_region_raises(self):
+        with pytest.raises(ValueError, match="conflicts with the region encoded"):
+            _kwargs("https://b.s3.eu-north-1.amazonaws.com/k", region="ap-south-1")
+
+    def test_matching_explicit_region_is_accepted(self):
+        uri = "https://b.s3.eu-north-1.amazonaws.com/k"
+        assert _kwargs(uri, region="eu-north-1")["region"] == "eu-north-1"
+
+    def test_region_appears_once_when_also_given_in_config(self):
+        # obstore rejects the same key twice with "Duplicate key aws_region".
+        out = _kwargs("s3://bucket/key", config={"region": "eu-west-1"})
+        assert out["region"] == "eu-west-1"
+        assert "config" not in out
+
+    def test_virtual_hosted_style_preserved(self):
+        uri = "https://b.s3.us-east-1.amazonaws.com/k"
+        assert _kwargs(uri)["virtual_hosted_style_request"] is True
+
+    def test_path_style_not_flipped(self):
+        uri = "https://s3.us-east-1.amazonaws.com/b/k"
+        assert "virtual_hosted_style_request" not in _kwargs(uri)
 
     def test_custom_credential_provider_skips_defaults(self):
         provider = MagicMock()
-        kwargs: dict[str, Any] = {"credential_provider": provider}
-        _apply_s3_defaults(kwargs, "s3://bucket/key")
-        assert "skip_signature" not in kwargs
-        assert kwargs["credential_provider"] is provider
+        out = _kwargs("s3://bucket/key", credential_provider=provider)
+        assert "skip_signature" not in out
+        assert out["credential_provider"] is provider
 
-    def test_skip_signature_false_triggers_boto3(self):
-        mock_provider = MagicMock()
-        mock_provider.config = None
-        with patch(
-            "rastera.store.Boto3CredentialProvider",
-            return_value=mock_provider,
-            create=True,
-        ):
-            with patch("rastera.store._apply_boto3_credentials") as mock_apply:
-                kwargs: dict[str, Any] = {"skip_signature": False}
-                _apply_s3_defaults(kwargs, "s3://bucket/key")
-                mock_apply.assert_called_once()
-                assert "skip_signature" not in kwargs
+    def test_skip_signature_false_uses_boto3(self):
+        provider = MagicMock()
+        provider.config = {"region": "ca-central-1"}
+        with patch("rastera.store._boto3_provider", return_value=provider):
+            out = _kwargs("s3://bucket/key", skip_signature=False)
+        assert "skip_signature" not in out
+        assert out["credential_provider"] is provider
+        assert out["region"] == "ca-central-1"
+
+    def test_boto3_unavailable_falls_back_to_unsigned(self):
+        with patch("rastera.store._boto3_provider", return_value=None):
+            out = _kwargs("s3://bucket/key", skip_signature=False)
+        assert out["skip_signature"] is True
+        assert "credential_provider" not in out
+
+    def test_local_strips_skip_signature(self):
+        assert "skip_signature" not in _kwargs("/tmp/foo.tif", skip_signature=False)
+
+    def test_http_strips_s3_defaults(self):
+        # HTTPStore rejects every config kwarg, region included.
+        out = _kwargs("https://cdn.example.com/f.tif", skip_signature=True)
+        assert out == {}
+
+    def test_http_rejects_a_request_to_authenticate(self):
+        # Silently stripping it would downgrade to an anonymous GET that only
+        # fails on private objects.
+        with pytest.raises(ValueError, match="cannot sign requests"):
+            _kwargs("https://b.s3.wasabisys.com/k", skip_signature=False)
+
+    def test_gs_keeps_caller_kwargs(self):
+        assert "region" not in _kwargs("gs://b/k")
 
 
 # ── _build_store_with ────────────────────────────────────────────────────
 
 
 class TestBuildStoreWith:
-    def test_delegates_to_from_url_fn(self):
+    def test_roots_at_the_bucket(self):
         mock_from_url = MagicMock(return_value="store")
-        result = _build_store_with("s3://bucket/key", mock_from_url)
-        assert result == "store"
-        mock_from_url.assert_called_once()
-        # Should be called with the bucket URL, not the full object path
-        call_args = mock_from_url.call_args
-        assert call_args[0][0] == "s3://bucket"
+        assert _build_store_with("s3://bucket/key", mock_from_url) == "store"
+        assert mock_from_url.call_args[0][0] == "s3://bucket"
 
-    def test_local_uri_strips_skip_signature(self):
-        captured: dict[str, Any] = {}
-
-        def fake_from_url(url: str, **kwargs: Any) -> object:
-            captured["url"] = url
-            captured["kwargs"] = kwargs
-            return object()
-
-        _build_store_with("/tmp/foo.tif", fake_from_url, skip_signature=False)
-        assert "skip_signature" not in captured["kwargs"]
-
-    def test_non_s3_https_uri_strips_skip_signature(self):
-        captured: dict[str, Any] = {}
-
-        def fake_from_url(url: str, **kwargs: Any) -> object:
-            captured["url"] = url
-            captured["kwargs"] = kwargs
-            return object()
-
-        _build_store_with(
-            "https://example.com/file.tif", fake_from_url, skip_signature=False
-        )
-        assert "skip_signature" not in captured["kwargs"]
+    def test_local_roots_at_the_parent_directory(self, tmp_path: Path):
+        f = tmp_path / "foo.tif"
+        f.write_bytes(b"")
+        mock_from_url = MagicMock(return_value="store")
+        _build_store_with(str(f), mock_from_url, skip_signature=False)
+        assert mock_from_url.call_args[0][0] == tmp_path.resolve().as_uri()
+        assert "skip_signature" not in mock_from_url.call_args[1]
