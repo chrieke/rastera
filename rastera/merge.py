@@ -47,29 +47,21 @@ async def merge(
     use_overviews: bool = False,
     resampling: ResamplingMethod = "nearest",
 ) -> RasterArray:
-    """
-    Merge a bbox that may span multiple GeoTIFFs and return a single stitched array.
+    """Merge a bbox that may span multiple GeoTIFFs into one stitched array.
 
     Args:
-        cogs: Sequence of opened AsyncGeoTIFF instances
-        bbox: Bounding box of the merged image
-        bbox_crs: EPSG code or ``pyproj.CRS`` of the bbox coordinate
-            system. The bbox is transformed to the COGs' native CRS
-            automatically.
-        band_indices: 1-based band indices to read
-        fill_value: Value used for pixels in `bbox` that aren't covered by any
-            input GeoTIFF (i.e. a "no data" fill; not always 0).
-        target_crs: Output EPSG code or ``pyproj.CRS``. Each COG is
-            reprojected into this CRS before merging when it differs
-            from the source. When ``None``, the CRS is inferred from
-            the inputs using *crs_method*.
-        target_resolution: Output pixel size in target CRS units.
+        bbox_crs: The bbox is transformed to the COGs' native CRS automatically.
+        band_indices: 1-based.
+        fill_value: For pixels in *bbox* covered by no input (not always 0).
+        target_crs: Each COG is reprojected into this CRS before merging when
+            it differs from the source. When ``None``, inferred from the
+            inputs using *crs_method*.
         mosaic_method: Overlap strategy when multiple COGs cover the same pixel.
             ``"first"`` keeps the first valid pixel (matching rasterio.merge
             default). ``"last"`` lets later COGs overwrite earlier ones.
-        crs_method: Strategy for choosing the output CRS when *target_crs*
-            is ``None``. ``"most_common"`` picks the CRS shared by the most
-            inputs; ``"first"`` uses the CRS of the first input.
+        crs_method: How to choose the output CRS when *target_crs* is ``None``.
+            ``"most_common"`` picks the CRS shared by the most inputs;
+            ``"first"`` uses the CRS of the first input.
         snap_to_grid: When True (default), and when all inputs already
             share the target CRS and resolution, the output grid snaps to
             the source pixel grid for an exact 1:1 copy
@@ -80,27 +72,10 @@ async def merge(
             and resampling selects source pixels according to ``resampling``,
             matching rasterio/GDAL behaviour. Each input is always read on
             its own pixel grid; this flag does not change that.
-        use_overviews: When True, reads from pre-computed COG overview
-            levels to save bandwidth. Overview pixels are resampled
-            aggregates, not original measurements — expect reduced
-            variance, dampened extremes, and altered spectral ratios
-            compared to full-resolution data. Suitable for thumbnails
-            or coarse segmentation; avoid for tasks requiring precise
-            pixel values such as spectral index computation or
-            per-pixel regression.
-        resampling: Method used when reprojecting or changing resolution.
-            One of ``"nearest"`` (default; fast, exact, blocky),
-            ``"bilinear"`` (separable linear kernel, smooth, no
-            overshoot), or ``"cubic"`` (Keys cubic, sharper than
-            bilinear, can overshoot the source value range). For
-            bilinear/cubic the kernel widens proportionally when
-            downsampling to act as an anti-aliasing low-pass filter,
-            matching GDAL's warp behaviour. Bilinear and cubic use
-            GDAL-style kernel renormalization around nodata; see
-            :func:`rastera.resampling.resample` for the precise rules.
-
-    Returns:
-        An ``async_geotiff.RasterArray`` containing the merged mosaic.
+        use_overviews: Trades accuracy for bandwidth; see
+            :meth:`rastera.AsyncGeoTIFF.read` for what overview pixels cost.
+        resampling: Used when reprojecting or changing resolution; see
+            :meth:`rastera.AsyncGeoTIFF.read` for the per-method trade-offs.
     """
     if not cogs:
         raise ValueError("merge requires at least one AsyncGeoTIFF")
@@ -138,7 +113,6 @@ async def merge(
     # n_out_bands rows, so those must line up before either dispatches.
     _require_stackable_bands(cogs, band_indices)
 
-    # Decide whether we need the reprojected merge path.
     all_same_crs = all(cog._crs_epsg == base._crs_epsg for cog in cogs[1:])
     all_same_res = all(
         math.isclose(float(cog._geotiff.transform.a), float(base_gt.transform.a))
@@ -189,7 +163,6 @@ async def merge(
         bbox=native_bbox,
     )
 
-    # Get sub bboxes specific to the contributing image
     sub_bboxes: list[tuple[AsyncGeoTIFF, BBox]] = []
     for cog in cogs:
         sub_bbox = native_bbox.intersect(BBox(*cog._geotiff.bounds))
@@ -238,16 +211,13 @@ async def _merge_reprojected(
     use_overviews: bool = False,
     resampling: ResamplingMethod = "nearest",
 ) -> RasterArray:
-    """Merge with reprojection — supports mixed-CRS inputs."""
     base = cogs[0]
     base_gt = base._geotiff
     out_crs = target_crs
 
-    # Transform bbox into the output CRS
     target_bbox = transform_bbox(bbox, bbox_crs, out_crs)
     res = target_resolution
 
-    # Build output grid
     out_transform, out_w, out_h = _grid_for_bbox(target_bbox, res)
 
     # Find contributing COGs by intersecting bounds (in target CRS) with output
@@ -584,7 +554,6 @@ def _resolve_target_crs(
     cogs: Sequence[AsyncGeoTIFF],
     crs_method: Literal["most_common", "first"],
 ) -> int:
-    """Pick a target CRS from the input COGs."""
     if crs_method == "first":
         for cog in cogs:
             if cog._crs_epsg is not None:

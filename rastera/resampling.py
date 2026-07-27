@@ -1,7 +1,10 @@
 """Pixel resampling for resolution changes and reprojection.
 
-Exposes a single public entry point :func:`resample`, which dispatches on a
-``method`` argument to one of three implementations:
+:func:`resample` is the entry point, dispatching on ``method`` to one of three
+implementations. :func:`validate_resampling` is public alongside it so callers
+with a fast path that never reaches :func:`resample` — ``AsyncGeoTIFF.read``'s
+native read, ``merge`` — can still reject an unknown method at their own
+boundary rather than silently ignoring it.
 
 - ``"nearest"`` — nearest-neighbor, memory-tight 1D/2D index path.
 - ``"bilinear"`` — separable linear kernel; 2×2 at upsampling/identity,
@@ -90,21 +93,16 @@ def resample(
     behave identically across sentinel types.
 
     Args:
-        src_array: (bands, h, w) source data.
-        src_transform: Affine pixel→world for source.
-        dst_transform: Affine pixel→world for destination.
-        dst_width: Output width in pixels.
-        dst_height: Output height in pixels.
-        nodata: Fill value for out-of-bounds pixels. Also drives kernel
-            renormalization for bilinear/cubic when set.
-        transformer: pyproj Transformer (target CRS → source CRS).
-            ``None`` if same CRS.
-        method: One of ``"nearest"``, ``"bilinear"``, ``"cubic"``.
+        src_array: ``(bands, h, w)``.
+        src_transform: Pixel→world for the source; *dst_transform* likewise for
+            the destination.
+        nodata: Fill for out-of-bounds pixels, and the sentinel the
+            bilinear/cubic renormalization keys off.
+        transformer: Target CRS → source CRS; ``None`` if same CRS.
         warp_strategy: How a cross-CRS bilinear/cubic warp is carried out.
             ``None`` (default) reads the process-wide setting from
             :func:`rastera.set_warp_strategy`; pass an explicit value to
-            override it for this call (useful in tests). See that function for
-            the ``"auto"`` / ``"single_pass"`` semantics. No effect on nearest
+            override it for this call (useful in tests). No effect on nearest
             (any CRS/scale), same-CRS, or upsampling.
     """
     validate_resampling(method)

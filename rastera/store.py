@@ -131,7 +131,6 @@ def _extract_key(uri: str) -> str:
 
 
 def _resolve_local_path(uri: str) -> Path | None:
-    """Return the resolved Path if *uri* is local, else None."""
     return _parse_uri(uri).local_path
 
 

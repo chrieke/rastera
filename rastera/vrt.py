@@ -3,53 +3,22 @@
 Two flavours are supported:
 
 - *Band-stack* VRTs: each ``<VRTRasterBand>`` is driven by a single
-  ``<SimpleSource>`` or ``<ComplexSource>`` that names a source file and a
-  source band. All sources are assumed to describe the same spatial image; the
-  VRT's own geotransform, SRS, and raster size are ignored in favour of the
-  first source's metadata. Other VRT features (``<AveragedSource>`` /
-  ``<KernelFilteredSource>``, multi-source bands, mosaicking via ``<SrcRect>``
-  / ``<DstRect>``) are out of scope and raise ``NotImplementedError``.
+  ``<SimpleSource>`` or ``<ComplexSource>`` naming a source file and band. All
+  sources are assumed to describe the same spatial image, so the VRT's own
+  geotransform, SRS, and raster size are ignored in favour of the first
+  source's metadata.
 
-  ``<ComplexSource>`` is accepted only when it is *semantically* a
-  ``<SimpleSource>`` — see ``_SIMPLE_SOURCE_CHILDREN``. That is not a
-  technicality: ``gdalbuildvrt -separate`` emits ``<ComplexSource>`` with a
-  ``<NODATA>`` child for every band whose source declares a nodata value, so
-  the canonical band-stack VRT is a ComplexSource one. Any child that
-  transforms pixel *values* (``<ScaleOffset>`` / ``<ScaleRatio>`` /
-  ``<LUT>`` / ``<Exponent>``) or masks them (``<UseMaskBand>`` /
-  ``<ColorTableComponent>``) still raises. ``<NODATA>`` is honoured — and
-  policed — only on ``<ComplexSource>``, which is the only place GDAL reads
-  it (see ``_reject_remapping_nodata``).
-
-  Because that "same spatial image" assumption is load-bearing, anything in
-  the XML that would contradict it is *rejected* rather than ignored — a
-  silently wrong pixel is worse than a missing feature. Dimension-free checks
-  (rect offsets, rect rescaling, value-transforming source children,
-  ``<NODATA>`` that would remap pixels) happen in
-  ``_parse_vrt_xml``; checks that need a source's real size (rects that window
-  or rescale a sub-region, a declared ``rasterXSize`` / ``rasterYSize`` that
-  differs from the source grid, sources of differing size) happen in
-  ``_validate_source_windows`` once the sources are open. Full-extent identity
-  rects — what ``gdalbuildvrt`` normally emits — are accepted; only rects that
-  disagree with the source grid raise. Band-level ``ColorInterp`` /
-  ``Description`` / ``dataType`` are *metadata* and remain inherited from the
-  first source; ``NoDataValue`` is the exception and *is* honoured, because
-  ignoring it makes ``merge`` composite nodata over real pixels (see
-  ``_declared_nodata``) and makes ``bilinear`` / ``cubic`` reads average nodata
-  into the kernel (see ``_VRTDataset._override_nodata``). ``HideNoDataValue``
-  is honoured alongside it (see ``_hides_nodata``).
-
-  Warped VRTs, pixel-function (``VRTDerivedRasterBand``) bands, and GCP/RPC
-  georeferencing are permanently out of scope — implementing them means
-  reimplementing GDAL's warper and expression engine — and raise with a
-  pointer to GDAL/rasterio.
+  That "same spatial image" assumption is load-bearing, so anything in the XML
+  contradicting it is *rejected* rather than ignored — a silently wrong pixel
+  is worse than a missing feature. The ``_reject_*`` guards below each say
+  what they turn away and why; ``_validate_source_windows`` covers the checks
+  that need a source's real size, once the sources are open.
 
 - *Processed* VRTs (``VRTDataset subClass="VRTProcessedDataset"``): a single
-  top-level ``<Input>`` plus a ``<ProcessingSteps>`` block. Only the
-  one-step ``ReflectanceToDisplay``-style LUT pipeline is supported — one
-  ``lut_N`` argument per input band, output dtype Byte. This is what Airbus
-  PNEO / SPOT / Pleiades ship as their *DISPLAY* VRT alongside the
-  reflectance product.
+  top-level ``<Input>`` plus a ``<ProcessingSteps>`` block. Only the one-step
+  ``ReflectanceToDisplay``-style LUT pipeline is supported — one ``lut_N``
+  argument per input band, output dtype Byte. This is what Airbus PNEO / SPOT
+  / Pleiades ship as their *DISPLAY* VRT alongside the reflectance product.
 """
 
 from __future__ import annotations
@@ -495,9 +464,6 @@ class _VRTProcessedDataset(AsyncGeoTIFF):
         )
 
 
-# ---- XML parsing & URI resolution ----
-
-
 def _parse_vrt_xml(
     xml_bytes: bytes, vrt_uri: str
 ) -> list[_VRTBand] | _VRTProcessedSpec:
@@ -587,12 +553,6 @@ def _parse_vrt_xml(
     _declared_nodata(bands)
     return bands
 
-
-# ---- Unsupported-feature guards ----
-#
-# These only ever raise; none of them transform pixels. Splitting them this way
-# keeps the "all sources are the same full image" assumption honest without
-# pulling any GDAL-style warping/mosaicking into rastera.
 
 _GDAL_HINT = "Use GDAL/rasterio for this VRT, or translate it to a COG first."
 
@@ -1103,7 +1063,6 @@ async def _dispatch_source_reads(
     no default on purpose — defaulting to ``None`` would make a caller that
     forgets it silently strip the sources' nodata from the result.
     """
-    # Group output bands by source while preserving output order within each group.
     groups: dict[int, tuple[AsyncGeoTIFF, list[tuple[int, int]]]] = {}
     for out_idx, vrt_idx in enumerate(vrt_indices):
         src, src_band = band_sources[vrt_idx]

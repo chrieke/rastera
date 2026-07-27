@@ -81,7 +81,6 @@ class AsyncGeoTIFF:
 
     @property
     def count(self) -> int:
-        """Number of bands exposed by this dataset."""
         return self._geotiff.count
 
     def _best_overview_for_resolution(self, target_resolution: float):
@@ -186,18 +185,10 @@ class AsyncGeoTIFF:
         """Read image data, optionally reprojecting and resampling.
 
         Args:
-            bbox: (minx, miny, maxx, maxy). Must be in target_crs if set,
-                else dataset CRS.
-            bbox_crs: EPSG code or ``pyproj.CRS`` of the bbox coordinate
-                system. Must match target_crs (or the dataset CRS when
-                target_crs is not set).
-            window: Pixel window (col_off, row_off, width, height). Can
-                combine with target_resolution for resampling but not with
-                target_crs.
-            band_indices: 1-based band indices to read.
-            target_crs: Output EPSG code or ``pyproj.CRS``. When set,
-                data is reprojected.
-            target_resolution: Output pixel size in target CRS units.
+            bbox: Must be in *bbox_crs*, which must equal *target_crs* if set,
+                else the dataset CRS.
+            window: Combines with *target_resolution* but not with *target_crs*.
+            band_indices: 1-based.
             snap_to_grid: When True (default), pixels are copied 1:1 from
                 the source grid and the extent grows outward to whole
                 pixels, so the result contains ``bbox`` and can exceed it
@@ -214,21 +205,13 @@ class AsyncGeoTIFF:
                 or coarse segmentation; avoid for tasks requiring precise
                 pixel values such as spectral index computation or
                 per-pixel regression.
-            resampling: Method used when reprojecting or changing
-                resolution. One of ``"nearest"`` (default; fast, exact,
-                blocky), ``"bilinear"`` (separable linear kernel,
-                smooth, no overshoot), or ``"cubic"`` (Keys cubic,
-                sharper than bilinear, can overshoot the source value
-                range). For bilinear/cubic the kernel widens
-                proportionally when downsampling to act as an
-                anti-aliasing low-pass filter, matching GDAL's warp
-                behaviour. Bilinear and cubic use GDAL-style kernel
-                renormalization around nodata; see
-                :func:`rastera.resampling.resample` for the precise
-                rules.
-
-        Returns:
-            An ``async_geotiff.RasterArray`` containing pixel data and spatial metadata.
+            resampling: Used when reprojecting or changing resolution.
+                ``"nearest"`` (default) is fast, exact and blocky;
+                ``"bilinear"`` is smooth with no overshoot; ``"cubic"`` is
+                sharper but can overshoot the source value range. Both
+                kernels widen when downsampling, to anti-alias as GDAL's
+                warp does, and renormalize around nodata GDAL-style — see
+                :func:`rastera.resampling.resample` for the precise rules.
         """
         gt = self._geotiff
         band_indices = normalize_band_indices(band_indices, gt.count)
@@ -346,7 +329,6 @@ class AsyncGeoTIFF:
         use_overviews: bool,
         resampling: ResamplingMethod,
     ) -> RasterArray:
-        """Read with reprojection and/or resampling."""
         gt = self._geotiff
         src_crs = self._crs_epsg
         out_crs = target_crs or src_crs
@@ -365,7 +347,6 @@ class AsyncGeoTIFF:
         else:
             target_bbox = BBox(*gt.bounds)
 
-        # Determine output resolution
         if target_resolution is not None:
             res = target_resolution
         elif needs_reproject:
@@ -484,10 +465,8 @@ class AsyncGeoTIFF:
             assert bbox is not None
             window = window_from_bbox(readable, bbox, snap_to_grid=snap_to_grid)
 
-        # Use async-geotiff's built-in read (handles tile fetching + stitching)
         result = await readable.read(window=window)
 
-        # Select requested bands
         if band_indices is not None:
             result = dc_replace(
                 result,
@@ -731,7 +710,6 @@ def _make_output_array(
     height: int,
     geotiff: GeoTIFF | _CrsNodata,
 ) -> RasterArray:
-    """Construct a RasterArray for rastera output."""
     return RasterArray(
         data=data,
         mask=None,

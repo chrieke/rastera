@@ -76,13 +76,8 @@ def normalize_band_indices(
 ) -> list[int]:
     """Return a concrete list of 0-based band indices for internal use.
 
-    Args:
-        band_indices: 1-based band indices (matching rasterio convention).
-            ``None`` selects all bands.
-        n_bands: Total number of bands in the dataset.
-
-    Returns:
-        0-based indices suitable for NumPy indexing.
+    *band_indices* is 1-based, matching the rasterio convention; ``None``
+    selects all bands.
     """
     if band_indices is None:
         return list(range(n_bands))
@@ -161,7 +156,6 @@ def window_from_bbox(
     inv = ~meta.transform
     minx, miny, maxx, maxy = bbox.minx, bbox.miny, bbox.maxx, bbox.maxy
 
-    # top-left and bottom-right in pixel coords
     col_min_f, row_max_f = _affine_apply(inv, minx, maxy)
     col_max_f, row_min_f = _affine_apply(inv, maxx, miny)
 
@@ -210,29 +204,21 @@ def compute_paste_slices(
     dst_width: int,
     dst_height: int,
 ) -> tuple[slice, slice, slice, slice] | None:
-    """
-    Compute aligned source/target slices for pasting a read window into a mosaic.
+    """Compute aligned source/target slices for pasting a read window into a mosaic.
 
-    This is used when you have already read a window (described by `src`)
-    and want to paste it into a destination array whose pixel grid is described
-    by `dst_transform` (pixel -> world for the destination).
-
-    `src` must have `.transform`, `.width`, `.height` attributes.
-
-    Returns (dst_rows, dst_cols, src_rows, src_cols) or None if there is no
-    overlap after clipping to destination bounds.
+    For a window already read (described by *src*) that is to be pasted into a
+    destination array whose grid is *dst_transform*. Returns
+    ``(dst_rows, dst_cols, src_rows, src_cols)``, or ``None`` when clipping to
+    the destination leaves no overlap.
     """
     dst_inv_transform = ~dst_transform
 
-    # Top-left world coordinate of the source window.
     wx0, wy0 = _affine_apply(src.transform, 0, 0)
 
-    # Map into destination pixel coordinates.
     dst_c0_f, dst_r0_f = _affine_apply(dst_inv_transform, wx0, wy0)
     dst_c0 = math.floor(dst_c0_f + 0.5)
     dst_r0 = math.floor(dst_r0_f + 0.5)
 
-    # Initial (unclipped) target indices in destination pixel coordinates.
     dst_c1 = dst_c0 + src.width
     dst_r1 = dst_r0 + src.height
 
@@ -247,7 +233,6 @@ def compute_paste_slices(
     if clipped_dst_c0 >= clipped_dst_c1 or clipped_dst_r0 >= clipped_dst_r1:
         return None
 
-    # Corresponding crop on the source window.
     src_c0 = clipped_dst_c0 - dst_c0
     src_r0 = clipped_dst_r0 - dst_r0
     src_c1 = src_c0 + (clipped_dst_c1 - clipped_dst_c0)

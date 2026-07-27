@@ -11,9 +11,7 @@ _vrt_concurrency: int = 1
 _dimap_concurrency: int = 1
 
 # How a cross-CRS warp (bilinear/cubic reprojection) is carried out.  See
-# ``set_warp_strategy`` for semantics.  Default is "auto": heavy cross-CRS
-# downsamples take the faster two-pass route, everything else (nearest of
-# any kind, and all same-CRS resamples) is unchanged.
+# ``set_warp_strategy`` for semantics.
 WarpStrategy = Literal["auto", "single_pass"]
 _warp_strategy: WarpStrategy = "auto"
 
@@ -56,6 +54,8 @@ def set_concurrency(
     Pass ``None`` to leave a value unchanged. Values must be int >= 1.
     """
     global _merge_concurrency, _vrt_concurrency, _dimap_concurrency
+    # Validate all three before assigning any, so one bad argument leaves the
+    # process-wide settings as they were rather than half-applied.
     for name, val in (("merge", merge), ("vrt", vrt), ("dimap", dimap)):
         if val is None:
             continue

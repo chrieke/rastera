@@ -55,16 +55,14 @@ async def build_index(
     bytes needed for zero-network reconstruction via ``open_from_index``.
 
     Args:
-        uris: COG URIs to index.
-        store: Optional pre-constructed obstore store for connection reuse
-            (not the async-tiff store ``rastera.open`` takes).
-        prefetch: Number of header bytes to store per file (default 32KB).
-        concurrency: Maximum number of concurrent file opens (default 100).
-        **store_kwargs: Extra kwargs forwarded to ``obstore.store.from_url``.
+        store: A pre-constructed *obstore* store for connection reuse — not the
+            async-tiff store ``rastera.open`` takes.
+        prefetch: Header bytes stored per file.
+        **store_kwargs: Forwarded to ``obstore.store.from_url``.
 
     Returns:
-        A GeoDataFrame with geometry in EPSG:4326.
-        Write with ``gdf.to_parquet(path)`` for geoparquet.
+        A GeoDataFrame with geometry in EPSG:4326. Write with
+        ``gdf.to_parquet(path)`` for geoparquet.
 
     Raises:
         ValueError: If *uris* span more than one bucket/host. Index each
@@ -122,7 +120,6 @@ async def build_index(
         rows["dtype"].append(str(gt.dtype))
         rows["nodata"].append(src._nodata)
         rows["overviews"].append(json.dumps(src.overviews or []))
-        # Reproject bounds to EPSG:4326 for a consistent geometry column
         b = gt.bounds  # (minx, miny, maxx, maxy)
         geom = box(b[0], b[1], b[2], b[3])
         if src._crs_epsg is not None and src._crs_epsg != 4326:
@@ -150,17 +147,10 @@ async def open_from_index(
     files are never read.
 
     Args:
-        gdf_or_path: A GeoDataFrame or path to a ``.parquet`` geoparquet file.
-        bbox: Optional (minx, miny, maxx, maxy) spatial filter.
-        bbox_crs: EPSG code of the bbox. When omitted, the bbox is assumed
-            to be in the same CRS as the index geometry column (EPSG:4326).
-        store: Optional pre-constructed object store.
-        prefetch: Must match the prefetch value used when building the index.
-        concurrency: Maximum number of concurrent file opens (default 100).
-        **store_kwargs: Extra kwargs forwarded to ``obstore.store.from_url``.
-
-    Returns:
-        List of AsyncGeoTIFF instances ready for ``.read()`` calls.
+        bbox_crs: When omitted, the bbox is assumed to be in the same CRS as
+            the index geometry column (EPSG:4326).
+        prefetch: Must match the value used when building the index.
+        **store_kwargs: Forwarded to ``obstore.store.from_url``.
 
     Raises:
         ValueError: If the selected rows span more than one bucket/host.
@@ -327,7 +317,6 @@ def _filter_gdf(
     bbox: tuple[float, float, float, float],
     bbox_crs: int | None = None,
 ) -> gpd.GeoDataFrame:
-    """Filter a GeoDataFrame by bounding box intersection."""
     minx, miny, maxx, maxy = bbox
     query_geom = box(minx, miny, maxx, maxy)
 
@@ -341,7 +330,6 @@ def _filter_gdf(
 
 
 def _build_obstore(uri: str, **store_kwargs: Any) -> Any:
-    """Build an obstore-compatible object store for the given URI."""
     return _build_store_with(uri, obstore_from_url, **store_kwargs)
 
 
