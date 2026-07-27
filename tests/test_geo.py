@@ -34,26 +34,17 @@ class TestBBox:
         minx, miny, maxx, maxy = b
         assert (minx, miny, maxx, maxy) == (1, 2, 3, 4)
 
-    def test_intersect_overlap(self):
-        a = BBox(0, 0, 10, 10)
-        b = BBox(5, 5, 15, 15)
-        c = a.intersect(b)
-        assert c == BBox(5, 5, 10, 10)
-
-    def test_intersect_no_overlap(self):
-        a = BBox(0, 0, 5, 5)
-        b = BBox(10, 10, 15, 15)
-        assert a.intersect(b) is None
-
-    def test_intersect_edge_touch(self):
-        a = BBox(0, 0, 5, 5)
-        b = BBox(5, 0, 10, 5)
-        assert a.intersect(b) is None  # touching edge = no area
-
-    def test_intersect_contained(self):
-        outer = BBox(0, 0, 10, 10)
-        inner = BBox(2, 2, 8, 8)
-        assert outer.intersect(inner) == inner
+    @pytest.mark.parametrize(
+        ("a", "b", "expected"),
+        [
+            (BBox(0, 0, 10, 10), BBox(5, 5, 15, 15), BBox(5, 5, 10, 10)),
+            (BBox(0, 0, 5, 5), BBox(10, 10, 15, 15), None),
+            (BBox(0, 0, 5, 5), BBox(5, 0, 10, 5), None),  # touching edge = no area
+            (BBox(0, 0, 10, 10), BBox(2, 2, 8, 8), BBox(2, 2, 8, 8)),
+        ],
+    )
+    def test_intersect(self, a: BBox, b: BBox, expected: BBox | None):
+        assert a.intersect(b) == expected
 
 
 # ── ensure_bbox ───────────────────────────────────────────────────────────

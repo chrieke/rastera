@@ -748,44 +748,42 @@ class TestRejectOutOfScopeFeatures:
 
 
 class TestResolveSourceURI:
-    def test_vsis3(self):
-        assert (
-            _resolve_source_uri("/vsis3/bucket/path/to/f.tif", False, "s3://b/x.vrt")
-            == "s3://bucket/path/to/f.tif"
-        )
-
-    def test_vsigs(self):
-        assert (
-            _resolve_source_uri("/vsigs/bucket/key.tif", False, "gs://b/x.vrt")
-            == "gs://bucket/key.tif"
-        )
-
-    def test_vsicurl(self):
-        assert (
-            _resolve_source_uri(
-                "/vsicurl/https://example.com/a.tif", False, "s3://b/x.vrt"
-            )
-            == "https://example.com/a.tif"
-        )
-
-    def test_absolute_s3(self):
-        # relativeToVRT="0" with an already-scheme URI: pass through
-        assert (
-            _resolve_source_uri("s3://other/f.tif", False, "s3://b/x.vrt")
-            == "s3://other/f.tif"
-        )
-
-    def test_relative_s3(self):
-        assert (
-            _resolve_source_uri("sub/f.tif", True, "s3://bucket/vrt/dir/x.vrt")
-            == "s3://bucket/vrt/dir/sub/f.tif"
-        )
-
-    def test_relative_with_parent_traversal(self):
-        assert (
-            _resolve_source_uri("../other/f.tif", True, "s3://bucket/vrt/dir/x.vrt")
-            == "s3://bucket/vrt/other/f.tif"
-        )
+    @pytest.mark.parametrize(
+        ("href", "relative", "vrt_uri", "expected"),
+        [
+            (
+                "/vsis3/bucket/path/to/f.tif",
+                False,
+                "s3://b/x.vrt",
+                "s3://bucket/path/to/f.tif",
+            ),
+            ("/vsigs/bucket/key.tif", False, "gs://b/x.vrt", "gs://bucket/key.tif"),
+            (
+                "/vsicurl/https://example.com/a.tif",
+                False,
+                "s3://b/x.vrt",
+                "https://example.com/a.tif",
+            ),
+            # relativeToVRT="0" with an already-scheme URI: pass through
+            ("s3://other/f.tif", False, "s3://b/x.vrt", "s3://other/f.tif"),
+            (
+                "sub/f.tif",
+                True,
+                "s3://bucket/vrt/dir/x.vrt",
+                "s3://bucket/vrt/dir/sub/f.tif",
+            ),
+            (
+                "../other/f.tif",
+                True,
+                "s3://bucket/vrt/dir/x.vrt",
+                "s3://bucket/vrt/other/f.tif",
+            ),
+        ],
+    )
+    def test_resolves(
+        self, href: str, relative: bool, vrt_uri: str, expected: str
+    ) -> None:
+        assert _resolve_source_uri(href, relative, vrt_uri) == expected
 
     def test_relative_local(self, tmp_path: Path):
         vrt = tmp_path / "sub" / "x.vrt"

@@ -12,15 +12,23 @@ class TestCoerceNodata:
     def test_none_returns_none(self):
         assert _coerce_nodata(None, np.dtype("f4")) is None
 
-    def test_float_for_float_dtype(self):
-        result = _coerce_nodata(-9999.0, np.dtype("f4"))
-        assert result == -9999.0
-        assert isinstance(result, float)
-
-    def test_float_coerced_to_int_for_int_dtype(self):
-        result = _coerce_nodata(255.0, np.dtype("u1"))
-        assert result == 255
-        assert isinstance(result, int)
+    @pytest.mark.parametrize(
+        ("nodata", "dtype", "expected", "expected_type"),
+        [
+            (-9999.0, "f4", -9999.0, float),
+            (255.0, "u1", 255, int),
+            (0.0, "u1", 0, int),
+            # The last two are the dtype bounds, which are inclusive.
+            (-32768.0, "i2", -32768, int),
+            (65535.0, "u2", 65535, int),
+        ],
+    )
+    def test_coerced_to_the_dtype_family(
+        self, nodata: float, dtype: str, expected: float, expected_type: type
+    ):
+        result = _coerce_nodata(nodata, np.dtype(dtype))
+        assert result == expected
+        assert isinstance(result, expected_type)
 
     def test_nan_returns_none_for_int_dtype(self):
         assert _coerce_nodata(float("nan"), np.dtype("u2")) is None
@@ -29,16 +37,6 @@ class TestCoerceNodata:
         result = _coerce_nodata(float("nan"), np.dtype("f4"))
         assert result is not None
         assert math.isnan(result)
-
-    def test_zero_nodata_int(self):
-        result = _coerce_nodata(0.0, np.dtype("u1"))
-        assert result == 0
-        assert isinstance(result, int)
-
-    def test_negative_nodata_int(self):
-        result = _coerce_nodata(-32768.0, np.dtype("i2"))
-        assert result == -32768
-        assert isinstance(result, int)
 
     @pytest.mark.parametrize(
         ("nodata", "dtype"),
@@ -50,7 +48,3 @@ class TestCoerceNodata:
         OverflowError. A VRT declaring <NoDataValue>-9999</NoDataValue> over a
         uint16 source is how this arises."""
         assert _coerce_nodata(nodata, np.dtype(dtype)) is None
-
-    def test_dtype_bounds_are_inclusive(self):
-        assert _coerce_nodata(65535.0, np.dtype("u2")) == 65535
-        assert _coerce_nodata(-32768.0, np.dtype("i2")) == -32768

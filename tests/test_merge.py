@@ -22,6 +22,7 @@ from rastera.merge import (
     merge,
 )
 from rastera.reader import AsyncGeoTIFF, _grid_for_bbox
+from rastera.resampling import ResamplingMethod
 from tests.conftest import (
     make_mock_geotiff,
     make_raster_array,
@@ -567,8 +568,10 @@ class TestMergeReprojected:
         assert result.res[0] == pytest.approx(2.0)  # type: ignore[reportUnknownMemberType]
         cog._read_native.assert_called()
 
-    async def test_merge_resampling_bilinear(self):
-        """merge with resampling='bilinear' produces expected shape and dtype."""
+    @pytest.mark.parametrize("resampling", ["bilinear", "cubic"])
+    async def test_merge_resampling_preserves_a_constant(
+        self, resampling: ResamplingMethod
+    ):
         cog = _make_cog(width=10, height=10, scale=1.0, bands=1)
         native_arr = np.ones((1, 10, 10), dtype=np.uint16) * 7
         native_result = _make_array(native_arr, Affine(1.0, 0, 0, 0, -1.0, 10))
@@ -581,32 +584,11 @@ class TestMergeReprojected:
             band_indices=[1],
             target_crs=32632,
             target_resolution=2.0,
-            resampling="bilinear",
+            resampling=resampling,
         )
         assert result.res[0] == pytest.approx(2.0)  # type: ignore[reportUnknownMemberType]
         assert result.data.dtype == np.uint16  # type: ignore[reportUnknownMemberType]
-        # Constant input → bilinear output is the same constant.
-        assert np.all(result.data == 7)  # type: ignore[reportUnknownMemberType]
-
-    async def test_merge_resampling_cubic(self):
-        """merge with resampling='cubic' produces expected shape and dtype."""
-        cog = _make_cog(width=10, height=10, scale=1.0, bands=1)
-        native_arr = np.ones((1, 10, 10), dtype=np.uint16) * 7
-        native_result = _make_array(native_arr, Affine(1.0, 0, 0, 0, -1.0, 10))
-        cog._read_native = AsyncMock(return_value=native_result)
-
-        result = await merge(
-            [cog],
-            bbox=BBox(0, 0, 10, 10),
-            bbox_crs=32632,
-            band_indices=[1],
-            target_crs=32632,
-            target_resolution=2.0,
-            resampling="cubic",
-        )
-        assert result.res[0] == pytest.approx(2.0)  # type: ignore[reportUnknownMemberType]
-        assert result.data.dtype == np.uint16  # type: ignore[reportUnknownMemberType]
-        # Constant input → cubic output is the same constant (kernel sums to 1).
+        # Both kernels sum to 1, so a constant input survives downsampling.
         assert np.all(result.data == 7)  # type: ignore[reportUnknownMemberType]
 
     async def test_merge_method_first_reprojected(self):
@@ -707,31 +689,30 @@ class TestMergeSeam:
 
 
 class TestResolveTargetCrs:
-    def test_most_common_picks_majority(self):
-        cogs = [_make_cog(crs=32632), _make_cog(crs=32633), _make_cog(crs=32632)]
-        assert _resolve_target_crs(cogs, "most_common") == 32632
-
-    def test_first_picks_first(self):
-        cogs = [_make_cog(crs=32633), _make_cog(crs=32632), _make_cog(crs=32632)]
-        assert _resolve_target_crs(cogs, "first") == 32633
-
-    def test_first_skips_none_crs(self):
-        cogs = [_make_cog(crs=None), _make_cog(crs=32632)]
-        assert _resolve_target_crs(cogs, "first") == 32632
-
-    def test_most_common_skips_none_crs(self):
-        cogs = [_make_cog(crs=None), _make_cog(crs=32632)]
-        assert _resolve_target_crs(cogs, "most_common") == 32632
+    @pytest.mark.parametrize(
+        ("crs_list", "method", "expected"),
+        [
+            ([32632, 32633, 32632], "most_common", 32632),
+            ([32633, 32632, 32632], "first", 32633),
+            ([None, 32632], "first", 32632),
+            ([None, 32632], "most_common", 32632),
+            ([4326], "most_common", 4326),
+            ([4326], "first", 4326),
+        ],
+    )
+    def test_picks(
+        self,
+        crs_list: list[int | None],
+        method: Literal["most_common", "first"],
+        expected: int,
+    ):
+        cogs = [_make_cog(crs=c) for c in crs_list]
+        assert _resolve_target_crs(cogs, method) == expected
 
     def test_all_none_raises(self):
         cogs = [_make_cog(crs=None), _make_cog(crs=None)]
         with pytest.raises(ValueError, match="No CRS found"):
             _resolve_target_crs(cogs, "most_common")
-
-    def test_single_cog(self):
-        cogs = [_make_cog(crs=4326)]
-        assert _resolve_target_crs(cogs, "most_common") == 4326
-        assert _resolve_target_crs(cogs, "first") == 4326
 
 
 # ── concurrency: merge ─────────────────────────────────────────────
