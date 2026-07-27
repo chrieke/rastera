@@ -203,9 +203,6 @@ async def open_from_index(
     return list(await asyncio.gather(*(_open_one(u) for u in uris)))
 
 
-# ---- Internal helpers ----
-
-
 class HeaderCacheStore:
     """Obspec-compatible store wrapper that serves pre-fetched header bytes from cache.
 
@@ -287,6 +284,9 @@ class HeaderCacheStore:
                 results[idx] = bytes(data)
 
         return cast(list[bytes], results)
+
+
+# ---- Internal helpers ----
 
 
 def _read_geoparquet(

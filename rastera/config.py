@@ -4,6 +4,8 @@ import asyncio
 from collections.abc import Awaitable, Coroutine
 from typing import Literal, TypeVar
 
+T = TypeVar("T")
+
 _merge_concurrency: int = 1
 _vrt_concurrency: int = 1
 _dimap_concurrency: int = 1
@@ -90,9 +92,6 @@ def set_warp_strategy(strategy: WarpStrategy) -> None:
         raise ValueError(f"warp strategy must be one of {valid}, got {strategy!r}")
     global _warp_strategy
     _warp_strategy = strategy
-
-
-T = TypeVar("T")
 
 
 async def _gather_bounded(n: int, coros: list[Awaitable[T]]) -> list[T]:

@@ -141,6 +141,15 @@ def resample(
     )
 
 
+def validate_resampling(method: str) -> None:
+    """Reject an unknown resampling method."""
+    if method not in _RESAMPLING_METHODS:
+        expected = ", ".join(repr(m) for m in _RESAMPLING_METHODS)
+        raise ValueError(
+            f"Unknown resampling method {method!r}; expected one of {expected}."
+        )
+
+
 def _resample_nearest(
     src_array: np.ndarray,
     src_transform: Affine,
@@ -469,15 +478,6 @@ def _validate_grids(
     if dst_width < 0 or dst_height < 0:
         raise ValueError(
             f"dst_width/dst_height must be >= 0, got {dst_width}x{dst_height}"
-        )
-
-
-def validate_resampling(method: str) -> None:
-    """Reject an unknown resampling method."""
-    if method not in _RESAMPLING_METHODS:
-        expected = ", ".join(repr(m) for m in _RESAMPLING_METHODS)
-        raise ValueError(
-            f"Unknown resampling method {method!r}; expected one of {expected}."
         )
 
 

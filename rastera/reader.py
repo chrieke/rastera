@@ -547,43 +547,6 @@ class AsyncGeoTIFF:
         )
 
 
-async def _open_many(
-    uris: Sequence[str],
-    *,
-    store: Any = None,
-    prefetch: int = 32768,
-    cache: bool = True,
-    meta_overrides: MetaOverrides | None = None,
-    **store_kwargs: Any,
-) -> list[AsyncGeoTIFF]:
-    """Open multiple GeoTIFFs concurrently with a shared store."""
-    uris = list(uris)
-    if not uris:
-        return []
-    if store is None:
-        _require_same_bucket(uris, "using a shared store")
-        store = _build_store(uris[0], **store_kwargs)
-    # store_kwargs is forwarded as well as consumed above: plain TIFF opens
-    # ignore it once `store` is set, but the VRT and DIMAP branches need it to
-    # build their own obstore for the descriptor fetch (the async-tiff and
-    # obstore store types are not interchangeable).
-    return list(
-        await asyncio.gather(
-            *(
-                AsyncGeoTIFF.open(
-                    u,
-                    store=store,
-                    prefetch=prefetch,
-                    cache=cache,
-                    meta_overrides=meta_overrides,
-                    **store_kwargs,
-                )
-                for u in uris
-            )
-        )
-    )
-
-
 @overload
 async def open(
     uri: str,
@@ -650,6 +613,43 @@ async def open(
         cache=cache,
         meta_overrides=meta_overrides,
         **store_kwargs,
+    )
+
+
+async def _open_many(
+    uris: Sequence[str],
+    *,
+    store: Any = None,
+    prefetch: int = 32768,
+    cache: bool = True,
+    meta_overrides: MetaOverrides | None = None,
+    **store_kwargs: Any,
+) -> list[AsyncGeoTIFF]:
+    """Open multiple GeoTIFFs concurrently with a shared store."""
+    uris = list(uris)
+    if not uris:
+        return []
+    if store is None:
+        _require_same_bucket(uris, "using a shared store")
+        store = _build_store(uris[0], **store_kwargs)
+    # store_kwargs is forwarded as well as consumed above: plain TIFF opens
+    # ignore it once `store` is set, but the VRT and DIMAP branches need it to
+    # build their own obstore for the descriptor fetch (the async-tiff and
+    # obstore store types are not interchangeable).
+    return list(
+        await asyncio.gather(
+            *(
+                AsyncGeoTIFF.open(
+                    u,
+                    store=store,
+                    prefetch=prefetch,
+                    cache=cache,
+                    meta_overrides=meta_overrides,
+                    **store_kwargs,
+                )
+                for u in uris
+            )
+        )
     )
 
 
