@@ -5,7 +5,6 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import numpy as np
 import pytest
-from affine import Affine
 
 gpd = pytest.importorskip("geopandas")
 box = pytest.importorskip("shapely.geometry").box
@@ -16,6 +15,7 @@ from rastera.index import (  # noqa: E402
     open_from_index,
 )
 from rastera.reader import AsyncGeoTIFF  # noqa: E402
+from tests.conftest import make_mock_geotiff  # noqa: E402
 
 # ── Helpers ──────────────────────────────────────────────────────────────
 
@@ -31,24 +31,15 @@ def _make_mock_async_geotiff(
     nodata: float | None = None,
 ) -> MagicMock:
     """Build a mock AsyncGeoTIFF with _geotiff, _crs_epsg, _nodata."""
-    transform = Affine(scale, 0, 0, 0, -scale, height * scale)
-    bounds = (0, 0, width * scale, height * scale)
-
-    gt = MagicMock()
-    gt.width = width
-    gt.height = height
-    gt.count = count
-    gt.dtype = dtype
-    gt.nodata = float(nodata) if nodata is not None else None
-    gt.transform = transform
-    gt.res = (scale, scale)
-    gt.bounds = bounds
-    gt.tile_width = 256
-    gt.tile_height = 256
-    crs_mock = MagicMock()
-    crs_mock.to_epsg.return_value = crs_epsg
-    gt.crs = crs_mock
-    gt.overviews = []
+    gt = make_mock_geotiff(
+        width=width,
+        height=height,
+        scale=scale,
+        count=count,
+        dtype=dtype,
+        nodata=float(nodata) if nodata is not None else None,
+        crs_epsg=crs_epsg,
+    )
 
     obj = MagicMock(spec=AsyncGeoTIFF)
     obj.uri = uri

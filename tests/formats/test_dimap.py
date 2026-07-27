@@ -1063,14 +1063,6 @@ class TestReadDefaults:
 # ── concurrency: dimap ─────────────────────────────────────────────
 
 
-@pytest.fixture
-def _reset_dimap_concurrency():
-    yield
-    import rastera
-
-    rastera.set_concurrency(merge=1, vrt=1, dimap=1)
-
-
 class TestDIMAPConcurrencyInvariance:
     """Output across (group, tile) fan-out must match the n=1 baseline."""
 
@@ -1097,7 +1089,7 @@ class TestDIMAPConcurrencyInvariance:
         return ds
 
     @pytest.mark.parametrize("n", [1, 2, 8])
-    async def test_pixel_equal_across_n(self, n: int, _reset_dimap_concurrency: None):
+    async def test_pixel_equal_across_n(self, n: int):
         import rastera
 
         rastera.set_concurrency(dimap=1)

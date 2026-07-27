@@ -18,7 +18,7 @@ from rastera.vrt import (
     _VRTProcessedDataset,
     _VRTProcessedSpec,
 )
-from tests.conftest import make_mock_geotiff
+from tests.conftest import make_mock_geotiff, make_raster_array
 
 # ── fixtures ────────────────────────────────────────────────────────────────
 
@@ -72,16 +72,7 @@ def _src_array(shape: tuple[int, int, int], *, dtype: Any = np.uint16) -> Raster
         data[i] = (i + 1) * 100
     geotiff = MagicMock()
     geotiff.nodata = 0
-    return RasterArray(
-        data=data,
-        mask=None,
-        width=shape[2],
-        height=shape[1],
-        count=shape[0],
-        transform=Affine(1, 0, 0, 0, -1, shape[1]),
-        _alpha_band_idx=None,
-        _geotiff=geotiff,
-    )
+    return make_raster_array(data, Affine(1, 0, 0, 0, -1, shape[1]), geotiff)
 
 
 # ── LUT compiler ────────────────────────────────────────────────────────────

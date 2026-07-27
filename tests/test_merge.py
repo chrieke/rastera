@@ -22,45 +22,14 @@ from rastera.merge import (
     merge,
 )
 from rastera.reader import AsyncGeoTIFF, _grid_for_bbox
-from tests.conftest import slicing_read, spy_read_native
+from tests.conftest import (
+    make_mock_geotiff,
+    make_raster_array,
+    slicing_read,
+    spy_read_native,
+)
 
 # ── Helpers ──────────────────────────────────────────────────────────────
-
-
-def _make_geotiff_stub(
-    width: int = 100,
-    height: int = 100,
-    scale: float = 10.0,
-    count: int = 1,
-    origin_x: float = 0.0,
-    origin_y: float | None = None,
-    crs_epsg: int | None = 32632,
-    dtype: np.dtype[Any] = np.dtype("u2"),
-    nodata: float | None = None,
-):
-    """Build a MagicMock that quacks like async_geotiff.GeoTIFF."""
-    if origin_y is None:
-        origin_y = height * scale
-    transform = Affine(scale, 0, origin_x, 0, -scale, origin_y)
-    bounds = (origin_x, origin_y - height * scale, origin_x + width * scale, origin_y)
-
-    gt = MagicMock()
-    gt.width = width
-    gt.height = height
-    gt.count = count
-    gt.dtype = dtype
-    gt.nodata = float(nodata) if nodata is not None else None
-    gt.transform = transform
-    gt.res = (scale, scale)
-    gt.bounds = bounds
-    gt.tile_width = 256
-    gt.tile_height = 256
-
-    crs_mock = MagicMock()
-    crs_mock.to_epsg.return_value = crs_epsg
-    gt.crs = crs_mock
-    gt.overviews = []
-    return gt
 
 
 def _make_cog(
@@ -75,7 +44,7 @@ def _make_cog(
     nodata: float | None = None,
 ):
     """Build a mock AsyncGeoTIFF."""
-    gt = _make_geotiff_stub(
+    gt = make_mock_geotiff(
         width=width,
         height=height,
         scale=scale,
@@ -84,7 +53,7 @@ def _make_cog(
         origin_y=origin_y,
         crs_epsg=crs,
         dtype=dtype,
-        nodata=nodata,
+        nodata=float(nodata) if nodata is not None else None,
     )
     cog = MagicMock()
     cog._geotiff = gt
@@ -115,16 +84,7 @@ def _make_array(
         geotiff.nodata = float(nodata) if nodata is not None else None
         geotiff.crs = MagicMock()
         geotiff.crs.to_epsg.return_value = 32632
-    return RasterArray(
-        data=data,
-        mask=None,
-        width=data.shape[2],
-        height=data.shape[1],
-        count=data.shape[0],
-        transform=transform,
-        _alpha_band_idx=None,
-        _geotiff=geotiff,
-    )
+    return make_raster_array(data, transform, geotiff)
 
 
 # ── _mosaic_grid_from_bbox ───────────────────────────────────────────────
@@ -777,14 +737,6 @@ class TestResolveTargetCrs:
 # ── concurrency: merge ─────────────────────────────────────────────
 
 
-@pytest.fixture
-def _reset_merge_concurrency():
-    yield
-    import rastera
-
-    rastera.set_concurrency(merge=1, vrt=1, dimap=1)
-
-
 def _make_strip_cog(origin_x: float, value: int):
     """A 10×10 single-band COG at (origin_x, 0..10) returning *value*."""
     cog = _make_cog(width=10, height=10, scale=1.0, bands=1, origin_x=origin_x)
@@ -804,7 +756,6 @@ class TestMergeConcurrencyInvariance:
         self,
         n: int,
         mosaic_method: Literal["first", "last"],
-        _reset_merge_concurrency: None,
     ):
         """Output must match the n=1 baseline pixel-for-pixel for any n."""
         import rastera
@@ -839,7 +790,7 @@ class TestMergeConcurrencyInvariance:
         baseline_data: np.ndarray[Any, Any] = baseline.data  # type: ignore[reportUnknownMemberType]
         assert np.array_equal(result_data, baseline_data)
 
-    async def test_first_mode_still_early_exits(self, _reset_merge_concurrency: None):
+    async def test_first_mode_still_early_exits(self):
         """With mosaic_method='first', first batch fully fills output → later
         batches should not be read at all."""
         import rastera
@@ -981,7 +932,7 @@ def _real_utm_cog(with_overview: bool = False) -> tuple[AsyncGeoTIFF, Any]:
     Real, not a MagicMock, so ``read()`` and ``merge()`` can be compared on the
     same object and both go through the production seam.
     """
-    gt = _make_geotiff_stub(
+    gt = make_mock_geotiff(
         width=400,
         height=400,
         scale=10.0,
@@ -993,7 +944,7 @@ def _real_utm_cog(with_overview: bool = False) -> tuple[AsyncGeoTIFF, Any]:
     gt.read = slicing_read(gt, np.zeros((1, 400, 400), np.uint16))
     ov = None
     if with_overview:
-        ov = _make_geotiff_stub(
+        ov = make_mock_geotiff(
             width=200,
             height=200,
             scale=20.0,

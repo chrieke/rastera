@@ -1,7 +1,6 @@
 """Unit tests for internal band-stack VRT support."""
 
 import math
-from collections.abc import Iterator
 from pathlib import Path
 from typing import Any, TypedDict
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -23,7 +22,7 @@ from rastera.vrt import (
     _VRTBand,
     _VRTDataset,
 )
-from tests.conftest import make_mock_geotiff
+from tests.conftest import make_mock_geotiff, make_raster_array
 
 # ── fixtures / helpers ──────────────────────────────────────────────────────
 
@@ -79,16 +78,7 @@ def _read_result(
     geotiff.nodata = None
     geotiff.crs = MagicMock()
     geotiff.crs.to_epsg.return_value = 3006
-    return RasterArray(
-        data=data,
-        mask=None,
-        width=shape[2],
-        height=shape[1],
-        count=shape[0],
-        transform=Affine(1, 0, 0, 0, -1, shape[1]),
-        _alpha_band_idx=None,
-        _geotiff=geotiff,
-    )
+    return make_raster_array(data, Affine(1, 0, 0, 0, -1, shape[1]), geotiff)
 
 
 # ── parser ──────────────────────────────────────────────────────────────────
@@ -1499,12 +1489,6 @@ class TestFetchLocal:
 # ── concurrency: vrt ─────────────────────────────────────────────
 
 
-@pytest.fixture
-def _reset_vrt_concurrency() -> Iterator[None]:
-    yield
-    rastera.set_concurrency(vrt=1)
-
-
 def _mocked_rgbnir_ds() -> _VRTDataset:
     """``_make_rgbnir_ds`` with both sources' reads stubbed to distinct fills,
     so a group/result mix-up in the reassembly shows up as wrong pixels."""
@@ -1517,9 +1501,7 @@ def _mocked_rgbnir_ds() -> _VRTDataset:
 
 class TestVRTConcurrencyInvariance:
     @pytest.mark.parametrize("n", [1, 8])
-    async def test_pixel_equal_across_n(
-        self, n: int, _reset_vrt_concurrency: None
-    ) -> None:
+    async def test_pixel_equal_across_n(self, n: int) -> None:
         rastera.set_concurrency(vrt=1)
         baseline = await _mocked_rgbnir_ds().read()
 

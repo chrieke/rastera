@@ -10,12 +10,6 @@ import rastera
 from rastera import config
 
 
-@pytest.fixture(autouse=True)
-def _reset_concurrency():
-    yield
-    rastera.set_concurrency(merge=1, vrt=1, dimap=1)
-
-
 class TestSetConcurrencyValidation:
     @pytest.mark.parametrize("bad", [0, -1, 1.5, "x", True, False])
     def test_rejects_invalid(self, bad: Any):

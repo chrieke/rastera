@@ -19,7 +19,12 @@ from rastera.reader import (
     set_cache_size,
 )
 from rastera.resampling import resample
-from tests.conftest import make_mock_geotiff, slicing_read, spy_read_native
+from tests.conftest import (
+    make_mock_geotiff,
+    make_raster_array,
+    slicing_read,
+    spy_read_native,
+)
 
 # ── Helpers ──────────────────────────────────────────────────────────────
 
@@ -40,16 +45,7 @@ def _make_read_result(
         geotiff.nodata = None
         geotiff.crs = MagicMock()
         geotiff.crs.to_epsg.return_value = 32632
-    return RasterArray(
-        data=data,
-        mask=None,
-        width=shape[2],
-        height=shape[1],
-        count=shape[0],
-        transform=transform,
-        _alpha_band_idx=None,
-        _geotiff=geotiff,
-    )
+    return make_raster_array(data, transform, geotiff)
 
 
 # ── Construction & properties ────────────────────────────────────────────
