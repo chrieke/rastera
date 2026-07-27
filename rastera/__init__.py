@@ -10,7 +10,10 @@ from .merge import merge
 from .reader import AsyncGeoTIFF, clear_cache, open, set_cache_size
 
 if TYPE_CHECKING:
-    from .index import build_index, open_from_index
+    # ``as`` marks these re-exported without __all__, which would make
+    # `from rastera import *` force the very import they exist to defer.
+    from .index import build_index as build_index
+    from .index import open_from_index as open_from_index
 
 __all__ = [
     "RasterArray",
@@ -23,8 +26,6 @@ __all__ = [
     "set_warp_strategy",
     "open",
     "merge",
-    "build_index",
-    "open_from_index",
 ]
 
 _INDEX_EXPORTS = ("build_index", "open_from_index")
@@ -42,6 +43,8 @@ if not TYPE_CHECKING:
             try:
                 from . import index
             except ImportError as exc:
+                # ImportError over AttributeError: a missing extra is an
+                # install problem. Trade-off: `hasattr` propagates it, not False.
                 raise ImportError(
                     f"rastera.{name} requires the optional index dependencies; "
                     'install them with `pip install "rastera[index]"`.'

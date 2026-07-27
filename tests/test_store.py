@@ -12,6 +12,7 @@ from rastera.store import (
     _build_store_with,
     _extract_key,
     _parse_uri,
+    _require_same_bucket,
     _resolve_local_path,
     _store_kwargs_for,
 )
@@ -211,6 +212,33 @@ class TestStoreRoot:
         b.write_bytes(b"")
         root = tmp_path.resolve().as_uri()
         assert _parse_uri(str(a)).root == _parse_uri(str(b)).root == root
+
+
+# ── _require_same_bucket ─────────────────────────────────────────────────
+
+
+class TestRequireSameBucket:
+    def test_addressing_style_is_not_a_mismatch(self):
+        """Both spellings of one bucket name the same objects."""
+        _require_same_bucket(
+            [
+                "https://b.s3.eu-north-1.amazonaws.com/a.tif",
+                "https://s3.eu-north-1.amazonaws.com/b/c.tif",
+            ],
+            "testing",
+        )
+
+    def test_different_buckets_still_raise(self):
+        with pytest.raises(ValueError, match="same bucket/host"):
+            _require_same_bucket(["s3://bucket-a/x.tif", "s3://bucket-b/x.tif"], "x")
+
+    def test_region_only_some_uris_state_raises(self):
+        """Matched on the region, not the bucket: they agree here, and a message
+        naming only the bucket reads as a bucket mismatch."""
+        with pytest.raises(ValueError, match="in region None"):
+            _require_same_bucket(
+                ["s3://b/a.tif", "https://b.s3.eu-north-1.amazonaws.com/c.tif"], "x"
+            )
 
 
 # ── _store_kwargs_for ────────────────────────────────────────────────────

@@ -81,9 +81,12 @@ class ParsedURI:
     virtual_hosted: bool = False
 
     @property
-    def identity(self) -> tuple[str, str | None, bool]:
-        """What must match for two URIs to share one store."""
-        return (self.root, self.region, self.virtual_hosted)
+    def identity(self) -> tuple[str, str | None]:
+        """What must match for two URIs to share one store.
+
+        Not addressing style — both spellings reach the same objects.
+        """
+        return (self.root, self.region)
 
 
 def _parse_uri(uri: str) -> ParsedURI:
@@ -139,14 +142,16 @@ def _require_same_bucket(uris: Sequence[str], reason: str) -> None:
 
     A store is rooted at one bucket and object keys carry no bucket, so a
     mixed-bucket list either 404s or — when two buckets mirror a key path —
-    silently serves one file's bytes for another's URI.
+    silently serves one file's bytes for another's URI. A region only some URIs
+    state also counts: the store comes from the first, so a later one is dropped.
     """
     first = _parse_uri(uris[0])
     mismatched = [u for u in uris[1:] if _parse_uri(u).identity != first.identity]
     if mismatched:
         raise ValueError(
             f"All URIs must belong to the same bucket/host when {reason}. "
-            f"First URI resolves to {first.root!r}, but these do not: {mismatched}"
+            f"First URI resolves to bucket {first.root!r} in region "
+            f"{first.region!r}, but these do not: {mismatched}"
         )
 
 

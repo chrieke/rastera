@@ -341,9 +341,9 @@ class TestTransformBbox:
         interior point; hulling densified *edges* tops out near lat 56.
         """
         result = transform_bbox(BBox(-3850000, -5350000, 3750000, 5850000), 3413, 4326)
-        assert result.maxy == pytest.approx(90.0)
-        assert result.minx == pytest.approx(-180.0)
-        assert result.maxx == pytest.approx(180.0)
+        assert result.maxy == pytest.approx(90.0)  # type: ignore[reportUnknownMemberType]
+        assert result.minx == pytest.approx(-180.0)  # type: ignore[reportUnknownMemberType]
+        assert result.maxx == pytest.approx(180.0)  # type: ignore[reportUnknownMemberType]
 
     def test_antimeridian_crossing_raises(self):
         """UTM zone 60N straddles the dateline; its 4326 envelope wraps."""
