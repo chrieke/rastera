@@ -42,6 +42,10 @@ _RESAMPLING_METHODS = ("nearest", "bilinear", "cubic")
 # two-pass split has no benefit) the single-pass warp is used.
 _AUTO_SCALE_THRESHOLD = 2.0
 
+# Kernel half-width in source pixels at unit scale: bilinear samples 2x2, cubic
+# 4x4.  Downsampling widens it (see the anti-aliasing expansion below).
+_BASE_RADIUS = {"bilinear": 1, "cubic": 2}
+
 
 def resample(
     src_array: np.ndarray,
@@ -216,7 +220,7 @@ def _resample_kernel(
     nodata: int | float | None,
     transformer: Transformer | None,
     method: Literal["bilinear", "cubic"],
-    warp_strategy: WarpStrategy = "single_pass",
+    warp_strategy: WarpStrategy,
 ) -> np.ndarray:
     """Bilinear or cubic resampling with GDAL-style nodata renormalization
     and anti-aliasing kernel expansion for downsampling.
@@ -338,9 +342,8 @@ def _resample_kernel(
     # upsampling (scale < 1) the kernel keeps its default radius.
     x_filter = max(1.0, x_scale_local)
     y_filter = max(1.0, y_scale_local)
-    base_radius = 1 if method == "bilinear" else 2
-    n_x_radius = math.ceil(base_radius * x_filter)
-    n_y_radius = math.ceil(base_radius * y_filter)
+    n_x_radius = math.ceil(_BASE_RADIUS[method] * x_filter)
+    n_y_radius = math.ceil(_BASE_RADIUS[method] * y_filter)
     x_offsets = tuple(range(1 - n_x_radius, n_x_radius + 1))
     y_offsets = tuple(range(1 - n_y_radius, n_y_radius + 1))
 
@@ -472,9 +475,9 @@ def _validate_grids(
 def validate_resampling(method: str) -> None:
     """Reject an unknown resampling method."""
     if method not in _RESAMPLING_METHODS:
+        expected = ", ".join(repr(m) for m in _RESAMPLING_METHODS)
         raise ValueError(
-            f"Unknown resampling method {method!r}; "
-            "expected 'nearest', 'bilinear', or 'cubic'."
+            f"Unknown resampling method {method!r}; expected one of {expected}."
         )
 
 
@@ -530,25 +533,21 @@ def _coarse_grid_transform(
     dst_transform: Affine,
     src_transform: Affine,
     transformer: Transformer,
-    step: int = _WARP_GRID_STEP,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Transform dst pixels to src pixel coords via coarse-grid interpolation.
 
     Instead of transforming every destination pixel through pyproj, transforms a
-    coarse grid (every ``step`` pixels) and bilinearly interpolates the rest.
-
-    Returns ``(src_col_f, src_row_f)`` as float arrays of shape
-    ``(dst_height, dst_width)``.
+    coarse grid (every ``_WARP_GRID_STEP`` pixels) and bilinearly interpolates
+    the rest.
     """
-    # Build coarse grid nodes, always including the last pixel.
-    coarse_cols = np.arange(0, dst_width, step, dtype=np.float64)
+    # The last pixel is always a node, so interpolation never extrapolates.
+    coarse_cols = np.arange(0, dst_width, _WARP_GRID_STEP, dtype=np.float64)
     if coarse_cols[-1] < dst_width - 1:
         coarse_cols = np.append(coarse_cols, dst_width - 1)
-    coarse_rows = np.arange(0, dst_height, step, dtype=np.float64)
+    coarse_rows = np.arange(0, dst_height, _WARP_GRID_STEP, dtype=np.float64)
     if coarse_rows[-1] < dst_height - 1:
         coarse_rows = np.append(coarse_rows, dst_height - 1)
 
-    # Transform coarse grid: dst pixel centers → world → source CRS → source pixels
     cc, cr = np.meshgrid(coarse_cols + 0.5, coarse_rows + 0.5)
     cwx = float(dst_transform.a) * cc + float(dst_transform.c)
     cwy = float(dst_transform.e) * cr + float(dst_transform.f)
@@ -907,7 +906,6 @@ def _resample_two_pass(
     runs and how its output relates to the single-pass warp.
     """
     n_bands, h, w = src_array.shape
-    base_radius = 1 if method == "bilinear" else 2
 
     # Per-axis: only ever downsample (scale <= 1 axes keep source resolution).
     sx = max(1.0, x_scale)
@@ -922,7 +920,7 @@ def _resample_two_pass(
 
     # Halo (intermediate pixels) >= Pass A's edge reach, plus one for the
     # cubic gate's slightly longer reach at nodata boundaries.
-    halo = base_radius + 1
+    halo = _BASE_RADIUS[method] + 1
     inter_w = core_w + 2 * halo
     inter_h = core_h + 2 * halo
     origin_x = float(src_transform.c) - halo * inter_a
@@ -975,5 +973,4 @@ def _kernel_halo(method: ResamplingMethod, scale: float) -> int:
     """
     if method == "nearest":
         return 0
-    base_radius = 1 if method == "bilinear" else 2
-    return math.ceil(base_radius * max(1.0, scale))
+    return math.ceil(_BASE_RADIUS[method] * max(1.0, scale))

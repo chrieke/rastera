@@ -554,11 +554,9 @@ def _parse_vrt_xml(
                 f"VRT band {band_no} uses <{src.tag}>; only <SimpleSource> "
                 f"and <ComplexSource> are supported"
             )
-        filename_el = src.find("SourceFilename")
-        if filename_el is None or not filename_el.text:
-            raise ValueError(f"Malformed VRT band {band_no}: missing <SourceFilename>")
-        relative = filename_el.attrib.get("relativeToVRT", "0") == "1"
-        source_uri = _resolve_source_uri(filename_el.text, relative, vrt_uri)
+        source_uri = _source_filename_uri(
+            src, vrt_uri, f"Malformed VRT band {band_no}: missing <SourceFilename>"
+        )
         source_band_el = src.find("SourceBand")
         source_band = (
             int(source_band_el.text)
@@ -1043,6 +1041,15 @@ def _resolve_source_uri(filename: str, relative_to_vrt: bool, vrt_uri: str) -> s
     return filename
 
 
+def _source_filename_uri(parent: ET.Element, vrt_uri: str, missing_msg: str) -> str:
+    """Resolve *parent*'s ``<SourceFilename>``, raising *missing_msg* if absent."""
+    el = parent.find("SourceFilename")
+    if el is None or not el.text:
+        raise ValueError(missing_msg)
+    relative = el.attrib.get("relativeToVRT", "0") == "1"
+    return _resolve_source_uri(el.text, relative, vrt_uri)
+
+
 async def _open_vrt_source(
     source_uri: str, vrt_uri: str, **open_kwargs: Any
 ) -> AsyncGeoTIFF:
@@ -1167,11 +1174,9 @@ def _parse_processed_vrt(root: ET.Element, vrt_uri: str) -> _VRTProcessedSpec:
     input_el = root.find("Input")
     if input_el is None:
         raise ValueError("VRTProcessedDataset: missing <Input>")
-    filename_el = input_el.find("SourceFilename")
-    if filename_el is None or not filename_el.text:
-        raise ValueError("VRTProcessedDataset: missing <Input>/<SourceFilename>")
-    relative = filename_el.attrib.get("relativeToVRT", "0") == "1"
-    input_uri = _resolve_source_uri(filename_el.text, relative, vrt_uri)
+    input_uri = _source_filename_uri(
+        input_el, vrt_uri, "VRTProcessedDataset: missing <Input>/<SourceFilename>"
+    )
 
     output_bands = root.findall("VRTRasterBand")
     if not output_bands:

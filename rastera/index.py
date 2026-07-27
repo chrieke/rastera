@@ -24,6 +24,22 @@ from .store import (
     _resolve_local_path,
 )
 
+# Written by build_index, read back by open_from_index; the geometry column is
+# added separately by GeoDataFrame.
+_INDEX_COLUMNS = (
+    "uri",
+    "header_bytes",
+    "crs_epsg",
+    "width",
+    "height",
+    "count",
+    "res_x",
+    "res_y",
+    "dtype",
+    "nodata",
+    "overviews",
+)
+
 
 async def build_index(
     uris: Sequence[str],
@@ -90,19 +106,7 @@ async def build_index(
 
     results = await asyncio.gather(*(_open_one(u, hdr) for u, _, hdr in fetched))
 
-    rows: dict[str, list[Any]] = {
-        "uri": [],
-        "header_bytes": [],
-        "crs_epsg": [],
-        "width": [],
-        "height": [],
-        "count": [],
-        "res_x": [],
-        "res_y": [],
-        "dtype": [],
-        "nodata": [],
-        "overviews": [],
-    }
+    rows: dict[str, list[Any]] = {c: [] for c in _INDEX_COLUMNS}
     geometries: list[Any] = []
 
     for src, hdr in results:
@@ -342,20 +346,7 @@ def _build_obstore(uri: str, **store_kwargs: Any) -> Any:
 
 
 def _empty_geodataframe() -> gpd.GeoDataFrame:
+    # A fresh list per column: one shared list would alias all eleven.
     return gpd.GeoDataFrame(
-        {
-            "uri": [],
-            "header_bytes": [],
-            "crs_epsg": [],
-            "width": [],
-            "height": [],
-            "count": [],
-            "res_x": [],
-            "res_y": [],
-            "dtype": [],
-            "nodata": [],
-            "overviews": [],
-        },
-        geometry=[],
-        crs="EPSG:4326",
+        {c: [] for c in _INDEX_COLUMNS}, geometry=[], crs="EPSG:4326"
     )

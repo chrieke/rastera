@@ -311,16 +311,19 @@ def _affine_apply(t: Affine, x: float, y: float) -> tuple[float, float]:
     return float(rx), float(ry)
 
 
-def _denoise(pixel_coord: float, tol: float = 1e-6) -> float:
+# In pixels: orders of magnitude above ``~transform``'s ULP error and far below
+# any sub-pixel offset a caller could mean.
+_DENOISE_TOL = 1e-6
+
+
+def _denoise(pixel_coord: float) -> float:
     """Collapse a pixel coordinate onto an exact boundary it all but sits on.
 
     ``~transform`` carries a few ULPs of error through the divide, so a bbox
     edge that is exactly on the source grid arrives as 12105.000000000004.
-    *tol* is in pixels — orders of magnitude above that error and far below
-    any sub-pixel offset a caller could mean.
     """
     nearest = round(pixel_coord)
-    return float(nearest) if abs(pixel_coord - nearest) < tol else pixel_coord
+    return float(nearest) if abs(pixel_coord - nearest) < _DENOISE_TOL else pixel_coord
 
 
 def _normalize_crs(crs: int | CRS) -> int:
