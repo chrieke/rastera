@@ -150,7 +150,7 @@ async def main():
         t_open1_net.append(time.perf_counter() - t0)
 
         print(
-            f"  [{i+1:2d}] index={t_open1_idx[-1]:.3f}s  network={t_open1_net[-1]:.3f}s",
+            f"  [{i + 1:2d}] index={t_open1_idx[-1]:.3f}s  network={t_open1_net[-1]:.3f}s",
             flush=True,
         )
 
@@ -169,7 +169,7 @@ async def main():
         t_open_net.append(time.perf_counter() - t0)
 
         print(
-            f"  [{i+1:2d}] index={t_open_idx[-1]:.2f}s  network={t_open_net[-1]:.2f}s",
+            f"  [{i + 1:2d}] index={t_open_idx[-1]:.2f}s  network={t_open_net[-1]:.2f}s",
             flush=True,
         )
 
@@ -196,7 +196,7 @@ async def main():
         t_query_net.append(time.perf_counter() - t0)
 
         print(
-            f"  [{i+1:2d}] {len(matched_uris)} files  index={t_query_idx[-1]:.2f}s  network={t_query_net[-1]:.2f}s",
+            f"  [{i + 1:2d}] {len(matched_uris)} files  index={t_query_idx[-1]:.2f}s  network={t_query_net[-1]:.2f}s",
             flush=True,
         )
 

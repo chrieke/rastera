@@ -140,7 +140,9 @@ async def cmd_query():
         )
         dt = time.perf_counter() - t0
         t_total_idx += dt
-        print(f"  [{i+1}] {len(sources)} files  {result.shape}  {dt:.2f}s", flush=True)
+        print(
+            f"  [{i + 1}] {len(sources)} files  {result.shape}  {dt:.2f}s", flush=True
+        )
 
     print(f"\n--- {N_QUERIES} queries via network (cold cache) ---", flush=True)
     t_total_net = 0.0
@@ -154,14 +156,18 @@ async def cmd_query():
         )
         dt = time.perf_counter() - t0
         t_total_net += dt
-        print(f"  [{i+1}] {len(sources)} files  {result.shape}  {dt:.2f}s", flush=True)
+        print(
+            f"  [{i + 1}] {len(sources)} files  {result.shape}  {dt:.2f}s", flush=True
+        )
 
     print("\n--- Results ---", flush=True)
     print(
-        f"  Index:   {t_total_idx:.2f}s  ({t_total_idx/N_QUERIES:.2f}s avg)", flush=True
+        f"  Index:   {t_total_idx:.2f}s  ({t_total_idx / N_QUERIES:.2f}s avg)",
+        flush=True,
     )
     print(
-        f"  Network: {t_total_net:.2f}s  ({t_total_net/N_QUERIES:.2f}s avg)", flush=True
+        f"  Network: {t_total_net:.2f}s  ({t_total_net / N_QUERIES:.2f}s avg)",
+        flush=True,
     )
     print(f"  Speedup: {t_total_net / t_total_idx:.1f}x\n", flush=True)
 

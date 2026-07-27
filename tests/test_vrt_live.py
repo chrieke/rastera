@@ -100,12 +100,10 @@ async def test_metadata_matches_gdal(fx: Any):
     assert str(np.dtype(gt.dtype)) == fx.dtype
     assert (gt.width, gt.height) == (fx.width, fx.height)
     assert ds._crs_epsg == fx.crs_epsg
-    assert gt.res[0] == pytest.approx(fx.resolution)  # type: ignore[reportUnknownMemberType]
+    assert gt.res[0] == pytest.approx(fx.resolution)
     # 0.3 m pixels give bounds that are not exactly representable in binary
     # floating point, so allow a hundredth of a pixel.
-    assert tuple(gt.bounds) == pytest.approx(  # type: ignore[reportUnknownMemberType]
-        fx.bounds, abs=fx.resolution / 100
-    )
+    assert tuple(gt.bounds) == pytest.approx(fx.bounds, abs=fx.resolution / 100)
     # The VRT's own <NoDataValue> is honoured, so this holds even when the
     # underlying source declares nothing.
     assert (None if ds._nodata is None else int(ds._nodata)) == fx.nodata

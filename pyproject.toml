@@ -30,7 +30,7 @@ markers = [
 
 [dependency-groups]
 dev = [
-    "ruff==0.8.5",
+    "ruff==0.16.0",
     "pyright>=1.1.408,<2.0.0",
     "pytest>=8.0.0",
     "pytest-asyncio>=1.0.0",
@@ -42,15 +42,33 @@ dev = [
     "pre-commit>=4.6.1",
 ]
 
+[tool.uv]
+# numpy 2.5 ships stubs that make np.unique/np.array_equal partially unknown,
+# which trips reportUnknownMemberType in ~70 places. Runtime is unaffected, so
+# this caps our lock only — `numpy>=2.2.6` above is what consumers resolve
+# against. Drop once numpy's stubs type those again.
+constraint-dependencies = ["numpy<2.5"]
+
 [tool.ruff]
 src = ["rastera"]
 line-length = 88
 fix = true
 
 [tool.ruff.lint]
-extend-select = [
-    "I",    # isort
+# Selected outright rather than extending ruff's default set, because that set
+# is not stable across releases: 0.16 grew it to ~418 rules and dropped E402 in
+# the same move, so `extend-select` would have silently swapped this project's
+# lint policy for a different one — losing a check tests/test_index.py relies on
+# and adding hundreds that mostly flag deliberate choices here. E4/E7/E9/F is
+# the historical default, spelled out so a ruff upgrade can only change
+# formatting and fixes, never which rules apply.
+select = [
+    "E4",   # pycodestyle: imports
+    "E7",   # pycodestyle: statements
+    "E9",   # pycodestyle: runtime errors
+    "F",    # pyflakes
     "E501", # line length
+    "I",    # isort
     "UP",   # pyupgrade
 ]
 ignore = []

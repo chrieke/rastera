@@ -16,7 +16,7 @@ repos:
   # Keep in lockstep with the pinned ruff in pyproject.toml's dev group,
   # otherwise pre-commit and CI disagree on formatting.
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.8.5
+    rev: v0.16.0
     hooks:
-      - id: ruff
+      - id: ruff-check
       - id: ruff-format

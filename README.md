@@ -77,12 +77,18 @@ import rastera
 uris = ["s3://bucket/tile_a.tif", "s3://bucket/tile_b.tif", ...]
 
 # Build once, save to disk
-gdf = await rastera.build_index(uris, prefetch=32768, concurrency=100, region="us-west-2")
+gdf = await rastera.build_index(
+    uris, prefetch=32768, concurrency=100, region="us-west-2"
+)
 gdf.to_parquet("index.parquet")
 
 # Open from index (reusable across sessions, ~5-6x faster opens)
-sources = await rastera.open_from_index("index.parquet", bbox=(minx, miny, maxx, maxy), region="us-west-2")
-raster_array = await rastera.merge(sources, bbox=bbox, bbox_crs=4326, target_crs=32632, target_resolution=10)
+sources = await rastera.open_from_index(
+    "index.parquet", bbox=(minx, miny, maxx, maxy), region="us-west-2"
+)
+raster_array = await rastera.merge(
+    sources, bbox=bbox, bbox_crs=4326, target_crs=32632, target_resolution=10
+)
 ```
 
 `rastera.open()` also keeps an in-memory LRU cache of parsed headers within the session (default 128 entries, configurable via `set_cache_size()`), so repeated opens of the same URI skip the network fetch even without an index.
