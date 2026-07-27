@@ -42,6 +42,13 @@ dev = [
     "pre-commit>=4.6.1",
 ]
 
+[tool.uv]
+# numpy 2.5 ships stubs that make np.unique/np.array_equal partially unknown,
+# which trips reportUnknownMemberType in ~70 places. Runtime is unaffected, so
+# this caps our lock only — `numpy>=2.2.6` above is what consumers resolve
+# against. Drop once numpy's stubs type those again.
+constraint-dependencies = ["numpy<2.5"]
+
 [tool.ruff]
 src = ["rastera"]
 line-length = 88

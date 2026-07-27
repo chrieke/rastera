@@ -565,7 +565,7 @@ class TestMergeReprojected:
             target_resolution=2.0,
         )
         # Output should use the requested resolution
-        assert result.res[0] == pytest.approx(2.0)  # type: ignore[reportUnknownMemberType]
+        assert result.res[0] == pytest.approx(2.0)
         cog._read_native.assert_called()
 
     @pytest.mark.parametrize("resampling", ["bilinear", "cubic"])
@@ -586,7 +586,7 @@ class TestMergeReprojected:
             target_resolution=2.0,
             resampling=resampling,
         )
-        assert result.res[0] == pytest.approx(2.0)  # type: ignore[reportUnknownMemberType]
+        assert result.res[0] == pytest.approx(2.0)
         assert result.data.dtype == np.uint16  # type: ignore[reportUnknownMemberType]
         # Both kernels sum to 1, so a constant input survives downsampling.
         assert np.all(result.data == 7)  # type: ignore[reportUnknownMemberType]
