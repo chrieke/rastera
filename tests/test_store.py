@@ -224,9 +224,8 @@ class TestStoreKwargs:
     def test_defaults_to_unsigned(self):
         assert _kwargs("s3://bucket/key")["skip_signature"] is True
 
-    def test_fallback_region(self, monkeypatch: pytest.MonkeyPatch):
-        monkeypatch.delenv("AWS_REGION", raising=False)
-        monkeypatch.delenv("AWS_DEFAULT_REGION", raising=False)
+    def test_fallback_region(self):
+        # The autouse _clear_aws_region fixture already unset both vars.
         assert _kwargs("s3://bucket/key")["region"] == "us-west-2"
 
     def test_env_region_beats_the_fallback(self, monkeypatch: pytest.MonkeyPatch):

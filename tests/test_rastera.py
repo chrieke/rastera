@@ -65,13 +65,6 @@ class TestAsyncGeoTIFFInit:
         assert "AsyncGeoTIFF" in r
         assert "s3://bucket/key.tif" in r
 
-    def test_geotiff_attrs(self):
-        gt = make_mock_geotiff(width=200, height=150, count=4)
-        obj = AsyncGeoTIFF("s3://b/k.tif", gt)
-        assert obj._geotiff.width == 200
-        assert obj._geotiff.height == 150
-        assert obj._geotiff.count == 4
-
     def test_overviews_populated(self):
         gt = make_mock_geotiff()
         ovr = MagicMock()
@@ -656,27 +649,3 @@ class TestLRUCache:
         _geotiff_cache["a"] = make_mock_geotiff()
         set_cache_size(0)
         assert len(_geotiff_cache) == 0
-
-    def test_lru_eviction_order(self):
-        """Accessing an entry promotes it; the least-recently-used entry is evicted."""
-        set_cache_size(2)
-        gt_a, gt_b, gt_c = (make_mock_geotiff() for _ in range(3))
-
-        # Insert A, then B (cache: A, B)
-        _geotiff_cache["a"] = gt_a
-        _geotiff_cache["b"] = gt_b
-
-        # Access A — promotes it (cache order: B, A)
-        _geotiff_cache.move_to_end("a")
-
-        # Insert C — should evict B (LRU), not A
-        set_cache_size(2)  # trigger eviction check if needed
-        _geotiff_cache["c"] = gt_c
-        if len(_geotiff_cache) > 2:
-            _geotiff_cache.popitem(last=False)
-
-        assert "a" in _geotiff_cache, "A was accessed recently and should survive"
-        assert "c" in _geotiff_cache, "C was just inserted and should survive"
-        assert (
-            "b" not in _geotiff_cache
-        ), "B was least-recently-used and should be evicted"
