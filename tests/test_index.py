@@ -241,6 +241,21 @@ class TestBuildIndex:
         assert maxy > miny
 
     @pytest.mark.asyncio
+    async def test_cross_bucket_raises(self) -> None:
+        with pytest.raises(ValueError, match="same bucket/host"):
+            await build_index(["s3://bucket-a/key.tif", "s3://bucket-b/key.tif"])
+
+    @pytest.mark.asyncio
+    async def test_cross_bucket_raises_with_explicit_store(self) -> None:
+        """A caller-supplied store does not rescue mirrored key paths: the
+        header cache is keyed by object key, so the two rows would collapse."""
+        with pytest.raises(ValueError, match="same bucket/host"):
+            await build_index(
+                ["s3://bucket-a/tiles/x.tif", "s3://bucket-b/tiles/x.tif"],
+                store=MagicMock(),
+            )
+
+    @pytest.mark.asyncio
     async def test_empty_uris(self) -> None:
         gdf = await build_index([])
 
@@ -276,6 +291,56 @@ class TestOpenFromIndex:
 
         assert len(result) == 2
         assert mock_open.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_cross_bucket_raises(self) -> None:
+        """Mirrored buckets sharing a key path would collapse in the header
+        cache, serving one file's header for the other's URI."""
+        gdf = _make_index_gdf(
+            [
+                {
+                    "uri": "s3://bucket-a/tiles/x.tif",
+                    "header_bytes": b"\xaa" * 100,
+                    "minx": 0,
+                    "miny": 0,
+                    "maxx": 1,
+                    "maxy": 1,
+                },
+                {
+                    "uri": "s3://bucket-b/tiles/x.tif",
+                    "header_bytes": b"\xbb" * 100,
+                    "minx": 0,
+                    "miny": 0,
+                    "maxx": 1,
+                    "maxy": 1,
+                },
+            ]
+        )
+
+        with pytest.raises(ValueError, match="same bucket/host"):
+            await open_from_index(gdf)
+
+    @pytest.mark.asyncio
+    @patch("rastera.index._build_obstore")
+    @patch("rastera.index.AsyncGeoTIFF.open", new_callable=AsyncMock)
+    @patch("rastera.index.get_cached_geotiff", return_value=None)
+    async def test_bbox_narrowing_to_one_bucket_is_allowed(
+        self, mock_cache: Any, mock_open: Any, mock_build_obs: Any
+    ) -> None:
+        """A multi-bucket index is fine as long as the selected rows agree."""
+        mock_build_obs.return_value = MagicMock()
+        mock_open.return_value = MagicMock(spec=AsyncGeoTIFF)
+
+        gdf = _make_index_gdf(
+            [
+                {"uri": "s3://a/x.tif", "minx": 0, "miny": 0, "maxx": 1, "maxy": 1},
+                {"uri": "s3://b/y.tif", "minx": 5, "miny": 5, "maxx": 6, "maxy": 6},
+            ]
+        )
+
+        result = await open_from_index(gdf, bbox=(0, 0, 1, 1), bbox_crs=4326)
+
+        assert len(result) == 1
 
     @pytest.mark.asyncio
     @patch("rastera.index._build_obstore")

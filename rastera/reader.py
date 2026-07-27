@@ -26,9 +26,9 @@ from .geo import (
 from .resampling import ResamplingMethod, _kernel_halo, resample
 from .store import (
     _apply_s3_defaults,
-    _bucket_url,
     _build_store,
     _extract_key,
+    _require_same_bucket,
     _resolve_local_path,
 )
 
@@ -563,14 +563,7 @@ async def _open_many(
     if not uris:
         return []
     if store is None:
-        bucket = _bucket_url(uris[0])
-        mismatched = [u for u in uris[1:] if _bucket_url(u) != bucket]
-        if mismatched:
-            raise ValueError(
-                f"All URIs must belong to the same bucket/host when using a "
-                f"shared store. First URI resolves to {bucket!r}, but these "
-                f"do not: {mismatched}"
-            )
+        _require_same_bucket(uris, "using a shared store")
         store = _build_store(uris[0], **store_kwargs)
     # store_kwargs is forwarded as well as consumed above: plain TIFF opens
     # ignore it once `store` is set, but the VRT and DIMAP branches need it to

@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import posixpath
 import re
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse, urlunparse
@@ -169,6 +170,22 @@ def _bucket_url(uri: str) -> str:
     if local_path is not None:
         return local_path.parent.as_uri()
     return uri
+
+
+def _require_same_bucket(uris: Sequence[str], reason: str) -> None:
+    """Raise if *uris* do not all resolve to the same bucket/host.
+
+    A store is rooted at one bucket and object keys carry no bucket, so a
+    mixed-bucket list either 404s or — when two buckets mirror a key path —
+    silently serves one file's bytes for another's URI.
+    """
+    bucket = _bucket_url(uris[0])
+    mismatched = [u for u in uris[1:] if _bucket_url(u) != bucket]
+    if mismatched:
+        raise ValueError(
+            f"All URIs must belong to the same bucket/host when {reason}. "
+            f"First URI resolves to {bucket!r}, but these do not: {mismatched}"
+        )
 
 
 def _resolve_local_path(uri: str) -> Path | None:

@@ -21,6 +21,7 @@ from .store import (
     _build_store_with,
     _extract_key,
     _obstore_key,
+    _require_same_bucket,
     _resolve_local_path,
 )
 
@@ -49,10 +50,17 @@ async def build_index(
     Returns:
         A GeoDataFrame with geometry in EPSG:4326.
         Write with ``gdf.to_parquet(path)`` for geoparquet.
+
+    Raises:
+        ValueError: If *uris* span more than one bucket/host. Index each
+            bucket separately and concatenate the frames.
     """
     uris = list(uris)
     if not uris:
         return _empty_geodataframe()
+    # Checked even when the caller supplies a store: the header cache below is
+    # keyed by object key, so two buckets mirroring a key path would collapse.
+    _require_same_bucket(uris, "building an index")
     obs = store if store is not None else _build_obstore(uris[0], **store_kwargs)
     sem = asyncio.Semaphore(concurrency)
 
@@ -150,6 +158,10 @@ async def open_from_index(
 
     Returns:
         List of AsyncGeoTIFF instances ready for ``.read()`` calls.
+
+    Raises:
+        ValueError: If the selected rows span more than one bucket/host.
+            Narrow the selection with *bbox* or open each bucket separately.
     """
     if isinstance(gdf_or_path, str):
         gdf = _read_geoparquet(gdf_or_path, bbox=bbox, bbox_crs=bbox_crs)
@@ -163,6 +175,11 @@ async def open_from_index(
 
     uris: list[str] = gdf["uri"].tolist()  # type: ignore[reportUnknownMemberType]
     headers: list[bytes] = gdf["header_bytes"].tolist()  # type: ignore[reportUnknownMemberType]
+
+    # An index may legitimately span buckets (rows concatenated from several
+    # builds), but a single open pass cannot: one store, and a header cache
+    # keyed by object key. Reject rather than serve one file's bytes as another's.
+    _require_same_bucket(uris, "opening from an index")
 
     if store is not None:
         shared_store = store
