@@ -92,9 +92,9 @@ class TestAsyncGeoTIFFInit:
 class TestOpen:
     @pytest.mark.asyncio
     @patch("rastera.reader.GeoTIFF")
-    @patch("rastera.reader.from_url")
+    @patch("rastera.store.from_url")
     async def test_open_auto_store(self, mock_from_url: Any, mock_geotiff_cls: Any):
-        """Without an explicit store, from_url builds one from the URI."""
+        """Without an explicit store, one is built rooted at the bucket."""
         gt = make_mock_geotiff()
         mock_store = MagicMock()
         mock_from_url.return_value = mock_store
@@ -103,10 +103,10 @@ class TestOpen:
         obj = await AsyncGeoTIFF.open("s3://bucket/key.tif", skip_signature=True)
 
         mock_from_url.assert_called_once_with(
-            "s3://bucket/key.tif", skip_signature=True, region="us-west-2"
+            "s3://bucket", skip_signature=True, region="us-west-2"
         )
         mock_geotiff_cls.open.assert_awaited_once_with(
-            "", store=mock_store, prefetch=32768
+            "key.tif", store=mock_store, prefetch=32768
         )
         assert obj.uri == "s3://bucket/key.tif"
         assert isinstance(obj, AsyncGeoTIFF)
@@ -198,7 +198,7 @@ class TestMetaOverrides:
 
     @pytest.mark.asyncio
     @patch("rastera.reader.GeoTIFF")
-    @patch("rastera.reader.from_url")
+    @patch("rastera.store.from_url")
     async def test_open_forwards_override(
         self, mock_from_url: Any, mock_geotiff_cls: Any
     ):

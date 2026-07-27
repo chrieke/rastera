@@ -11,7 +11,6 @@ from typing import Any, TypedDict, overload
 import numpy as np
 from affine import Affine
 from async_geotiff import GeoTIFF, RasterArray, Window
-from async_tiff.store import from_url  # type: ignore[reportMissingImports]
 from pyproj import CRS, Transformer
 
 from .geo import (
@@ -31,11 +30,9 @@ from .resampling import (
     validate_resampling,
 )
 from .store import (
-    _apply_s3_defaults,
     _build_store,
     _extract_key,
     _require_same_bucket,
-    _resolve_local_path,
 )
 
 # LRU cache for parsed GeoTIFF objects, keyed by URI.
@@ -163,20 +160,9 @@ class AsyncGeoTIFF:
             if gt is not None:
                 return cls(uri, gt, meta_overrides=meta_overrides)
 
-        if store is not None:
-            key = _extract_key(uri)
-            geotiff = await GeoTIFF.open(key, store=store, prefetch=prefetch)
-        else:
-            local_path = _resolve_local_path(uri)
-            if local_path is not None:
-                store = from_url(local_path.parent.as_uri(), **store_kwargs)
-                geotiff = await GeoTIFF.open(
-                    local_path.name, store=store, prefetch=prefetch
-                )
-            else:
-                _apply_s3_defaults(store_kwargs, uri)
-                store = from_url(uri, **store_kwargs)
-                geotiff = await GeoTIFF.open("", store=store, prefetch=prefetch)
+        if store is None:
+            store = _build_store(uri, **store_kwargs)
+        geotiff = await GeoTIFF.open(_extract_key(uri), store=store, prefetch=prefetch)
 
         if cache and _cache_max_size > 0:
             if len(_geotiff_cache) >= _cache_max_size:

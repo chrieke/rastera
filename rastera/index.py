@@ -20,7 +20,6 @@ from .reader import (
 from .store import (
     _build_store_with,
     _extract_key,
-    _obstore_key,
     _require_same_bucket,
     _resolve_local_path,
 )
@@ -68,7 +67,7 @@ async def build_index(
     # reads from memory instead of making a second network request.
     async def _fetch_header(uri: str) -> tuple[str, str, bytes]:
         async with sem:
-            key = _obstore_key(uri)
+            key = _extract_key(uri)
             hdr = bytes(await obstore.get_range_async(obs, key, start=0, end=prefetch))
             return uri, key, hdr
 
@@ -181,12 +180,10 @@ async def open_from_index(
     # keyed by object key. Reject rather than serve one file's bytes as another's.
     _require_same_bucket(uris, "opening from an index")
 
-    if store is not None:
-        shared_store = store
-        keys = [_extract_key(u) for u in uris]
-    else:
-        shared_store = _build_obstore(uris[0], **store_kwargs)
-        keys = [_obstore_key(u) for u in uris]
+    shared_store = (
+        store if store is not None else _build_obstore(uris[0], **store_kwargs)
+    )
+    keys = [_extract_key(u) for u in uris]
 
     cache = dict(zip(keys, headers))
     cached_store = HeaderCacheStore(shared_store, cache)

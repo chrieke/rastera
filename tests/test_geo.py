@@ -1,6 +1,5 @@
 """Unit tests for pure geometry, parsing, and utility functions."""
 
-from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -18,7 +17,6 @@ from rastera.geo import (
     validate_resolution,
     window_from_bbox,
 )
-from rastera.reader import _extract_key
 from tests.conftest import make_meta
 
 # ── BBox ──────────────────────────────────────────────────────────────────
@@ -328,40 +326,6 @@ class TestComputePasteSlices:
             dst_height=100,
         )
         assert result is None
-
-
-# ── _extract_key ─────────────────────────────────────────────────────────
-
-
-class TestExtractKey:
-    def test_s3_scheme(self):
-        assert _extract_key("s3://my-bucket/path/to/file.tif") == "path/to/file.tif"
-
-    def test_virtual_hosted_style(self):
-        assert (
-            _extract_key(
-                "https://my-bucket.s3.us-west-2.amazonaws.com/path/to/file.tif"
-            )
-            == "path/to/file.tif"
-        )
-
-    def test_path_style(self):
-        assert (
-            _extract_key(
-                "https://s3.us-west-2.amazonaws.com/my-bucket/path/to/file.tif"
-            )
-            == "path/to/file.tif"
-        )
-
-    def test_local_path(self, tmp_path: Path):
-        f = tmp_path / "file.tif"
-        f.write_bytes(b"")
-        assert _extract_key(str(f)) == "file.tif"
-
-    def test_file_scheme(self, tmp_path: Path):
-        f = tmp_path / "file.tif"
-        f.write_bytes(b"")
-        assert _extract_key(f.as_uri()) == "file.tif"
 
 
 # ── transform_bbox ───────────────────────────────────────────────────────

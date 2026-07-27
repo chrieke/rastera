@@ -1,140 +1,113 @@
 """Obstore construction, S3 authentication and region discovery.
 
-When opening a file from S3, the store is configured as follows:
+Every URI is normalised once by :func:`_parse_uri` into a ``(root, key)`` pair
+such that ``from_url(root)`` plus ``key`` addresses the same object that
+``from_url(uri)`` would. All other helpers derive from that parse.
 
-**Region** is resolved in priority order:
+Supported S3 forms, all rewritten to ``s3://<bucket>/<key>`` before they reach
+obstore — whose own URL parser rejects the dash-region, legacy-global and
+dotted-bucket variants::
 
-1. Explicit ``region`` kwarg passed by the caller.
-2. Region extracted from HTTPS-style URLs
-   (e.g. ``https://bucket.s3.eu-north-1.amazonaws.com/...``).
-3. For authenticated access (``skip_signature=False``): the region from
-   the active boto3 session (``~/.aws/config``, ``AWS_REGION`` env var, etc.).
-4. Fallback ``us-west-2`` (unsigned/public access only).
+    s3://<bucket>/<key>
+    https://<bucket>.s3.<region>.amazonaws.com/<key>
+    https://<bucket>.s3-<region>.amazonaws.com/<key>
+    https://<bucket>.s3.amazonaws.com/<key>
+    https://s3.<region>.amazonaws.com/<bucket>/<key>
+    https://s3.amazonaws.com/<bucket>/<key>
 
-**Credentials** default to unsigned (public) access.  Pass
-``skip_signature=False`` in ``store_kwargs`` to enable authenticated access
-via ``Boto3CredentialProvider``, which supports env vars,
-``~/.aws/credentials``, SSO, IAM roles, and all other boto3-supported
-credential sources.  If ``obstore.auth.boto3`` is not installed, it falls
-back to unsigned access silently.
+Other ``amazonaws.com`` hosts — dual-stack, transfer acceleration, FIPS, access
+points, S3 Express, VPC endpoints — are rejected. Each implies an endpoint and
+addressing style that cannot be inferred from the URL, and silently serving them
+from the standard endpoint would defeat the reason for using them.
+
+Non-AWS S3-compatible services (Wasabi, MinIO, Ceph) are read over plain HTTP,
+which works for public objects only; signed access needs an explicit
+``store=S3Store(bucket=..., endpoint=..., region=...)``.
+
+**Region** for AWS URIs, in priority order: encoded in the host, explicit
+``region`` kwarg, ``AWS_REGION``/``AWS_DEFAULT_REGION``, the boto3 session (only
+consulted when authenticating), then ``us-west-2``. A host-encoded region that
+contradicts an explicit kwarg is an error rather than a silent pick.
+
+**Credentials** default to unsigned. ``skip_signature=False`` switches to
+``Boto3CredentialProvider`` (env vars, ``~/.aws/credentials``, SSO, IAM roles);
+if it cannot be constructed, access falls back to unsigned.
 """
 
 from __future__ import annotations
 
+import os
 import posixpath
 import re
 from collections.abc import Sequence
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
-from urllib.parse import urlparse, urlunparse
+from typing import Any, Literal
+from urllib.parse import ParseResult, unquote, urlparse, urlunparse
 
 import obstore
 from async_tiff.store import from_url  # type: ignore[reportMissingImports]
 from obstore.store import from_url as obstore_from_url
 
 _DEFAULT_REGION = "us-west-2"
-_S3_REGION_RE = re.compile(r"[./]s3[.-]([a-z0-9-]+)\.amazonaws\.com")
+
+_AWS_SUFFIX = r"amazonaws\.com(?:\.cn)?"
+_AWS_REGION = r"[a-z]{2}(?:-[a-z]+)+-\d+"
+# Anchored on the host alone: a substring search also matches a region spelled
+# out in an attacker-controlled path segment.
+_AWS_HOST_RE = re.compile(
+    rf"^(?:(?P<bucket>[^/]+)\.)?s3(?:[.-](?P<region>{_AWS_REGION}))?\.{_AWS_SUFFIX}$",
+    re.IGNORECASE,
+)
+_AWS_SUFFIX_RE = re.compile(rf"\.{_AWS_SUFFIX}$", re.IGNORECASE)
+
+# Rejected outright by LocalFileSystem and HTTPStore ("Cannot pass config or
+# keyword parameters for scheme ..."), so they cannot be forwarded blindly.
+_S3_ONLY_KWARGS = ("skip_signature", "region", "credential_provider")
+
+UriKind = Literal["local", "aws", "cloud", "http"]
 
 
-def _is_s3_uri(uri: str) -> bool:
-    return uri.startswith("s3://") or ".s3." in uri or ".s3-" in uri
+@dataclass(frozen=True)
+class ParsedURI:
+    """A URI split into the store root and the key relative to it."""
+
+    uri: str
+    kind: UriKind
+    root: str
+    key: str
+    local_path: Path | None = None
+    region: str | None = None
+    virtual_hosted: bool = False
+
+    @property
+    def identity(self) -> tuple[str, str | None, bool]:
+        """What must match for two URIs to share one store."""
+        return (self.root, self.region, self.virtual_hosted)
 
 
-def _detect_region(uri: str) -> str | None:
-    """Try to extract the AWS region from an S3 HTTPS URL.
-
-    Returns None when the region cannot be determined from the URL,
-    letting obstore fall back to its own discovery (``AWS_REGION`` env
-    var, boto3 session region, or ``us-east-1`` default).
-
-    Handles virtual-hosted style:
-        https://<bucket>.s3.<region>.amazonaws.com/...
-        https://<bucket>.s3-<region>.amazonaws.com/...
-    And path style:
-        https://s3.<region>.amazonaws.com/...
-    """
-    m = _S3_REGION_RE.search(uri)
-    if m:
-        return m.group(1)
-    return None
-
-
-def _extract_key(uri: str) -> str:
-    """Extract the object key from a URI, for use with a pre-constructed store."""
+def _parse_uri(uri: str) -> ParsedURI:
     parsed = urlparse(uri)
-    if parsed.scheme in {"s3", "gs", "az"}:
-        return parsed.path.lstrip("/")
-    if parsed.scheme in {"http", "https"}:
-        host = parsed.netloc
-        if ".s3." in host or ".s3-" in host:
-            return parsed.path.lstrip("/")
-        # Path-style: https://s3.<region>.amazonaws.com/<bucket>/<key>
-        parts = parsed.path.lstrip("/").split("/", 1)
-        return parts[1] if len(parts) == 2 else ""
-    local_path = _resolve_local_path(uri)
-    if local_path is not None:
-        return local_path.name
-    return parsed.path or uri
+    scheme = parsed.scheme.lower()
 
+    if scheme in ("", "file"):
+        raw = unquote(parsed.path) if scheme == "file" else uri
+        path = Path(raw).resolve()
+        return ParsedURI(uri, "local", path.parent.as_uri(), path.name, local_path=path)
 
-def _apply_s3_defaults(store_kwargs: dict[str, Any], uri: str) -> None:
-    """Set default S3 credentials/region on *store_kwargs* when *uri* is an S3 URI.
+    if scheme == "s3":
+        return ParsedURI(uri, "aws", f"s3://{parsed.netloc}", _path_key(parsed))
 
-    Region is extracted from HTTPS-style URLs when possible.  The default
-    for credentials is ``skip_signature=True`` (unsigned / public access).
-    Callers that need authenticated access should pass
-    ``skip_signature=False`` — this will automatically set up a
-    ``Boto3CredentialProvider`` so that AWS SSO, profiles, and all other
-    boto3-supported credential sources work transparently.
+    if scheme in ("gs", "az"):
+        return ParsedURI(uri, "cloud", f"{scheme}://{parsed.netloc}", _path_key(parsed))
 
-    For non-S3 URIs, ``skip_signature`` is stripped so it does not leak
-    through to backends that would reject it (e.g. LocalFileSystem).
-    """
-    if not _is_s3_uri(uri):
-        # skip_signature is S3-only and would be rejected by non-S3
-        # backends (e.g. LocalFileSystem). Other cross-backend kwargs
-        # like region/credential_provider/config are left alone.
-        store_kwargs.pop("skip_signature", None)
-        return
-    region = _detect_region(uri)
-    if region is not None:
-        store_kwargs.setdefault("region", region)
-    if store_kwargs.get("skip_signature") is False:
-        store_kwargs.pop("skip_signature")
-        _apply_boto3_credentials(store_kwargs, url_region=region)
-    elif "credential_provider" not in store_kwargs:
-        store_kwargs.setdefault("skip_signature", True)
-        if region is None:
-            store_kwargs.setdefault("region", _DEFAULT_REGION)
+    if scheme in ("http", "https"):
+        return _parse_http_uri(uri, parsed)
 
-
-def _apply_boto3_credentials(
-    store_kwargs: dict[str, Any],
-    url_region: str | None,
-) -> None:
-    """Configure ``Boto3CredentialProvider`` on *store_kwargs*.
-
-    Falls back to ``skip_signature=True`` if boto3/obstore auth is
-    not available.
-    """
-    try:
-        from obstore.auth.boto3 import Boto3CredentialProvider
-
-        provider = Boto3CredentialProvider()
-        store_kwargs["credential_provider"] = provider
-        # Merge the boto3 session config (e.g. region) so obstore
-        # targets the right endpoint for s3:// URIs that don't
-        # encode a region.  A region already detected from the URL
-        # takes precedence.
-        if provider.config:
-            merged = {**provider.config}
-            if url_region is not None:
-                merged.pop("region", None)
-            if merged:
-                existing = store_kwargs.get("config", {}) or {}
-                store_kwargs["config"] = {**merged, **existing}
-    except ImportError:
-        store_kwargs.setdefault("skip_signature", True)
+    raise ValueError(
+        f"Unsupported URI scheme {scheme!r} in {uri!r}. Expected one of "
+        f"s3, gs, az, http, https, file, or a local path."
+    )
 
 
 def _build_store_with(uri: str, from_url_fn: Any, **store_kwargs: Any) -> Any:
@@ -143,11 +116,8 @@ def _build_store_with(uri: str, from_url_fn: Any, **store_kwargs: Any) -> Any:
     Accepts any ``from_url`` callable (e.g. ``async_tiff.store.from_url``
     or ``obstore.store.from_url``) so the same logic serves both backends.
     """
-    _apply_s3_defaults(store_kwargs, uri)
-    local_path = _resolve_local_path(uri)
-    if local_path is not None:
-        return from_url_fn(local_path.parent.as_uri(), **store_kwargs)
-    return from_url_fn(_bucket_url(uri), **store_kwargs)
+    parsed = _parse_uri(uri)
+    return from_url_fn(parsed.root, **_store_kwargs_for(parsed, store_kwargs))
 
 
 def _build_store(uri: str, **store_kwargs: Any) -> Any:
@@ -155,57 +125,41 @@ def _build_store(uri: str, **store_kwargs: Any) -> Any:
     return _build_store_with(uri, from_url, **store_kwargs)
 
 
-def _bucket_url(uri: str) -> str:
-    """Extract the bucket-level URL from a full object URI."""
-    parsed = urlparse(uri)
-    if parsed.scheme == "s3":
-        # s3://bucket/key -> s3://bucket
-        return f"s3://{parsed.netloc}"
-    if parsed.scheme in {"gs", "az"}:
-        return f"{parsed.scheme}://{parsed.netloc}"
-    if parsed.scheme in {"http", "https"}:
-        # https://bucket.s3.region.amazonaws.com/key -> https://bucket.s3.region.amazonaws.com
-        return f"{parsed.scheme}://{parsed.netloc}"
-    local_path = _resolve_local_path(uri)
-    if local_path is not None:
-        return local_path.parent.as_uri()
-    return uri
+def _extract_key(uri: str) -> str:
+    """The object key relative to ``_parse_uri(uri).root``, percent-decoded."""
+    return _parse_uri(uri).key
+
+
+def _resolve_local_path(uri: str) -> Path | None:
+    """Return the resolved Path if *uri* is local, else None."""
+    return _parse_uri(uri).local_path
 
 
 def _require_same_bucket(uris: Sequence[str], reason: str) -> None:
-    """Raise if *uris* do not all resolve to the same bucket/host.
+    """Raise if *uris* do not all resolve to the same store.
 
     A store is rooted at one bucket and object keys carry no bucket, so a
     mixed-bucket list either 404s or — when two buckets mirror a key path —
     silently serves one file's bytes for another's URI.
     """
-    bucket = _bucket_url(uris[0])
-    mismatched = [u for u in uris[1:] if _bucket_url(u) != bucket]
+    first = _parse_uri(uris[0])
+    mismatched = [u for u in uris[1:] if _parse_uri(u).identity != first.identity]
     if mismatched:
         raise ValueError(
             f"All URIs must belong to the same bucket/host when {reason}. "
-            f"First URI resolves to {bucket!r}, but these do not: {mismatched}"
+            f"First URI resolves to {first.root!r}, but these do not: {mismatched}"
         )
-
-
-def _resolve_local_path(uri: str) -> Path | None:
-    """Return resolved Path if uri is local, else None."""
-    parsed = urlparse(uri)
-    if parsed.scheme not in ("", "file") or _is_s3_uri(uri):
-        return None
-    return Path(parsed.path if parsed.scheme == "file" else uri).resolve()
 
 
 async def _fetch_descriptor_bytes(uri: str, **store_kwargs: Any) -> bytes:
     """Fetch a full XML descriptor object (VRT or DIMAP) via obstore,
     with a filesystem fast-path for local paths. Shared by the VRT and
     DIMAP readers — both just GET the whole document once at open time."""
-    local = _resolve_local_path(uri)
-    if local is not None:
-        return local.read_bytes()
+    parsed = _parse_uri(uri)
+    if parsed.local_path is not None:
+        return parsed.local_path.read_bytes()
     store = _build_store_with(uri, obstore_from_url, **store_kwargs)
-    key = _obstore_key(uri)
-    result = await obstore.get_async(store, key)
+    result = await obstore.get_async(store, parsed.key)
     return bytes(await result.bytes_async())
 
 
@@ -226,25 +180,142 @@ def _join_relative_uri(base_uri: str, relative: str) -> str:
     return urlunparse(parsed._replace(path=joined))
 
 
-def _obstore_key(uri: str) -> str:
-    """Extract the object key for use with an obstore rooted at bucket level.
+# ── URI parsing ──────────────────────────────────────────────────────────
 
-    Unlike ``_extract_key`` (used with async-tiff stores), this does not
-    distinguish virtual-hosted from path-style S3 HTTP URLs because
-    obstore handles that internally when the store is rooted via
-    ``_bucket_url``.
+
+def _path_key(parsed: ParseResult) -> str:
+    return unquote(parsed.path).lstrip("/")
+
+
+def _parse_http_uri(uri: str, parsed: ParseResult) -> ParsedURI:
+    host = parsed.netloc
+    match = _AWS_HOST_RE.match(host)
+
+    if match is None:
+        if _AWS_SUFFIX_RE.search(host):
+            raise ValueError(
+                f"Unsupported S3 endpoint {host!r}. rastera resolves "
+                f"virtual-hosted and path-style URLs on s3[.-]<region>.amazonaws.com; "
+                f"dual-stack, transfer-acceleration, FIPS, access-point, S3 Express "
+                f"and VPC-endpoint hosts imply an endpoint and addressing style that "
+                f"cannot be inferred from the URL. Pass an explicit store instead: "
+                f"store=S3Store(bucket=..., endpoint=..., region=...)."
+            )
+        # A query or fragment carries auth material that a host-rooted store
+        # would silently drop, so root at the whole URI in that case.
+        if parsed.query or parsed.fragment:
+            return ParsedURI(uri, "http", uri, "")
+        return ParsedURI(uri, "http", f"{parsed.scheme}://{host}", _path_key(parsed))
+
+    bucket = match.group("bucket")
+    raw_key = parsed.path.lstrip("/")
+    if bucket is None:
+        # Path-style: the bucket is the first path segment.
+        bucket, _, raw_key = raw_key.partition("/")
+        bucket = unquote(bucket)
+        virtual_hosted = False
+    else:
+        # A dotted bucket cannot be reached virtual-hosted: the wildcard cert
+        # for *.s3.<region>.amazonaws.com covers a single label only.
+        virtual_hosted = "." not in bucket
+    if not bucket:
+        raise ValueError(f"No bucket in S3 URL {uri!r}.")
+
+    region = match.group("region")
+    return ParsedURI(
+        uri,
+        "aws",
+        f"s3://{bucket}",
+        unquote(raw_key),
+        region=region.lower() if region else None,
+        virtual_hosted=virtual_hosted,
+    )
+
+
+# ── store kwargs ─────────────────────────────────────────────────────────
+
+
+def _store_kwargs_for(
+    parsed: ParsedURI, store_kwargs: dict[str, Any]
+) -> dict[str, Any]:
+    """The kwargs to pass ``from_url`` for *parsed*, given the caller's."""
+    out = dict(store_kwargs)
+
+    if parsed.kind == "aws":
+        return _aws_store_kwargs(parsed, out)
+
+    if parsed.kind == "local":
+        out.pop("skip_signature", None)
+        return out
+
+    if parsed.kind == "http":
+        if out.get("skip_signature") is False or "credential_provider" in out:
+            raise ValueError(
+                f"{parsed.uri!r} resolves to a plain HTTP store, which cannot sign "
+                f"requests. rastera authenticates AWS S3 hosts only; for another "
+                f"S3-compatible service pass a configured store, e.g. "
+                f"store=S3Store(bucket=..., endpoint=..., region=...)."
+            )
+        for key in _S3_ONLY_KWARGS:
+            out.pop(key, None)
+        return out
+
+    return out  # gs://, az:// — let obstore validate its own kwargs
+
+
+def _aws_store_kwargs(parsed: ParsedURI, out: dict[str, Any]) -> dict[str, Any]:
+    if parsed.virtual_hosted:
+        out.setdefault("virtual_hosted_style_request", True)
+
+    # obstore rejects a region supplied twice ("Duplicate key aws_region"), so
+    # every source is collapsed into a single `region=` here.
+    config = dict(out.get("config") or {})
+    config_region = None
+    for key in [k for k in config if k.lower() in ("region", "aws_region")]:
+        config_region = config.pop(key)
+    if config:
+        out["config"] = config
+    else:
+        out.pop("config", None)
+
+    caller_region = out.pop("region", None) or config_region
+    if parsed.region and caller_region and caller_region != parsed.region:
+        raise ValueError(
+            f"region={caller_region!r} conflicts with the region encoded in "
+            f"{parsed.uri!r} ({parsed.region!r}). Pass only one of the two."
+        )
+    region = parsed.region or caller_region or _env_region()
+
+    if out.get("skip_signature") is False:
+        del out["skip_signature"]
+        provider = _boto3_provider()
+        if provider is None:
+            out["skip_signature"] = True
+        else:
+            out["credential_provider"] = provider
+            session_config: dict[str, Any] = provider.config or {}
+            region = region or session_config.get("region")
+    elif "credential_provider" not in out:
+        out.setdefault("skip_signature", True)
+
+    out["region"] = region or _DEFAULT_REGION
+    return out
+
+
+def _env_region() -> str | None:
+    return os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION")
+
+
+def _boto3_provider() -> Any | None:
+    """``Boto3CredentialProvider``, or None when it cannot be constructed.
+
+    Absent credentials surface as ``ValueError`` and a bad ``AWS_PROFILE`` as
+    botocore's ``ProfileNotFound``; neither is an ``ImportError``, so the
+    documented fallback to unsigned access needs the wide catch.
     """
-    local_path = _resolve_local_path(uri)
-    if local_path is not None:
-        return local_path.name
-    parsed = urlparse(uri)
-    if parsed.scheme in ("s3", "gs", "az"):
-        return parsed.path.lstrip("/")
-    if parsed.scheme in ("http", "https"):
-        host = parsed.netloc
-        path = parsed.path.lstrip("/")
-        if ".s3." not in host and ".s3-" not in host:
-            parts = path.split("/", 1)
-            return parts[1] if len(parts) == 2 else ""
-        return path
-    return parsed.path or uri
+    try:
+        from obstore.auth.boto3 import Boto3CredentialProvider
+
+        return Boto3CredentialProvider()
+    except Exception:
+        return None

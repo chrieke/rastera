@@ -6,8 +6,35 @@ import rastera
 
 live = pytest.mark.live
 
-URI = "s3://e84-earth-search-sentinel-data/sentinel-2-c1-l2a/33/T/TG/2025/7/S2B_T33TTG_20250703T100029_L2A/B03.tif"
+KEY = "sentinel-2-c1-l2a/33/T/TG/2025/7/S2B_T33TTG_20250703T100029_L2A/B03.tif"
+BUCKET = "e84-earth-search-sentinel-data"
+URI = f"s3://{BUCKET}/{KEY}"
+# The bucket's own region. Pinned rather than left to the us-west-2 fallback,
+# which would otherwise make these tests depend on the developer's AWS_REGION.
+REGION = "us-west-2"
 BBOX = (255804.0, 4626619.0, 274330.0, 4644625.0)  # UTM subset over Rome
+
+# Every URL form that must resolve to the same object.
+URI_FORMS = [
+    URI,
+    f"https://{BUCKET}.s3.{REGION}.amazonaws.com/{KEY}",
+    f"https://{BUCKET}.s3-{REGION}.amazonaws.com/{KEY}",
+    f"https://s3.{REGION}.amazonaws.com/{BUCKET}/{KEY}",
+    f"https://s3-{REGION}.amazonaws.com/{BUCKET}/{KEY}",
+    f"https://{BUCKET}.s3.amazonaws.com/{KEY}",
+    f"https://s3.amazonaws.com/{BUCKET}/{KEY}",
+]
+
+
+@live
+@pytest.mark.asyncio
+@pytest.mark.parametrize("uri", URI_FORMS)
+async def test_every_url_form_opens_the_same_object(uri: str):
+    """All six HTTPS spellings crashed before URIs were normalised to s3://."""
+    src = await rastera.open(uri, region=REGION)
+
+    gt = src._geotiff
+    assert (gt.width, gt.height, src.count) == (10980, 10980, 1)
 
 
 @pytest.mark.skip(
@@ -16,7 +43,7 @@ BBOX = (255804.0, 4626619.0, 274330.0, 4644625.0)  # UTM subset over Rome
 @live
 @pytest.mark.asyncio
 async def test_read_full_image():
-    src = await rastera.open(URI)
+    src = await rastera.open(URI, region=REGION)
 
     raster_array = await src.read()
 
@@ -31,7 +58,7 @@ async def test_read_full_image():
 @live
 @pytest.mark.asyncio
 async def test_read_bbox():
-    src = await rastera.open(URI)
+    src = await rastera.open(URI, region=REGION)
 
     raster_array = await src.read(bbox=BBOX, bbox_crs=32633)
 

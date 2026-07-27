@@ -3,7 +3,16 @@ from typing import Any
 from unittest.mock import MagicMock
 
 import numpy as np
+import pytest
 from affine import Affine
+
+
+@pytest.fixture(autouse=True)
+def _clear_aws_region(monkeypatch: pytest.MonkeyPatch):
+    """Region resolution consults the environment, so a developer's AWS_REGION
+    would otherwise decide what the offline tests assert."""
+    monkeypatch.delenv("AWS_REGION", raising=False)
+    monkeypatch.delenv("AWS_DEFAULT_REGION", raising=False)
 
 
 def make_meta(

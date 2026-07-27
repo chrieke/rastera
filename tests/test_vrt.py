@@ -1519,7 +1519,7 @@ class TestDispatch:
         with (
             patch("rastera.vrt._open_vrt", new=AsyncMock()) as mock_open_vrt,
             patch("rastera.reader.GeoTIFF") as mock_geotiff_cls,
-            patch("rastera.reader.from_url"),
+            patch("rastera.store.from_url"),
         ):
             mock_geotiff_cls.open = AsyncMock(return_value=gt)
             await rastera.open("s3://bucket/plain.tif", cache=False)

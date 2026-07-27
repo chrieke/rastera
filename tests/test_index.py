@@ -12,7 +12,6 @@ box = pytest.importorskip("shapely.geometry").box
 
 from rastera.index import (  # noqa: E402
     HeaderCacheStore,
-    _obstore_key,
     build_index,
     open_from_index,
 )
@@ -376,34 +375,6 @@ class TestOpenFromIndex:
         result = await open_from_index(gdf, bbox=(0, 0, 1, 1), bbox_crs=4326)
 
         assert result == []
-
-
-# ── _obstore_key ─────────────────────────────────────────────────────────
-
-
-class TestObstoreKey:
-    def test_s3_uri(self):
-        assert _obstore_key("s3://bucket/path/file.tif") == "path/file.tif"
-
-    def test_virtual_hosted_url(self):
-        url = "https://bucket.s3.us-east-1.amazonaws.com/path/file.tif"
-        assert _obstore_key(url) == "path/file.tif"
-
-    def test_path_style_url(self):
-        url = "https://s3.us-east-1.amazonaws.com/bucket/path/file.tif"
-        assert _obstore_key(url) == "path/file.tif"
-
-    def test_path_style_url_matches_extract_key(self):
-        """_obstore_key and _extract_key must agree for all S3 URL styles."""
-        from rastera.reader import _extract_key
-
-        urls = [
-            "s3://bucket/path/file.tif",
-            "https://bucket.s3.us-east-1.amazonaws.com/path/file.tif",
-            "https://s3.us-east-1.amazonaws.com/bucket/path/file.tif",
-        ]
-        for url in urls:
-            assert _obstore_key(url) == _extract_key(url), f"Mismatch for {url}"
 
 
 class TestBuildIndexStore:
