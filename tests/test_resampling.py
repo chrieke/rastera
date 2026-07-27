@@ -9,23 +9,24 @@ from pyproj import Transformer
 
 from rastera.resampling import ResamplingMethod, resample
 
+
+def _src_grid(n: int):
+    """n×n source of sequential values, 10m pixels, origin (0, n*10)."""
+    arr = np.arange(n * n, dtype=np.float32).reshape(1, n, n)
+    return arr, Affine(10, 0, 0, 0, -10, n * 10)
+
+
 # ── resample (nearest) ───────────────────────────────────────────────────
 
 
 class TestResampleNearest:
-    def _make_src(self):
-        """4x4 source array with sequential values, 10m pixels, origin (0, 40)."""
-        arr = np.arange(16, dtype=np.float32).reshape(1, 4, 4)
-        transform = Affine(10, 0, 0, 0, -10, 40)
-        return arr, transform
-
     def test_identity(self):
-        arr, t = self._make_src()
+        arr, t = _src_grid(4)
         out = resample(arr, t, t, 4, 4)
         np.testing.assert_array_equal(out, arr)
 
     def test_downsample(self):
-        arr, src_t = self._make_src()
+        arr, src_t = _src_grid(4)
         # 2x2 output, 20m pixels, same origin
         dst_t = Affine(20, 0, 0, 0, -20, 40)
         out = resample(arr, src_t, dst_t, 2, 2)
@@ -42,7 +43,7 @@ class TestResampleNearest:
         assert out[0, 1, 1] == arr[0, 3, 3]
 
     def test_upsample(self):
-        arr, src_t = self._make_src()
+        arr, src_t = _src_grid(4)
         # 8x8 output, 5m pixels, same origin
         dst_t = Affine(5, 0, 0, 0, -5, 40)
         out = resample(arr, src_t, dst_t, 8, 8)
@@ -54,7 +55,7 @@ class TestResampleNearest:
         assert out[0, 1, 0] == arr[0, 0, 0]
 
     def test_nodata_for_out_of_bounds(self):
-        arr, src_t = self._make_src()
+        arr, src_t = _src_grid(4)
         # Destination extends beyond source: 4x4 at 10m but shifted right by 20m
         dst_t = Affine(10, 0, 20, 0, -10, 40)
         out = resample(arr, src_t, dst_t, 4, 4, nodata=-1)
@@ -63,8 +64,6 @@ class TestResampleNearest:
         assert out[0, 0, 3] == -1  # out of bounds
 
     def test_with_reprojection(self):
-        from pyproj import Transformer
-
         # Source in UTM 32N, destination in WGS84
         src_arr = np.ones((1, 10, 10), dtype=np.float32)
         src_t = Affine(100, 0, 500000, 0, -100, 5000000)  # 100m pixels in UTM
@@ -79,8 +78,6 @@ class TestResampleNearest:
 
     def test_coarse_grid_matches_brute_force(self):
         """Coarse-grid interpolation should match per-pixel pyproj within 0.125 px."""
-        from pyproj import Transformer
-
         from rastera.resampling import _coarse_grid_transform
 
         # Source in UTM 33N, destination in WGS84 — realistic Sentinel-2 scenario
@@ -108,8 +105,6 @@ class TestResampleNearest:
 
     def test_small_grid_with_transformer(self):
         """Grid smaller than the coarse step size should still work."""
-        from pyproj import Transformer
-
         src_arr = np.arange(25, dtype=np.float32).reshape(1, 5, 5)
         src_t = Affine(100, 0, 500000, 0, -100, 5000000)
         dst_t = Affine(0.001, 0, 9.0, 0, -0.001, 45.1)
@@ -119,8 +114,6 @@ class TestResampleNearest:
 
     def test_single_pixel_with_transformer(self):
         """1x1 destination grid should not crash."""
-        from pyproj import Transformer
-
         src_arr = np.ones((1, 10, 10), dtype=np.float32)
         src_t = Affine(100, 0, 500000, 0, -100, 5000000)
         dst_t = Affine(0.01, 0, 9.0, 0, -0.01, 45.1)
@@ -133,15 +126,9 @@ class TestResampleNearest:
 
 
 class TestResampleBilinear:
-    def _make_src(self):
-        """4x4 source array with sequential values, 10m pixels, origin (0, 40)."""
-        arr = np.arange(16, dtype=np.float32).reshape(1, 4, 4)
-        transform = Affine(10, 0, 0, 0, -10, 40)
-        return arr, transform
-
     def test_identity(self):
         """Same grid, frac=0 at every pixel center → output equals source."""
-        arr, t = self._make_src()
+        arr, t = _src_grid(4)
         out = resample(arr, t, t, 4, 4, method="bilinear")
         np.testing.assert_allclose(out, arr)
 
@@ -219,7 +206,7 @@ class TestResampleBilinear:
 
     def test_oob_fill(self):
         """Dst pixel whose center is outside source extent → nodata."""
-        arr, src_t = self._make_src()
+        arr, src_t = _src_grid(4)
         # Shift dst origin so two columns fall outside the source.
         dst_t = Affine(10, 0, 20, 0, -10, 40)
         out = resample(arr, src_t, dst_t, 4, 4, nodata=-1, method="bilinear")
@@ -228,8 +215,6 @@ class TestResampleBilinear:
         np.testing.assert_array_equal(out[0, :, 3], -1)
 
     def test_with_reprojection(self):
-        from pyproj import Transformer
-
         src_arr = np.ones((1, 10, 10), dtype=np.float32)
         src_t = Affine(100, 0, 500000, 0, -100, 5000000)
         dst_t = Affine(0.001, 0, 9.0, 0, -0.001, 45.1)
@@ -305,21 +290,15 @@ class TestResampleBilinear:
 
 
 class TestResampleCubic:
-    def _make_src(self):
-        """8x8 source array with sequential values, 10m pixels, origin (0, 80)."""
-        arr = np.arange(64, dtype=np.float32).reshape(1, 8, 8)
-        transform = Affine(10, 0, 0, 0, -10, 80)
-        return arr, transform
-
     def test_identity(self):
         """Cubic at the same grid returns the source array (frac=0 at centers)."""
-        arr, t = self._make_src()
+        arr, t = _src_grid(8)
         out = resample(arr, t, t, 8, 8, method="cubic")
         np.testing.assert_allclose(out, arr, atol=1e-5)
 
     def test_smooth_downsample_vs_nearest(self):
         """On a gradient, cubic downsample differs from nearest snapping."""
-        arr, src_t = self._make_src()  # values 0..63
+        arr, src_t = _src_grid(8)  # values 0..63
         # 2x2 downsample (4x reduction); use phase that doesn't align with grid
         dst_t = Affine(40, 0, 0, 0, -40, 80)
         out_cubic = resample(arr, src_t, dst_t, 2, 2, method="cubic")
@@ -395,7 +374,7 @@ class TestResampleCubic:
 
     def test_oob_fill(self):
         """Dst pixel whose center is outside source extent → nodata."""
-        arr, src_t = self._make_src()
+        arr, src_t = _src_grid(8)
         # Shift dst origin so columns fall outside.
         dst_t = Affine(10, 0, 100, 0, -10, 80)
         out = resample(arr, src_t, dst_t, 4, 4, nodata=-1, method="cubic")
@@ -418,8 +397,6 @@ class TestResampleCubic:
         assert out.max() <= 255
 
     def test_with_reprojection(self):
-        from pyproj import Transformer
-
         src_arr = np.ones((1, 20, 20), dtype=np.float32)
         src_t = Affine(100, 0, 500000, 0, -100, 5000000)
         dst_t = Affine(0.001, 0, 9.0, 0, -0.001, 45.1)
@@ -861,8 +838,6 @@ class TestResampleValidation:
         the same-CRS path returned cleanly."""
         t = None
         if transformer == "cross":
-            from pyproj import Transformer
-
             t = Transformer.from_crs(32632, 32633, always_xy=True)
         out = resample(
             self.SRC, self.SRC_T, self.DST_T, 0, 0, transformer=t, method=method
@@ -914,7 +889,6 @@ class TestBoolMask:
 
     def test_two_pass_cross_crs_bool(self):
         """_two_pass_work_dtype called np.iinfo(np.bool_), which raises."""
-        from pyproj import Transformer
 
         mask = np.ones((1, 64, 64), dtype=bool)
         t = Transformer.from_crs(32632, 32632, always_xy=True)

@@ -90,7 +90,6 @@ class TestAsyncGeoTIFFInit:
 
 
 class TestOpen:
-    @pytest.mark.asyncio
     @patch("rastera.reader.GeoTIFF")
     @patch("rastera.store.from_url")
     async def test_open_auto_store(self, mock_from_url: Any, mock_geotiff_cls: Any):
@@ -111,7 +110,6 @@ class TestOpen:
         assert obj.uri == "s3://bucket/key.tif"
         assert isinstance(obj, AsyncGeoTIFF)
 
-    @pytest.mark.asyncio
     @patch("rastera.reader.GeoTIFF")
     async def test_open_with_store(self, mock_geotiff_cls: Any):
         """With an explicit store, from_url is NOT called; key is extracted from URI."""
@@ -128,7 +126,6 @@ class TestOpen:
         )
         assert obj.uri == "s3://bucket/path/to/key.tif"
 
-    @pytest.mark.asyncio
     async def test_open_multi_uri_cross_bucket_raises(self):
         """Cross-bucket URIs without explicit store should raise."""
         with pytest.raises(ValueError, match="same bucket/host"):
@@ -139,7 +136,6 @@ class TestOpen:
                 ]
             )
 
-    @pytest.mark.asyncio
     @patch("rastera.reader.GeoTIFF")
     @patch("rastera.store.from_url")
     async def test_open_many_accepts_sibling_local_paths(
@@ -196,7 +192,6 @@ class TestMetaOverrides:
         with pytest.raises(ValueError, match="Unknown meta_overrides key"):
             AsyncGeoTIFF("s3://b/k.tif", gt, meta_overrides={"csr": 3006})  # type: ignore[typeddict-unknown-key]
 
-    @pytest.mark.asyncio
     @patch("rastera.reader.GeoTIFF")
     @patch("rastera.store.from_url")
     async def test_open_forwards_override(
@@ -228,30 +223,25 @@ class TestReadArgumentValidation:
         gt.read = AsyncMock(side_effect=AssertionError("read was issued"))
         return obj
 
-    @pytest.mark.asyncio
     async def test_unknown_resampling_rejected_on_native_path(self):
         """The native path never calls resample(), so this argument was
         accepted and then silently ignored."""
         with pytest.raises(ValueError, match="Unknown resampling method"):
             await self._obj().read(resampling="lanczos")  # type: ignore[arg-type]
 
-    @pytest.mark.asyncio
     @pytest.mark.parametrize("bad", [0.0, -1.0, float("nan"), float("inf")])
     async def test_bad_target_resolution_rejected(self, bad: float):
         with pytest.raises(ValueError, match="target_resolution"):
             await self._obj().read(target_resolution=bad)
 
-    @pytest.mark.asyncio
     async def test_inverted_bbox_rejected(self):
         with pytest.raises(ValueError, match="minx < maxx"):
             await self._obj().read(bbox=(10, 0, 0, 10), bbox_crs=32632)
 
-    @pytest.mark.asyncio
     async def test_float_band_index_rejected(self):
         with pytest.raises(ValueError, match="must be integers"):
             await self._obj().read(band_indices=[1.5])  # type: ignore[list-item]
 
-    @pytest.mark.asyncio
     async def test_native_resolution_is_not_rejected(self):
         """target_resolution equal to the source res is a no-op, not an error."""
         gt = make_mock_geotiff(
@@ -266,7 +256,6 @@ class TestReadArgumentValidation:
 
 
 class TestRead:
-    @pytest.mark.asyncio
     async def test_read_bbox_and_window_raises(self):
         gt = make_mock_geotiff()
         obj = AsyncGeoTIFF("s3://b/k.tif", gt)
@@ -277,7 +266,6 @@ class TestRead:
                 window=Window(col_off=0, row_off=0, width=10, height=10),
             )
 
-    @pytest.mark.asyncio
     async def test_read_full_image(self):
         """Read with no bbox/window should use full image bounds."""
         gt = make_mock_geotiff(
@@ -295,7 +283,6 @@ class TestRead:
         assert arr.height == 16
         np.testing.assert_array_equal(arr.data, 1)  # type: ignore[reportUnknownMemberType]
 
-    @pytest.mark.asyncio
     async def test_read_with_window(self):
         gt = make_mock_geotiff(
             width=32, height=32, scale=1.0, count=2, tile_width=32, tile_height=32
@@ -310,7 +297,6 @@ class TestRead:
         assert arr.data.shape == (2, 16, 16)  # type: ignore[reportUnknownMemberType]
         np.testing.assert_array_equal(arr.data, 42)  # type: ignore[reportUnknownMemberType]
 
-    @pytest.mark.asyncio
     async def test_read_band_indices(self):
         gt = make_mock_geotiff(
             width=16, height=16, scale=1.0, count=3, tile_width=16, tile_height=16
@@ -336,7 +322,6 @@ class TestRead:
         np.testing.assert_array_equal(arr.data[0], data[0])  # type: ignore[reportUnknownMemberType]
         np.testing.assert_array_equal(arr.data[1], data[2])  # type: ignore[reportUnknownMemberType]
 
-    @pytest.mark.asyncio
     async def test_read_band_index_zero_raises(self):
         gt = make_mock_geotiff(width=16, height=16, scale=1.0, count=3)
         obj = AsyncGeoTIFF("s3://b/k.tif", gt)
@@ -344,7 +329,6 @@ class TestRead:
         with pytest.raises(ValueError, match="1-based"):
             await obj.read(band_indices=[0])
 
-    @pytest.mark.asyncio
     async def test_window_resample_matches_equivalent_bbox(self):
         """The output grid is ceil-sized, so reading only the window left the
         trailing row/column with nothing behind it — nodata, even mid-image
@@ -366,7 +350,6 @@ class TestRead:
         np.testing.assert_array_equal(arr.data, equivalent.data)  # type: ignore[reportUnknownMemberType]
         assert arr.bounds == equivalent.bounds
 
-    @pytest.mark.asyncio
     async def test_window_resample_with_overview_reads_right_region(self):
         """*window* is in full-resolution pixels; it used to be handed to the
         overview unchanged, which reads a different region entirely."""
@@ -389,7 +372,6 @@ class TestRead:
         )
         assert (arr.bounds[0], arr.bounds[2]) == (300.0, 380.0)
 
-    @pytest.mark.asyncio
     @pytest.mark.parametrize("method", ["bilinear", "cubic"])
     # res 1x1 downsamples 10x on both axes; 2x20 downsamples 5x in x but
     # *up*samples in y, so an x-derived halo is too narrow for the y kernel.
@@ -430,7 +412,6 @@ class TestRead:
         )
         np.testing.assert_array_equal(got.data, want)  # type: ignore[reportUnknownMemberType]
 
-    @pytest.mark.asyncio
     async def test_unsnapped_transform_clamped_to_image(self):
         """The window is clipped to the image, so anchoring on a bbox edge that
         overhangs it labelled the pixels where they are not."""
@@ -448,7 +429,6 @@ class TestRead:
         assert arr.transform.c == 0.0  # not -500
         assert arr.transform.f == 160.0
 
-    @pytest.mark.asyncio
     async def test_unsnapped_transform_non_square_pixels(self):
         """res[0] was used for both axes, so tall pixels came back short."""
         gt = make_mock_geotiff(
@@ -493,7 +473,6 @@ class TestWarpSeam:
             ("nearest", 10.0),
         ],
     )
-    @pytest.mark.asyncio
     async def test_same_crs_halo_is_kernel_sized(self, method: str, pad: float):
         obj, _ = self._utm_obj()
         calls = spy_read_native(obj)
@@ -514,7 +493,6 @@ class TestWarpSeam:
         )
         assert calls[0]["overview"] is None
 
-    @pytest.mark.asyncio
     async def test_cross_crs_halo_is_per_axis(self):
         """UTM->4326 compresses x and y by different factors, so a scalar
         source-resolution ratio under-pads one axis."""
@@ -544,7 +522,6 @@ class TestWarpSeam:
             atol=1e-6,
         )
 
-    @pytest.mark.asyncio
     async def test_reproject_without_target_resolution_skips_overviews(self):
         """Overviews are all coarser than native, so a density-preserving
         reprojection must not silently read one."""
@@ -568,7 +545,6 @@ class TestWarpSeam:
         assert len(calls) == 1
         assert calls[0]["overview"] is None
 
-    @pytest.mark.asyncio
     async def test_same_crs_resample_reports_source_geotiff(self):
         """Not a _CrsNodata stub: RasterArray.crs/.nodata read straight off
         this, and vrt._dispatch_source_reads keys its nodata swap off a
@@ -616,7 +592,6 @@ class TestOutputLabels:
             ({"target_crs": 4326}, 4326),
         ],
     )
-    @pytest.mark.asyncio
     async def test_crs_override_reaches_the_output(
         self, read_kwargs: dict[str, Any], expected: int
     ):
@@ -629,7 +604,6 @@ class TestOutputLabels:
         "read_kwargs",
         [{}, {"target_resolution": 20.0}, {"target_crs": 4326}],
     )
-    @pytest.mark.asyncio
     async def test_unrepresentable_nodata_is_not_reported(
         self, read_kwargs: dict[str, Any]
     ):
@@ -650,7 +624,6 @@ class TestOutputLabels:
             (float("nan"), np.dtype("f4")),
         ],
     )
-    @pytest.mark.asyncio
     async def test_agreeing_file_keeps_the_live_geotiff(
         self, nodata: float, dtype: np.dtype[Any]
     ):

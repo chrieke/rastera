@@ -101,7 +101,6 @@ def _make_index_gdf(entries: list[dict[str, Any]]) -> Any:
 
 
 class TestHeaderCacheStore:
-    @pytest.mark.asyncio
     @patch("rastera.index.obstore.get_range_async", new_callable=AsyncMock)
     async def test_get_range_served_from_cache(self, mock_get_range: Any) -> None:
         cached_bytes = b"ABCDEFGHIJ"  # 10 bytes
@@ -112,7 +111,6 @@ class TestHeaderCacheStore:
         assert result == b"CDEF"
         mock_get_range.assert_not_called()
 
-    @pytest.mark.asyncio
     @patch("rastera.index.obstore.get_range_async", new_callable=AsyncMock)
     async def test_get_range_delegates_beyond_cache(self, mock_get_range: Any) -> None:
         cached_bytes = b"ABCDE"  # 5 bytes
@@ -131,7 +129,6 @@ class TestHeaderCacheStore:
             length=None,
         )
 
-    @pytest.mark.asyncio
     @patch("rastera.index.obstore.get_ranges_async", new_callable=AsyncMock)
     async def test_get_ranges_mixed(self, mock_get_ranges: Any) -> None:
         cached_bytes = b"0123456789"  # 10 bytes
@@ -159,7 +156,6 @@ class TestHeaderCacheStore:
 
 
 class TestBuildIndex:
-    @pytest.mark.asyncio
     @patch("rastera.index._build_obstore")
     @patch("rastera.index.AsyncGeoTIFF.open", new_callable=AsyncMock)
     @patch("rastera.index.obstore.get_range_async", new_callable=AsyncMock)
@@ -207,7 +203,6 @@ class TestBuildIndex:
         }
         assert set(gdf.columns) == expected_cols
 
-    @pytest.mark.asyncio
     @patch("rastera.index._build_obstore")
     @patch("rastera.index.AsyncGeoTIFF.open", new_callable=AsyncMock)
     @patch("rastera.index.obstore.get_range_async", new_callable=AsyncMock)
@@ -239,12 +234,10 @@ class TestBuildIndex:
         assert maxx > minx
         assert maxy > miny
 
-    @pytest.mark.asyncio
     async def test_cross_bucket_raises(self) -> None:
         with pytest.raises(ValueError, match="same bucket/host"):
             await build_index(["s3://bucket-a/key.tif", "s3://bucket-b/key.tif"])
 
-    @pytest.mark.asyncio
     async def test_cross_bucket_raises_with_explicit_store(self) -> None:
         """A caller-supplied store does not rescue mirrored key paths: the
         header cache is keyed by object key, so the two rows would collapse."""
@@ -254,7 +247,6 @@ class TestBuildIndex:
                 store=MagicMock(),
             )
 
-    @pytest.mark.asyncio
     async def test_empty_uris(self) -> None:
         gdf = await build_index([])
 
@@ -269,7 +261,6 @@ class TestBuildIndex:
 
 
 class TestOpenFromIndex:
-    @pytest.mark.asyncio
     @patch("rastera.index._build_obstore")
     @patch("rastera.index.AsyncGeoTIFF.open", new_callable=AsyncMock)
     @patch("rastera.index.get_cached_geotiff", return_value=None)
@@ -291,7 +282,6 @@ class TestOpenFromIndex:
         assert len(result) == 2
         assert mock_open.await_count == 2
 
-    @pytest.mark.asyncio
     async def test_cross_bucket_raises(self) -> None:
         """Mirrored buckets sharing a key path would collapse in the header
         cache, serving one file's header for the other's URI."""
@@ -319,7 +309,6 @@ class TestOpenFromIndex:
         with pytest.raises(ValueError, match="same bucket/host"):
             await open_from_index(gdf)
 
-    @pytest.mark.asyncio
     @patch("rastera.index._build_obstore")
     @patch("rastera.index.AsyncGeoTIFF.open", new_callable=AsyncMock)
     @patch("rastera.index.get_cached_geotiff", return_value=None)
@@ -341,7 +330,6 @@ class TestOpenFromIndex:
 
         assert len(result) == 1
 
-    @pytest.mark.asyncio
     @patch("rastera.index._build_obstore")
     @patch("rastera.index.AsyncGeoTIFF.open", new_callable=AsyncMock)
     @patch("rastera.index.get_cached_geotiff", return_value=None)
@@ -364,7 +352,6 @@ class TestOpenFromIndex:
         assert len(result) == 1
         mock_open.assert_awaited_once()
 
-    @pytest.mark.asyncio
     async def test_empty_after_filter(self) -> None:
         gdf = _make_index_gdf(
             [
@@ -378,7 +365,6 @@ class TestOpenFromIndex:
 
 
 class TestBuildIndexStore:
-    @pytest.mark.asyncio
     @patch("rastera.index._build_obstore")
     @patch("rastera.index.AsyncGeoTIFF.open", new_callable=AsyncMock)
     @patch("rastera.index.obstore.get_range_async", new_callable=AsyncMock)

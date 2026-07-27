@@ -4,7 +4,7 @@ import pytest
 
 import rastera
 
-live = pytest.mark.live
+pytestmark = pytest.mark.live
 
 KEY = "sentinel-2-c1-l2a/33/T/TG/2025/7/S2B_T33TTG_20250703T100029_L2A/B03.tif"
 BUCKET = "e84-earth-search-sentinel-data"
@@ -26,8 +26,6 @@ URI_FORMS = [
 ]
 
 
-@live
-@pytest.mark.asyncio
 @pytest.mark.parametrize("uri", URI_FORMS)
 async def test_every_url_form_opens_the_same_object(uri: str):
     """All six HTTPS spellings crashed before URIs were normalised to s3://."""
@@ -40,8 +38,6 @@ async def test_every_url_form_opens_the_same_object(uri: str):
 @pytest.mark.skip(
     reason="Downloads full 10980x10980 image (~230MB), too slow for routine use"
 )
-@live
-@pytest.mark.asyncio
 async def test_read_full_image():
     src = await rastera.open(URI, region=REGION)
 
@@ -55,8 +51,6 @@ async def test_read_full_image():
     assert data.mean() != 0
 
 
-@live
-@pytest.mark.asyncio
 async def test_read_bbox():
     src = await rastera.open(URI, region=REGION)
 
@@ -86,8 +80,6 @@ async def test_read_bbox():
 # tests/test_vrt_live.py for the same pattern with GDAL as a pixel oracle.
 
 
-@live
-@pytest.mark.asyncio
 async def test_multitile_vrt_open_and_window_read():
     from async_geotiff import Window
 
@@ -111,8 +103,6 @@ async def test_multitile_vrt_open_and_window_read():
     assert data.mean() != 0
 
 
-@live
-@pytest.mark.asyncio
 async def test_multitile_vrt_reproject_to_wgs84():
     """Stitch-then-reproject: proves the mosaic survives the read-path
     reprojection wrapper unchanged."""
