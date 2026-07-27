@@ -1,0 +1,22 @@
+# Fast, auto-fixing checks only. pyright and pytest are left to CI.
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: trailing-whitespace
+        # nbformat owns notebook whitespace; let it.
+        exclude: \.ipynb$
+      - id: end-of-file-fixer
+        exclude: \.ipynb$
+      - id: check-yaml
+      - id: check-toml
+      - id: check-merge-conflict
+      - id: check-added-large-files
+
+  # Keep in lockstep with the pinned ruff in pyproject.toml's dev group,
+  # otherwise pre-commit and CI disagree on formatting.
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.8.5
+    hooks:
+      - id: ruff
+      - id: ruff-format
