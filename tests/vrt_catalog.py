@@ -63,8 +63,7 @@ def load() -> Any:
         # body, which is how test_live.py calls it — the runner reports the
         # raised Skipped either way.
         pytest.skip(
-            f"local-only VRT catalog not present at {path} "
-            f"(override with ${ENV_VAR})",
+            f"local-only VRT catalog not present at {path} (override with ${ENV_VAR})",
             allow_module_level=True,
         )
     return _parse(json.loads(path.read_text()))

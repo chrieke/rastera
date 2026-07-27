@@ -517,7 +517,7 @@ def run_benchmarks(scenarios: list[dict]):
                 for edge_name, info in border_check["edges"].items():
                     if info["bad"]:
                         out(
-                            f"    ❌ {edge_name}: {info['dominant_frac']*100:.0f}% "
+                            f"    ❌ {edge_name}: {info['dominant_frac'] * 100:.0f}% "
                             f"is value {info['dominant_value']}"
                         )
 
