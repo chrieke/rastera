@@ -21,6 +21,7 @@ from .geo import (
     ensure_bbox,
     normalize_band_indices,
     transform_bbox,
+    validate_resolution,
 )
 from .reader import (
     AsyncGeoTIFF,
@@ -28,7 +29,7 @@ from .reader import (
     _grid_for_bbox,
     _make_output_array,
 )
-from .resampling import ResamplingMethod
+from .resampling import ResamplingMethod, validate_resampling
 
 
 async def merge(
@@ -103,6 +104,21 @@ async def merge(
     """
     if not cogs:
         raise ValueError("merge requires at least one AsyncGeoTIFF")
+
+    # Up front, and before any read: a misspelled method silently selected the
+    # other branch's semantics, and the grid arguments failed several frames
+    # deep with an error naming neither the argument nor this call.
+    if mosaic_method not in ("first", "last"):
+        raise ValueError(
+            f"mosaic_method must be 'first' or 'last', got {mosaic_method!r}"
+        )
+    if crs_method not in ("most_common", "first"):
+        raise ValueError(
+            f"crs_method must be 'most_common' or 'first', got {crs_method!r}"
+        )
+    validate_resampling(resampling)
+    validate_resolution(target_resolution)
+    _validate_fill_value(fill_value, cogs[0]._geotiff.dtype)
 
     bbox_crs = _normalize_crs(bbox_crs)
     if target_crs is not None:
@@ -449,6 +465,42 @@ def _mosaic_grid_from_bbox(
 
     transform = base_transform * Affine.translation(col_min, row_min)
     return transform, width, height
+
+
+def _validate_fill_value(fill_value: int | float, dtype: np.dtype[Any] | None) -> None:
+    """Reject a fill value the output dtype cannot carry.
+
+    ``np.full`` is inconsistent about these: out-of-range integers raise a bare
+    ``OverflowError`` naming neither the argument nor the dtype, while a
+    fractional or NaN fill is truncated to something the caller never asked for
+    (0.5 and NaN both land on 0 in an integer mosaic).
+    """
+    if dtype is None:
+        return
+    if not isinstance(fill_value, int | float | np.number) or isinstance(
+        fill_value, bool
+    ):
+        raise ValueError(f"fill_value must be a number, got {fill_value!r}")
+    if dtype.kind not in ("i", "u", "b"):
+        return
+    if math.isnan(fill_value) or math.isinf(fill_value):
+        raise ValueError(
+            f"fill_value={fill_value!r} cannot be represented in {dtype}; "
+            f"pass a finite integer fill"
+        )
+    if fill_value != int(fill_value):
+        raise ValueError(
+            f"fill_value={fill_value!r} is not an integer and would be "
+            f"truncated in a {dtype} mosaic"
+        )
+    if dtype.kind == "b":
+        return  # np.iinfo has no bool entry, and there is no range to check
+    info = np.iinfo(dtype)
+    if not info.min <= fill_value <= info.max:
+        raise ValueError(
+            f"fill_value={fill_value!r} is outside the range of {dtype} "
+            f"[{info.min}, {info.max}]"
+        )
 
 
 def _require_stackable_bands(

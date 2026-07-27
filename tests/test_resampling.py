@@ -795,6 +795,45 @@ class TestResampleValidation:
                 src, self.SRC_T, self.DST_T, 8, 8, nodata=float("nan"), method=method
             )
 
+    @pytest.mark.parametrize("method", ["nearest", "bilinear", "cubic"])
+    def test_fractional_nodata_on_integer_rejected(self, method: ResamplingMethod):
+        """No integer pixel can equal 1.5, and the methods disagreed on what to
+        write for it: nearest truncated to 1 on the cast, the kernels rounded
+        to 2. Either way the caller's mask never matched."""
+        with pytest.raises(ValueError, match="not an integer"):
+            resample(self.SRC, self.SRC_T, self.DST_T, 8, 8, nodata=1.5, method=method)
+
+    @pytest.mark.parametrize("method", ["nearest", "bilinear", "cubic"])
+    def test_whole_float_nodata_on_integer_allowed(self, method: ResamplingMethod):
+        """3.0 is representable, so it stays legal — rasterio hands nodata over
+        as a float and every real sentinel arrives this way."""
+        out = resample(
+            self.SRC, self.SRC_T, self.DST_T, 8, 8, nodata=3.0, method=method
+        )
+        assert (out == 3).any()
+
+    @pytest.mark.parametrize("method", ["nearest", "bilinear", "cubic"])
+    def test_nodata_past_float64_mantissa_rejected(self, method: ResamplingMethod):
+        """The kernels accumulate in float64 and write the sentinel back through
+        float(nodata), so 2**53+1 came out as 2**53 — bilinear marked nodata
+        with a value nearest never produces and nothing downstream matches."""
+        src = self.SRC.astype(np.int64)
+        with pytest.raises(ValueError, match="exactly representable"):
+            resample(src, self.SRC_T, self.DST_T, 8, 8, nodata=2**53 + 1, method=method)
+
+    @pytest.mark.parametrize("method", ["nearest", "bilinear", "cubic"])
+    def test_large_but_exact_nodata_allowed(self, method: ResamplingMethod):
+        src = self.SRC.astype(np.int64)
+        out = resample(
+            src, self.SRC_T, self.DST_T, 8, 8, nodata=-(2**40), method=method
+        )
+        assert (out == -(2**40)).any()
+
+    def test_fractional_nodata_on_float_allowed(self):
+        src = self.SRC.astype(np.float32)
+        out = resample(src, self.SRC_T, self.DST_T, 8, 8, nodata=1.5, method="bilinear")
+        assert (out == np.float32(1.5)).any()
+
     def test_nan_nodata_on_float_allowed(self):
         src = self.SRC.astype(np.float32)
         out = resample(

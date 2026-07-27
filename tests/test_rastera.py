@@ -216,6 +216,55 @@ class TestMetaOverrides:
 # ── read() ───────────────────────────────────────────────────────────────
 
 
+class TestReadArgumentValidation:
+    """read() shares merge()'s validators, so the same bad argument is rejected
+    the same way on both entry points instead of failing deep in NumPy."""
+
+    @staticmethod
+    def _obj():
+        gt = make_mock_geotiff(width=16, height=16, scale=1.0, count=1)
+        obj = AsyncGeoTIFF("s3://b/k.tif", gt)
+        # No case here should reach I/O.
+        gt.read = AsyncMock(side_effect=AssertionError("read was issued"))
+        return obj
+
+    @pytest.mark.asyncio
+    async def test_unknown_resampling_rejected_on_native_path(self):
+        """The native path never calls resample(), so this argument was
+        accepted and then silently ignored."""
+        with pytest.raises(ValueError, match="Unknown resampling method"):
+            await self._obj().read(resampling="lanczos")  # type: ignore[arg-type]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("bad", [0.0, -1.0, float("nan"), float("inf")])
+    async def test_bad_target_resolution_rejected(self, bad: float):
+        with pytest.raises(ValueError, match="target_resolution"):
+            await self._obj().read(target_resolution=bad)
+
+    @pytest.mark.asyncio
+    async def test_inverted_bbox_rejected(self):
+        with pytest.raises(ValueError, match="minx < maxx"):
+            await self._obj().read(bbox=(10, 0, 0, 10), bbox_crs=32632)
+
+    @pytest.mark.asyncio
+    async def test_float_band_index_rejected(self):
+        with pytest.raises(ValueError, match="must be integers"):
+            await self._obj().read(band_indices=[1.5])  # type: ignore[list-item]
+
+    @pytest.mark.asyncio
+    async def test_native_resolution_is_not_rejected(self):
+        """target_resolution equal to the source res is a no-op, not an error."""
+        gt = make_mock_geotiff(
+            width=16, height=16, scale=1.0, count=1, tile_width=16, tile_height=16
+        )
+        obj = AsyncGeoTIFF("s3://b/k.tif", gt)
+        gt.read = AsyncMock(
+            return_value=_make_read_result((1, 16, 16), dtype=np.uint16, geotiff=gt)
+        )
+        arr = await obj.read(target_resolution=1.0, resampling="bilinear")
+        assert arr.data.shape == (1, 16, 16)  # type: ignore[reportUnknownMemberType]
+
+
 class TestRead:
     @pytest.mark.asyncio
     async def test_read_bbox_and_window_raises(self):

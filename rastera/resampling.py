@@ -30,6 +30,7 @@ from . import config
 from .config import WarpStrategy
 
 ResamplingMethod = Literal["nearest", "bilinear", "cubic"]
+_RESAMPLING_METHODS = ("nearest", "bilinear", "cubic")
 
 # Local downsample scale above which the ``"auto"`` strategy takes the two-pass
 # cross-CRS route.  Set conservatively: benchmarking cross-CRS warps across
@@ -102,11 +103,7 @@ def resample(
             the ``"auto"`` / ``"single_pass"`` semantics. No effect on nearest
             (any CRS/scale), same-CRS, or upsampling.
     """
-    if method not in ("nearest", "bilinear", "cubic"):
-        raise ValueError(
-            f"Unknown resampling method {method!r}; "
-            "expected 'nearest', 'bilinear', or 'cubic'."
-        )
+    validate_resampling(method)
     if warp_strategy is None:
         warp_strategy = config._warp_strategy
 
@@ -472,6 +469,15 @@ def _validate_grids(
         )
 
 
+def validate_resampling(method: str) -> None:
+    """Reject an unknown resampling method."""
+    if method not in _RESAMPLING_METHODS:
+        raise ValueError(
+            f"Unknown resampling method {method!r}; "
+            "expected 'nearest', 'bilinear', or 'cubic'."
+        )
+
+
 def _validate_dtype_nodata(dtype: np.dtype, nodata: int | float | None) -> None:
     """Reject nodata sentinels the dtype cannot carry.
 
@@ -486,6 +492,13 @@ def _validate_dtype_nodata(dtype: np.dtype, nodata: int | float | None) -> None:
             f"nodata=NaN cannot be represented in {dtype}; pass a finite "
             f"sentinel or nodata=None"
         )
+    if math.isinf(nodata) or nodata != int(nodata):
+        # A fractional sentinel matches no pixel and lands differently per
+        # method — nearest truncates it on the cast, the kernels round it.
+        raise ValueError(
+            f"nodata={nodata!r} is not an integer and so cannot be represented "
+            f"in {dtype}; no pixel can equal it"
+        )
     if dtype.kind == "b":
         return  # np.iinfo has no bool entry, and there is no range to check
     info = np.iinfo(dtype)
@@ -493,6 +506,14 @@ def _validate_dtype_nodata(dtype: np.dtype, nodata: int | float | None) -> None:
         raise ValueError(
             f"nodata={nodata!r} is outside the range of {dtype} "
             f"[{info.min}, {info.max}]; no pixel can equal it"
+        )
+    # The kernels accumulate in float64 and write the sentinel back through
+    # ``float(nodata)``, so a 64-bit sentinel past the mantissa comes back
+    # altered — bilinear marks nodata with a value nearest never produces.
+    if abs(int(nodata)) > 2**53:
+        raise ValueError(
+            f"nodata={nodata!r} exceeds 2**53 and is not exactly representable "
+            f"in the float64 the resampling kernels use; pick a smaller sentinel"
         )
 
 

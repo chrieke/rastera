@@ -21,9 +21,15 @@ from .geo import (
     ensure_bbox,
     normalize_band_indices,
     transform_bbox,
+    validate_resolution,
     window_from_bbox,
 )
-from .resampling import ResamplingMethod, _kernel_halo, resample
+from .resampling import (
+    ResamplingMethod,
+    _kernel_halo,
+    resample,
+    validate_resampling,
+)
 from .store import (
     _apply_s3_defaults,
     _build_store,
@@ -246,6 +252,12 @@ class AsyncGeoTIFF:
             raise ValueError("bbox_crs is required when bbox is provided")
         if window is not None and target_crs is not None:
             raise ValueError("Cannot combine window with target_crs")
+        # ``resampling`` is checked here rather than left to ``resample()``: the
+        # native path never calls it, so an unknown method was silently ignored
+        # on exactly the reads where it looked like it had been honoured.
+        validate_resampling(resampling)
+        if target_resolution is not None:
+            validate_resolution(target_resolution)
 
         if bbox_crs is not None:
             bbox_crs = _normalize_crs(bbox_crs)

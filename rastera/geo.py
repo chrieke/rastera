@@ -4,6 +4,7 @@ import math
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 
+import numpy as np
 from affine import Affine
 from async_geotiff import Window
 from async_geotiff._transform import HasTransform
@@ -49,8 +50,25 @@ class BBox:
 
 
 def ensure_bbox(bbox: BBox | tuple[float, float, float, float]) -> BBox:
-    """Normalize a bbox argument to a BBox instance."""
-    return bbox if isinstance(bbox, BBox) else BBox(*bbox)
+    """Normalize a caller-supplied bbox argument to a validated BBox instance.
+
+    Only for bboxes that came from outside the library — the internal
+    constructions (dataset bounds, intersections, transformed envelopes) are
+    already known-good and some are legitimately degenerate.
+    """
+    box = bbox if isinstance(bbox, BBox) else BBox(*bbox)
+    if not all(math.isfinite(v) for v in box):
+        raise ValueError(f"BBox must be finite, got {tuple(box)}")
+    # Every consumer takes min()/max() of the corners, so an inverted box is
+    # silently swapped rather than rejected.  For a GeoJSON antimeridian bbox
+    # like (170, -10, -170, 10) that swap spans the complementary 340 degrees.
+    if box.minx >= box.maxx or box.miny >= box.maxy:
+        raise ValueError(
+            f"BBox must have minx < maxx and miny < maxy, got {tuple(box)}. "
+            f"An antimeridian-crossing bbox (minx > maxx) has no axis-aligned "
+            f"representation; split the request at the antimeridian."
+        )
+    return box
 
 
 def normalize_band_indices(
@@ -71,6 +89,12 @@ def normalize_band_indices(
     if len(band_indices) == 0:
         raise ValueError("band_indices must not be empty (use None for all bands)")
     for b in band_indices:
+        # A float index passes the range checks below and then subtracts to
+        # 0.899..., which dies several frames later inside NumPy.
+        if not isinstance(b, int | np.integer) or isinstance(b, bool):
+            raise ValueError(
+                f"Band indices must be integers, got {b!r} ({type(b).__name__})."
+            )
         if b < 1:
             raise ValueError(
                 f"Band indices are 1-based (got {b}). Use 1 for the first band."
@@ -80,6 +104,25 @@ def normalize_band_indices(
                 f"Band index {b} out of range for dataset with {n_bands} band(s)."
             )
     return [b - 1 for b in band_indices]
+
+
+def validate_resolution(target_resolution: float) -> None:
+    """Reject a target resolution the grid math cannot use.
+
+    ``0`` divides by zero, a negative value yields a 1x1 array with a mirrored
+    transform, and nan/inf die inside ``round``/``ceil`` — all of them several
+    frames from the caller's mistake.
+    """
+    if not isinstance(target_resolution, int | float | np.number) or isinstance(
+        target_resolution, bool
+    ):
+        raise ValueError(
+            f"target_resolution must be a number, got {target_resolution!r}"
+        )
+    if not math.isfinite(target_resolution) or target_resolution <= 0:
+        raise ValueError(
+            f"target_resolution must be a finite value > 0, got {target_resolution!r}"
+        )
 
 
 def bounds_from_transform(transform: Affine, width: int, height: int) -> BBox:

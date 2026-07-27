@@ -190,6 +190,115 @@ class TestRequireCompatibleMergeInputs:
         _require_compatible_merge_inputs([cog1, cog2])
 
 
+# ── merge argument validation ────────────────────────────────────────────
+
+
+class TestMergeArgumentValidation:
+    """These arguments used to fail either silently — by selecting the other
+    branch's semantics — or several frames deep in NumPy with an error naming
+    neither the argument nor this call. All are rejected before any read."""
+
+    @staticmethod
+    def _merge(**kwargs: Any):
+        cog = _make_cog(width=10, height=10, scale=1.0, bands=1)
+        # No read is expected to happen: every case here must fail before I/O.
+        cog._read_native = AsyncMock(side_effect=AssertionError("read was issued"))
+        defaults = dict(
+            bbox=BBox(0, 0, 10, 10),
+            bbox_crs=32632,
+            target_crs=32632,
+            target_resolution=1.0,
+        )
+        return merge([cog], **{**defaults, **kwargs})  # type: ignore[arg-type]
+
+    @pytest.mark.parametrize("bad", ["fisrt", "min", "MAX", "First"])
+    async def test_unknown_mosaic_method_rejected(self, bad: str):
+        """Anything that wasn't exactly "first" fell through to last-wins."""
+        with pytest.raises(ValueError, match="mosaic_method must be"):
+            await self._merge(mosaic_method=bad)
+
+    @pytest.mark.parametrize("bad", ["First", "common", "most-common"])
+    async def test_unknown_crs_method_rejected(self, bad: str):
+        """Anything that wasn't exactly "first" fell through to most_common,
+        which for mixed inputs reprojects the whole mosaic into another zone."""
+        with pytest.raises(ValueError, match="crs_method must be"):
+            await self._merge(crs_method=bad)
+
+    async def test_unknown_resampling_rejected(self):
+        """The native fast path never calls resample(), so its method argument
+        was never validated at all on this route."""
+        with pytest.raises(ValueError, match="Unknown resampling method"):
+            await self._merge(resampling="lanczos")
+
+    @pytest.mark.parametrize("bad", [0.0, -1.0, float("nan"), float("inf")])
+    async def test_bad_target_resolution_rejected(self, bad: float):
+        with pytest.raises(ValueError, match="target_resolution"):
+            await self._merge(target_resolution=bad)
+
+    @pytest.mark.parametrize("bad", [-1, 70000])
+    async def test_fill_value_outside_dtype_range_rejected(self, bad: int):
+        """np.full raised a bare OverflowError naming neither uint16 nor the
+        fill_value argument."""
+        with pytest.raises(ValueError, match="outside the range"):
+            await self._merge(fill_value=bad)
+
+    async def test_fractional_fill_value_rejected(self):
+        """0.5 was truncated to 0 in a uint16 mosaic — indistinguishable from
+        a deliberate fill_value=0."""
+        with pytest.raises(ValueError, match="not an integer"):
+            await self._merge(fill_value=0.5)
+
+    async def test_nan_fill_value_on_integer_rejected(self):
+        """NaN also landed on 0, with only a RuntimeWarning."""
+        with pytest.raises(ValueError, match="cannot be represented"):
+            await self._merge(fill_value=float("nan"))
+
+    async def test_nan_fill_value_on_float_dtype_allowed(self):
+        cog = _make_cog(width=10, height=10, scale=1.0, dtype=np.dtype("f4"))
+        result = await merge(
+            [cog],
+            bbox=BBox(100, 100, 110, 110),  # disjoint from the cog: pure fill
+            bbox_crs=32632,
+            target_crs=32632,
+            target_resolution=1.0,
+            fill_value=float("nan"),
+        )
+        assert np.all(np.isnan(result.data))  # type: ignore[reportUnknownMemberType]
+
+    async def test_inverted_bbox_rejected(self):
+        """min()/max() swapped this into the complementary extent."""
+        with pytest.raises(ValueError, match="minx < maxx"):
+            await self._merge(bbox=BBox(10, 0, 0, 10))
+
+    async def test_float_band_index_rejected(self):
+        with pytest.raises(ValueError, match="must be integers"):
+            await self._merge(band_indices=[1.5])
+
+    async def test_valid_arguments_still_reach_the_read(self):
+        """Guards the guard: the checks above must not reject a normal call."""
+        cog = _make_cog(width=10, height=10, scale=1.0, bands=1)
+        cog._read_native = AsyncMock(
+            return_value=_make_array(
+                np.ones((1, 10, 10), dtype=np.uint16),
+                transform=Affine(1, 0, 0, 0, -1, 10),
+                geotiff=cog._geotiff,
+            )
+        )
+        await merge(
+            [cog],
+            bbox=BBox(0, 0, 10, 10),
+            bbox_crs=32632,
+            band_indices=[1],
+            fill_value=0,
+            target_crs=32632,
+            target_resolution=1.0,
+            mosaic_method="last",
+            crs_method="first",
+            resampling="nearest",
+        )
+        cog._read_native.assert_called_once()
+
+
 # ── merge ───────────────────────────────────────────────────────────
 
 
