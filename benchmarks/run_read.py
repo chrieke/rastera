@@ -8,11 +8,14 @@ from __future__ import annotations
 
 from run import run_benchmarks
 
+# UTM 33N subset over Rome, inside the B03 tile's footprint.
+BBOX = "255804.0,4626619.0,274330.0,4644625.0"
+
 SCENARIOS = [
     {
         "name": "Read: same CRS, native resolution (bbox subset), snapped to raster grid (rastera default)",
         "mode": "read",
-        "bbox": "255804.0,4626619.0,274330.0,4644625.0",
+        "bbox": BBOX,
         "bbox_crs": 32633,
         "expect": {
             "shape_match": False,
@@ -22,7 +25,7 @@ SCENARIOS = [
     {
         "name": "Read: same CRS, native resolution (bbox subset), not snapped - raster matches bbox exactly (rasterio default)",
         "mode": "read",
-        "bbox": "255804.0,4626619.0,274330.0,4644625.0",
+        "bbox": BBOX,
         "bbox_crs": 32633,
         "snap_to_grid": False,
         "expect": {"max_pct_differ": 0, "max_rmse_pct": 0},
@@ -30,7 +33,7 @@ SCENARIOS = [
     {
         "name": "Read: same CRS, downsampled to 60m, no overviews (both default)",
         "mode": "read",
-        "bbox": "255804.0,4626619.0,274330.0,4644625.0",
+        "bbox": BBOX,
         "bbox_crs": 32633,
         "target_resolution": 60.0,
         "expect": {"max_pct_differ": 0, "max_rmse_pct": 0},
@@ -38,7 +41,7 @@ SCENARIOS = [
     {
         "name": "Read: same CRS, downsampled to 60m via overviews (rastera)",
         "mode": "read",
-        "bbox": "255804.0,4626619.0,274330.0,4644625.0",
+        "bbox": BBOX,
         "bbox_crs": 32633,
         "target_resolution": 60.0,
         "use_overviews": True,
@@ -51,7 +54,7 @@ SCENARIOS = [
     {
         "name": "Read: cross-CRS reproject to EPSG:4326, 0.001 deg, no overviews (default)",
         "mode": "read",
-        "bbox": "255804.0,4626619.0,274330.0,4644625.0",
+        "bbox": BBOX,
         "bbox_crs": 32633,
         "target_crs": 4326,
         "target_resolution": 0.001,
@@ -65,7 +68,7 @@ SCENARIOS = [
     {
         "name": "Read: cross-CRS reproject to EPSG:4326, 0.001 deg, via overviews (rastera)",
         "mode": "read",
-        "bbox": "255804.0,4626619.0,274330.0,4644625.0",
+        "bbox": BBOX,
         "bbox_crs": 32633,
         "target_crs": 4326,
         "target_resolution": 0.001,

@@ -14,8 +14,27 @@ import time
 import numpy as np
 
 
-def read_rastera(
-    uri: str,
+def _affine_list(t) -> list:
+    return [t.a, t.b, t.c, t.d, t.e, t.f]
+
+
+def _corner_hull(bbox: tuple, from_crs: int, to_crs: int) -> tuple:
+    """Reproject a bbox by its four corners.
+
+    Deliberately not rastera's ``geo.transform_bbox``, which densifies each
+    edge: the rasterio side of the comparison keeps its own math so the
+    benchmark does not measure the library under test against itself.
+    """
+    from pyproj import Transformer
+
+    minx, miny, maxx, maxy = bbox
+    t = Transformer.from_crs(from_crs, to_crs, always_xy=True)
+    txs, tys = t.transform([minx, maxx, minx, maxx], [miny, miny, maxy, maxy])
+    return min(txs), min(tys), max(txs), max(tys)
+
+
+def _run_rastera(
+    uri: str | list[str],
     bbox: tuple,
     bbox_crs: int,
     target_crs: int | None,
@@ -23,13 +42,13 @@ def read_rastera(
     snap_to_grid: bool = True,
     use_overviews: bool = True,
 ) -> tuple[np.ndarray, list]:
+    """Read one URI, or merge a list of them; both take the same arguments."""
     import asyncio
 
     import rastera
 
     async def _run():
-        src = await rastera.open(uri)
-        result = await src.read(
+        kwargs = dict(
             bbox=bbox,
             bbox_crs=bbox_crs,
             target_crs=target_crs,
@@ -37,40 +56,22 @@ def read_rastera(
             snap_to_grid=snap_to_grid,
             use_overviews=use_overviews,
         )
-        t = result.transform
-        return result.data, [t.a, t.b, t.c, t.d, t.e, t.f]
+        opened = await rastera.open(uri)
+        if isinstance(uri, list):
+            result = await rastera.merge(opened, **kwargs)
+        else:
+            result = await opened.read(**kwargs)
+        return result.data, _affine_list(result.transform)
 
     return asyncio.run(_run())
 
 
-def merge_rastera(
-    uris: list[str],
-    bbox: tuple,
-    bbox_crs: int,
-    target_crs: int | None,
-    target_resolution: float | None,
-    snap_to_grid: bool = True,
-    use_overviews: bool = True,
-) -> tuple[np.ndarray, list]:
-    import asyncio
+def read_rastera(uri: str, *args, **kwargs) -> tuple[np.ndarray, list]:
+    return _run_rastera(uri, *args, **kwargs)
 
-    import rastera
 
-    async def _run():
-        sources = await rastera.open(uris)
-        result = await rastera.merge(
-            sources,
-            bbox=bbox,
-            bbox_crs=bbox_crs,
-            target_crs=target_crs,
-            target_resolution=target_resolution,
-            snap_to_grid=snap_to_grid,
-            use_overviews=use_overviews,
-        )
-        t = result.transform
-        return result.data, [t.a, t.b, t.c, t.d, t.e, t.f]
-
-    return asyncio.run(_run())
+def merge_rastera(uris: list[str], *args, **kwargs) -> tuple[np.ndarray, list]:
+    return _run_rastera(uris, *args, **kwargs)
 
 
 def read_rasterio(
@@ -98,26 +99,13 @@ def read_rasterio(
     with rasterio.open(uri) as src:
         src_crs_epsg = src.crs.to_epsg()
 
-        # Transform bbox into the output CRS for grid construction
-        minx, miny, maxx, maxy = bbox
-        if bbox_crs and target_crs and bbox_crs != target_crs:
-            from pyproj import Transformer as ProjTransformer
-
-            t = ProjTransformer.from_crs(bbox_crs, target_crs, always_xy=True)
-            xs = [minx, maxx, minx, maxx]
-            ys = [miny, miny, maxy, maxy]
-            txs, tys = t.transform(xs, ys)
-            minx, maxx = min(txs), max(txs)
-            miny, maxy = min(tys), max(tys)
-        elif bbox_crs and not target_crs and bbox_crs != src_crs_epsg:
-            from pyproj import Transformer as ProjTransformer
-
-            t = ProjTransformer.from_crs(bbox_crs, src_crs_epsg, always_xy=True)
-            xs = [minx, maxx, minx, maxx]
-            ys = [miny, miny, maxy, maxy]
-            txs, tys = t.transform(xs, ys)
-            minx, maxx = min(txs), max(txs)
-            miny, maxy = min(tys), max(tys)
+        # Grid construction needs the bbox in the output CRS; without a
+        # target_crs that is the source's own.
+        dst = target_crs or src_crs_epsg
+        if bbox_crs and bbox_crs != dst:
+            minx, miny, maxx, maxy = _corner_hull(bbox, bbox_crs, dst)
+        else:
+            minx, miny, maxx, maxy = bbox
 
         if target_crs or target_resolution:
             vrt_kwargs = {
@@ -137,13 +125,13 @@ def read_rasterio(
             with WarpedVRT(src, **vrt_kwargs) as vrt:
                 data = vrt.read(resampling=Resampling.nearest)
                 t = vrt.transform
-                transform = [t.a, t.b, t.c, t.d, t.e, t.f]
+                transform = _affine_list(t)
         else:
             # Same CRS, same resolution — just read the bbox window
             win = from_bounds(minx, miny, maxx, maxy, transform=src.transform)
             data = src.read(window=win, resampling=Resampling.nearest)
             t = src.window_transform(win)
-            transform = [t.a, t.b, t.c, t.d, t.e, t.f]
+            transform = _affine_list(t)
 
     return data, transform
 
@@ -155,7 +143,6 @@ def merge_rasterio(
     target_crs: int | None,
     target_resolution: float | None,
 ) -> tuple[np.ndarray, list]:
-    """Merge using rasterio.merge.merge — matches the notebook pattern."""
     import os
 
     import rasterio
@@ -166,17 +153,10 @@ def merge_rasterio(
 
     out_crs = CRS.from_epsg(target_crs) if target_crs else None
 
-    # Transform bbox into the output CRS so merge() gets correct bounds
     merge_bounds = tuple(bbox)
     if out_crs and bbox_crs and target_crs != bbox_crs:
-        from pyproj import Transformer as ProjTransformer
-
-        t = ProjTransformer.from_crs(bbox_crs, target_crs, always_xy=True)
-        minx, miny, maxx, maxy = bbox
-        xs = [minx, maxx, minx, maxx]
-        ys = [miny, miny, maxy, maxy]
-        txs, tys = t.transform(xs, ys)
-        merge_bounds = (min(txs), min(tys), max(txs), max(tys))
+        assert target_crs is not None
+        merge_bounds = _corner_hull(bbox, bbox_crs, target_crs)
 
     datasets = [rasterio.open(u) for u in uris]
     vrts = []
@@ -207,8 +187,7 @@ def merge_rasterio(
         for ds in datasets:
             ds.close()
 
-    t = out_transform
-    return array, [t.a, t.b, t.c, t.d, t.e, t.f]
+    return array, _affine_list(out_transform)
 
 
 def main():
@@ -221,7 +200,9 @@ def main():
     parser.add_argument("--bbox-crs", required=True, type=int)
     parser.add_argument("--target-crs", type=int, default=None)
     parser.add_argument("--target-resolution", type=float, default=None)
-    parser.add_argument("--save-array", default=None, help="Path to save output .npy")
+    parser.add_argument(
+        "--save-array", default=None, help="Path to write the output GeoTIFF"
+    )
     parser.add_argument(
         "--no-snap-to-grid",
         action="store_true",
@@ -296,14 +277,14 @@ def main():
     print(json.dumps(result))
 
     if args.save_array:
-        import rasterio as _rio
-        from rasterio.crs import CRS as _CRS
-        from rasterio.transform import Affine as _Affine
+        import rasterio
+        from rasterio.crs import CRS
+        from rasterio.transform import Affine
 
-        out_crs = _CRS.from_epsg(args.target_crs or args.bbox_crs)
-        out_transform = _Affine(*transform)
+        out_crs = CRS.from_epsg(args.target_crs or args.bbox_crs)
+        out_transform = Affine(*transform)
         bands, height, width = data.shape
-        with _rio.open(
+        with rasterio.open(
             args.save_array,
             "w",
             driver="GTiff",
