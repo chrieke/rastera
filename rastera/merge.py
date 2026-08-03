@@ -52,7 +52,7 @@ async def merge(
     Args:
         bbox_crs: The bbox is transformed to the COGs' native CRS automatically.
         band_indices: 1-based.
-        fill_value: For pixels in *bbox* covered by no input (not always 0).
+        fill_value: For output-grid pixels covered by no input (not always 0).
         target_crs: Each COG is reprojected into this CRS before merging when
             it differs from the source. When ``None``, inferred from the
             inputs using *crs_method*.
@@ -62,16 +62,19 @@ async def merge(
         crs_method: How to choose the output CRS when *target_crs* is ``None``.
             ``"most_common"`` picks the CRS shared by the most inputs;
             ``"first"`` uses the CRS of the first input.
-        snap_to_grid: When True (default), and when all inputs already
-            share the target CRS and resolution, the output grid snaps to
-            the source pixel grid for an exact 1:1 copy
-            (no resampling); the bbox may shift by up to 1 pixel. When False,
-            or when any input differs in CRS/resolution, the output grid is
-            anchored at the requested ``(minx, maxy)`` with width/height
-            rounded to whole pixels (so the max edges can drift by <0.5 px)
-            and resampling selects source pixels according to ``resampling``,
-            matching rasterio/GDAL behaviour. Each input is always read on
-            its own pixel grid; this flag does not change that.
+        snap_to_grid: When True (default), the output grid is rounded
+            outward onto multiples of ``target_resolution`` (GDAL's
+            ``-tap``), on both merge paths. The output transform and shape
+            are then a pure function of the bbox and resolution — never of
+            source grid phase, tile count, or tile order — and each edge not
+            already on that grid grows by less than one pixel. Inputs
+            already on the grid at the target CRS and resolution are copied
+            1:1 (no resampling); anything else is resampled according to
+            ``resampling``. When False, the output grid is anchored at the
+            requested ``(minx, maxy)`` with width/height rounded to whole
+            pixels (so the max edges can drift by <0.5 px), matching
+            rasterio/GDAL merge behaviour. Each input is always read on its
+            own pixel grid; this flag does not change that.
         use_overviews: Trades accuracy for bandwidth; see
             :meth:`rastera.AsyncGeoTIFF.read` for what overview pixels cost.
         resampling: Used when reprojecting or changing resolution; see
@@ -119,7 +122,20 @@ async def merge(
         for cog in cogs[1:]
     )
     crs_matches_target = target_crs == base._crs_epsg
-    res_matches_target = math.isclose(target_resolution, base_gt.res[0], rel_tol=1e-6)
+    # Default isclose tolerance: the output grid's pixel scale is exactly
+    # target_resolution, so a looser match would let the block copy accumulate
+    # a whole pixel of paste drift over a large enough offset.
+    res_matches_target = math.isclose(target_resolution, base_gt.res[0])
+
+    # The native path is a straight block copy onto the snapped output grid,
+    # which sits on multiples of target_resolution — exact only when every
+    # source grid is on those multiples too (and north-up, since the output
+    # hardcodes a negative row scale). Anything else must be resampled.
+    srcs_on_res_grid = float(base_gt.transform.e) < 0 and all(
+        _is_on_res_grid(float(cog._geotiff.transform.c), target_resolution)
+        and _is_on_res_grid(float(cog._geotiff.transform.f), target_resolution)
+        for cog in cogs
+    )
 
     # Note: use_overviews is intentionally NOT included here.  The native
     # fast path is only reached when res_matches_target is True, meaning
@@ -131,6 +147,7 @@ async def merge(
         or not all_same_res
         or not crs_matches_target
         or not res_matches_target
+        or not srcs_on_res_grid
         or not snap_to_grid
     )
 
@@ -145,6 +162,7 @@ async def merge(
             target_crs=target_crs,
             target_resolution=target_resolution,
             mosaic_method=mosaic_method,
+            snap_to_grid=snap_to_grid,
             use_overviews=use_overviews,
             resampling=resampling,
         )
@@ -158,9 +176,8 @@ async def merge(
     assert native_crs is not None
     native_bbox = transform_bbox(bbox, bbox_crs, native_crs)
 
-    window_transform, win_width, win_height = _mosaic_grid_from_bbox(
-        base_transform=base_gt.transform,
-        bbox=native_bbox,
+    window_transform, win_width, win_height = _snapped_grid_for_bbox(
+        native_bbox, target_resolution
     )
 
     sub_bboxes: list[tuple[AsyncGeoTIFF, BBox]] = []
@@ -208,6 +225,7 @@ async def _merge_reprojected(
     target_crs: int,
     target_resolution: float,
     mosaic_method: Literal["first", "last"] = "first",
+    snap_to_grid: bool = True,
     use_overviews: bool = False,
     resampling: ResamplingMethod = "nearest",
 ) -> RasterArray:
@@ -218,7 +236,11 @@ async def _merge_reprojected(
     target_bbox = transform_bbox(bbox, bbox_crs, out_crs)
     res = target_resolution
 
-    out_transform, out_w, out_h = _grid_for_bbox(target_bbox, res)
+    out_transform, out_w, out_h = (
+        _snapped_grid_for_bbox(target_bbox, res)
+        if snap_to_grid
+        else _grid_for_bbox(target_bbox, res)
+    )
 
     # Find contributing COGs by intersecting bounds (in target CRS) with output
     # bbox.
@@ -381,10 +403,13 @@ def _output_subgrid(
     c0, r0 = _affine_apply(inv, sub_bbox.minx, sub_bbox.maxy)
     c1, r1 = _affine_apply(inv, sub_bbox.maxx, sub_bbox.miny)
 
-    col_min = max(0, math.floor(min(c0, c1)))
-    row_min = max(0, math.floor(min(r0, r1)))
-    col_max = min(out_w, math.ceil(max(c0, c1)))
-    row_max = min(out_h, math.ceil(max(r0, r1)))
+    # A bare ceil would buy a spurious row/column off ~transform's ULP error;
+    # with the output grid on resolution multiples, contributor bounds landing
+    # exactly on a grid line are the common case, not the exception.
+    col_min = max(0, math.floor(_denoise(min(c0, c1))))
+    row_min = max(0, math.floor(_denoise(min(r0, r1))))
+    col_max = min(out_w, math.ceil(_denoise(max(c0, c1))))
+    row_max = min(out_h, math.ceil(_denoise(max(r0, r1))))
 
     sub_w = col_max - col_min
     sub_h = row_max - row_min
@@ -403,38 +428,27 @@ def _output_subgrid(
     return sub_transform, sub_w, sub_h
 
 
-def _mosaic_grid_from_bbox(
-    *, base_transform: Affine, bbox: BBox
-) -> tuple[Affine, int, int]:
+def _snapped_grid_for_bbox(bbox: BBox, res: float) -> tuple[Affine, int, int]:
+    """Outward-rounded grid on multiples of *res* (what GDAL calls ``-tap``).
+
+    Depends only on *bbox* and *res*, so two merges over the same request
+    return the same grid regardless of which tiles contribute; each edge not
+    already on the grid grows outward by less than one pixel. Per-tile read
+    snapping (``window_from_bbox(snap_to_grid=True)``) decides which source
+    pixels a read returns, never this output grid — keep the two apart.
     """
-    Create a pixel-aligned mosaic grid for `bbox` on the `base_transform` grid.
+    # _denoise sees coordinate/res magnitudes here (~6e7 px for a UTM northing
+    # at sub-metre resolution), where the division error is ~1e-8 px — inside
+    # its 1e-6 tolerance with two orders of magnitude to spare.
+    col_min = math.floor(_denoise(bbox.minx / res))
+    col_max = math.ceil(_denoise(bbox.maxx / res))
+    row_min = math.floor(_denoise(bbox.miny / res))
+    row_max = math.ceil(_denoise(bbox.maxy / res))
 
-    Rounds outward, the same rule ``window_from_bbox(snap_to_grid=True)`` uses
-    for the reads that fill this grid — so the mosaic contains *bbox* instead
-    of stopping a pixel short of it. Unlike ``window_from_bbox`` this does NOT
-    clamp to any particular image size.
-    """
-    inv = ~base_transform
-
-    # top-left and bottom-right in pixel coords (may be outside any single image)
-    col_min_f, row_max_f = _affine_apply(inv, bbox.minx, bbox.maxy)
-    col_max_f, row_min_f = _affine_apply(inv, bbox.maxx, bbox.miny)
-
-    col_lo = _denoise(min(col_min_f, col_max_f))
-    col_hi = _denoise(max(col_min_f, col_max_f))
-    row_lo = _denoise(min(row_min_f, row_max_f))
-    row_hi = _denoise(max(row_min_f, row_max_f))
-
-    col_min = math.floor(col_lo)
-    row_min = math.floor(row_lo)
-
+    transform = Affine(res, 0, col_min * res, 0, -res, row_max * res)
     # max(1): a bbox thinner than a pixel still names one, and merge callers
     # rely on getting a grid rather than an exception for a degenerate strip.
-    width = max(1, math.ceil(col_hi) - col_min)
-    height = max(1, math.ceil(row_hi) - row_min)
-
-    transform = base_transform * Affine.translation(col_min, row_min)
-    return transform, width, height
+    return transform, max(1, col_max - col_min), max(1, row_max - row_min)
 
 
 def _validate_fill_value(fill_value: int | float, dtype: np.dtype[Any] | None) -> None:
@@ -548,6 +562,17 @@ def _require_compatible_merge_inputs(cogs: Sequence[AsyncGeoTIFF]) -> None:
                 "All GeoTIFFs must be aligned to the same pixel grid "
                 "(origins differ by whole pixels)"
             )
+
+
+def _is_on_res_grid(coord: float, res: float, tol: float = 1e-6) -> bool:
+    """Whether *coord* lies on a multiple of *res*, within *tol* pixels.
+
+    Compared via ``round`` rather than ``% 1``: an origin written as k·res
+    with float error from below arrives as a phase of almost exactly *res*,
+    which a modulo test would read as maximally misaligned.
+    """
+    q = coord / res
+    return abs(q - round(q)) < tol
 
 
 def _resolve_target_crs(
