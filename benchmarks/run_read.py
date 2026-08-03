@@ -36,7 +36,13 @@ SCENARIOS = [
         "bbox": BBOX,
         "bbox_crs": 32633,
         "target_resolution": 60.0,
-        "expect": {"max_pct_differ": 0, "max_rmse_pct": 0},
+        "expect": {
+            "shape_match": False,
+            "max_pct_differ": 100,
+            "max_rmse_pct": 2,
+            "note": "Grid snaps outward onto 60m multiples (bbox is off-grid at "
+            "60m): origin shifts vs rasterio's bbox-anchored grid.",
+        },
     },
     {
         "name": "Read: same CRS, downsampled to 60m via overviews (rastera)",
@@ -46,9 +52,11 @@ SCENARIOS = [
         "target_resolution": 60.0,
         "use_overviews": True,
         "expect": {
+            "shape_match": False,
             "max_pct_differ": 100,
             "max_rmse_pct": 2,
-            "note": "~97% differ: rastera reads 40m COG overview; rasterio reads full 10m and downsamples.",
+            "note": "Grid snaps outward onto 60m multiples; rastera reads the "
+            "40m COG overview while rasterio downsamples full 10m.",
         },
     },
     {
@@ -60,9 +68,11 @@ SCENARIOS = [
         "target_resolution": 0.001,
         "reproject_bbox": True,
         "expect": {
-            "max_pct_differ": 5,
-            "max_rmse_pct": 1,
-            "note": "~2% differ: coarse-grid warp (step=16) interpolates coords, shifting some pixels across NN boundaries.",
+            "shape_match": False,
+            "max_pct_differ": 100,
+            "max_rmse_pct": 2,
+            "note": "Grid snaps outward onto 0.001 deg multiples (reprojected "
+            "bbox is off-grid): sub-pixel origin shift moves NN picks.",
         },
     },
     {
@@ -75,9 +85,11 @@ SCENARIOS = [
         "reproject_bbox": True,
         "use_overviews": True,
         "expect": {
+            "shape_match": False,
             "max_pct_differ": 100,
             "max_rmse_pct": 5,
-            "note": "~97% differ: COG overview source + coarse-grid warp interpolation.",
+            "note": "Grid snaps outward onto 0.001 deg multiples + COG overview "
+            "source + coarse-grid warp interpolation.",
         },
     },
 ]

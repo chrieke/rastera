@@ -12,22 +12,23 @@ from rastera.geo import (
     BBox,
     WindowOutOfRangeError,
     bounds_from_transform,
+    snapped_grid_for_bbox,
     transform_bbox,
     window_from_bbox,
 )
 from rastera.merge import (
-    _mosaic_grid_from_bbox,
     _require_compatible_merge_inputs,
     _resolve_target_crs,
     merge,
 )
-from rastera.reader import AsyncGeoTIFF, _grid_for_bbox
+from rastera.reader import AsyncGeoTIFF
 from rastera.resampling import ResamplingMethod
 from tests.conftest import (
     make_mock_geotiff,
     make_raster_array,
     slicing_read,
     spy_read_native,
+    spy_read_to_grid,
 )
 
 # ── Helpers ──────────────────────────────────────────────────────────────
@@ -88,41 +89,63 @@ def _make_array(
     return make_raster_array(data, transform, geotiff)
 
 
-# ── _mosaic_grid_from_bbox ───────────────────────────────────────────────
+# ── snapped_grid_for_bbox ────────────────────────────────────────────────
 
 
-class TestMosaicGridFromBbox:
-    def test_aligned_bbox(self):
-        base_transform = Affine(10, 0, 0, 0, -10, 1000)
-        bbox = BBox(100, 500, 300, 800)
-        transform, w, h = _mosaic_grid_from_bbox(
-            base_transform=base_transform,
-            bbox=bbox,
-        )
-        assert w == 20
-        assert h == 30
+class TestSnappedGridForBbox:
+    def test_aligned_bbox_is_exact(self):
+        transform, w, h = snapped_grid_for_bbox(BBox(100, 500, 300, 800), 10.0)
+        assert (w, h) == (20, 30)
         bounds = bounds_from_transform(transform, w, h)
-        assert bounds.minx == 100.0
-        assert bounds.maxy == 800.0
+        assert (bounds.minx, bounds.miny, bounds.maxx, bounds.maxy) == (
+            100.0,
+            500.0,
+            300.0,
+            800.0,
+        )
 
     def test_subpixel_bbox_still_produces_grid(self):
-        base_transform = Affine(10, 0, 0, 0, -10, 1000)
         # A tiny bbox within a single pixel still produces a 1x1 grid
-        bbox = BBox(5, 5, 6, 6)
-        _, w, h = _mosaic_grid_from_bbox(base_transform=base_transform, bbox=bbox)
-        assert w >= 1
-        assert h >= 1
+        _, w, h = snapped_grid_for_bbox(BBox(5, 5, 6, 6), 10.0)
+        assert (w, h) == (1, 1)
 
     def test_offgrid_bbox_is_contained(self):
         """Rounding the span rather than the far edge stopped the mosaic a
         pixel short of a bbox its own reads had already covered."""
         bbox = BBox(0.8, 0.0, 11.3, 10.0)
-        transform, w, h = _mosaic_grid_from_bbox(
-            base_transform=Affine(1, 0, 0, 0, -1, 10), bbox=bbox
-        )
+        transform, w, h = snapped_grid_for_bbox(bbox, 1.0)
         bounds = bounds_from_transform(transform, w, h)
         assert bounds.minx <= bbox.minx and bounds.maxx >= bbox.maxx
         assert bounds.miny <= bbox.miny and bounds.maxy >= bbox.maxy
+        # Each off-grid edge grows outward by less than one pixel, no further.
+        assert (w, h) == (12, 10)
+
+    def test_negative_coordinates(self):
+        transform, w, h = snapped_grid_for_bbox(BBox(-25.0, -14.0, -4.0, -3.0), 10.0)
+        assert (w, h) == (3, 2)
+        bounds = bounds_from_transform(transform, w, h)
+        assert (bounds.minx, bounds.miny, bounds.maxx, bounds.maxy) == (
+            -30.0,
+            -20.0,
+            0.0,
+            0.0,
+        )
+
+    def test_denoises_utm_magnitude_edges(self):
+        """An edge exactly on the grid arrives with ULP error from the divide;
+        without _denoise, ceil would buy a spurious column."""
+        minx = 499999.9999999996
+        transform, w, h = snapped_grid_for_bbox(
+            BBox(minx, 0.0, minx + 20.0, 10.0), 10.0
+        )
+        assert (w, h) == (2, 1)
+        assert transform.c == 500000.0
+
+    def test_thin_bbox_on_grid_line_still_names_a_pixel(self):
+        _, w, h = snapped_grid_for_bbox(
+            BBox(9.9999999999, 0.0, 10.0000000001, 10.0), 1.0
+        )
+        assert (w, h) == (1, 10)
 
 
 # ── _require_compatible_merge_inputs ─────────────────────────────────────
@@ -621,7 +644,9 @@ class TestMergeReprojected:
 # ── merge: seam between adjacent tiles ─────────────────────────────────
 
 
-def _make_windowed_cog(origin_x: float, width: int, value: int):
+def _make_windowed_cog(
+    origin_x: float, width: int, value: int, *, origin_y: float = 15.0
+):
     """A COG whose ``_read_native`` honours the real window arithmetic.
 
     The other merge tests mock ``_read_native`` with a fixed array, which hides
@@ -633,7 +658,7 @@ def _make_windowed_cog(origin_x: float, width: int, value: int):
         scale=1.0,
         bands=1,
         origin_x=origin_x,
-        origin_y=15.0,
+        origin_y=origin_y,
         nodata=0,
     )
     gt = cog._geotiff
@@ -683,6 +708,137 @@ class TestMergeSeam:
         col = self.SEAM_COL + 1 if snap_to_grid else self.SEAM_COL
         assert data[0, :, col].tolist() == [1] * data.shape[1]
         assert data[0, :, col + 1].tolist() == [2] * data.shape[1]
+
+
+# ── merge: output grid is a pure function of the arguments ─────────────
+
+
+class TestMergeGridInvariance:
+    """The output transform and shape are a pure function of
+    (bbox, target_resolution, snap_to_grid) — never of source grid phase,
+    merge path, tile count, or tile order."""
+
+    # Off-grid on every edge at res 1.0.
+    BBOX = BBox(0.8, 0.3, 13.8, 10.3)
+    # Its edges rounded outward onto the resolution grid.
+    GRID = (Affine(1, 0, 0.0, 0, -1, 11.0), 14, 11)
+
+    @staticmethod
+    def _grid(result: RasterArray) -> tuple[Affine, int, int]:
+        return result.transform, result.width, result.height
+
+    async def _merge(self, cogs: list[Any], **kwargs: Any) -> RasterArray:
+        return await merge(
+            cogs,
+            bbox=self.BBOX,
+            bbox_crs=32632,
+            target_crs=32632,
+            target_resolution=1.0,
+            **kwargs,
+        )
+
+    @pytest.mark.parametrize("phase", [0.0, 0.25, 0.5])
+    async def test_grid_ignores_source_phase(self, phase: float):
+        left = _make_windowed_cog(
+            origin_x=-10.0 + phase, width=20, value=1, origin_y=15.0 + phase
+        )
+        right = _make_windowed_cog(
+            origin_x=6.0 + phase, width=20, value=2, origin_y=15.0 + phase
+        )
+        result = await self._merge([left, right])
+        assert self._grid(result) == self.GRID
+
+    async def test_native_and_warp_paths_agree(self):
+        aligned = _make_windowed_cog(origin_x=-10.0, width=30, value=1)
+        shifted = _make_windowed_cog(origin_x=-10.5, width=30, value=1, origin_y=15.5)
+        native = await self._merge([aligned])
+        warped = await self._merge([shifted])
+        assert self._grid(native) == self._grid(warped) == self.GRID
+
+    async def test_grid_ignores_tile_count_and_order(self):
+        a = _make_windowed_cog(origin_x=-10.0, width=20, value=1)
+        b = _make_windowed_cog(origin_x=6.0, width=20, value=2)
+        for cogs in ([a], [b], [a, b], [b, a]):
+            result = await self._merge(list(cogs))
+            assert self._grid(result) == self.GRID
+
+    async def test_snap_to_grid_false_stays_bbox_anchored(self):
+        cog = _make_windowed_cog(origin_x=-10.0, width=30, value=1)
+        result = await self._merge([cog], snap_to_grid=False)
+        assert (result.width, result.height) == (13, 10)
+        assert (result.transform.c, result.transform.f) == (
+            self.BBOX.minx,
+            self.BBOX.maxy,
+        )
+
+    async def test_aligned_bbox_is_exact_and_copied_natively(self):
+        cog = _make_windowed_cog(origin_x=-10.0, width=30, value=1)
+        native_calls = spy_read_native(cog)
+        to_grid_calls = spy_read_to_grid(cog)
+        result = await merge(
+            [cog],
+            bbox=BBox(1.0, 2.0, 12.0, 9.0),
+            bbox_crs=32632,
+            target_crs=32632,
+            target_resolution=1.0,
+        )
+        assert self._grid(result) == (Affine(1, 0, 1.0, 0, -1, 9.0), 11, 7)
+        assert native_calls and not to_grid_calls
+
+    async def test_offgrid_source_is_resampled_to_the_snapped_grid(self):
+        cog = _make_windowed_cog(origin_x=-10.5, width=30, value=1, origin_y=15.5)
+        to_grid_calls = spy_read_to_grid(cog)
+        result = await self._merge([cog])
+        assert self._grid(result) == self.GRID
+        assert to_grid_calls
+
+    async def test_mixed_phase_inputs_merge_in_either_order(self):
+        aligned = _make_windowed_cog(origin_x=-10.0, width=20, value=1)
+        shifted = _make_windowed_cog(origin_x=6.5, width=20, value=2, origin_y=15.5)
+        first = await self._merge([aligned, shifted])
+        second = await self._merge([shifted, aligned])
+        assert self._grid(first) == self._grid(second) == self.GRID
+
+    async def test_read_and_merge_agree_on_the_grid(self):
+        gt = make_mock_geotiff(
+            width=30, height=20, scale=1.0, count=1, origin_x=-10.0, origin_y=15.0
+        )
+        gt.read = slicing_read(gt, np.ones((1, 20, 30), np.uint16))
+        via_read = await AsyncGeoTIFF("s3://b/k.tif", gt).read(
+            bbox=self.BBOX, bbox_crs=32632, target_resolution=1.0
+        )
+        via_merge = await self._merge(
+            [_make_windowed_cog(origin_x=-10.0, width=30, value=1)]
+        )
+        assert self._grid(via_read) == self._grid(via_merge) == self.GRID
+
+    async def test_non_square_source_is_resampled(self):
+        cog = _make_windowed_cog(origin_x=-10.0, width=30, value=1)
+        gt = cog._geotiff
+        gt.transform = Affine(1.0, 0, -10.0, 0, -2.0, 15.0)
+        gt.res = (1.0, 2.0)
+        gt.bounds = (-10.0, 15.0 - 2.0 * gt.height, -10.0 + gt.width, 15.0)
+        to_grid_calls = spy_read_to_grid(cog)
+        result = await self._merge([cog])
+        assert self._grid(result) == self.GRID
+        assert to_grid_calls
+
+    async def test_uncovered_margin_gets_fill_value(self):
+        cog = _make_windowed_cog(origin_x=0.0, width=10, value=7)
+        result = await merge(
+            [cog],
+            bbox=BBox(0.3, 0.0, 10.3, 10.0),
+            bbox_crs=32632,
+            target_crs=32632,
+            target_resolution=1.0,
+            fill_value=9,
+        )
+        data: np.ndarray[Any, Any] = result.data  # type: ignore[reportUnknownMemberType]
+        assert data.shape == (1, 10, 11)
+        # The tile ends at x=10; the snapped grid's last column (x 10..11) is
+        # covered by no input and must carry the fill.
+        assert (data[0, :, 10] == 9).all()
+        assert (data[0, :, :10] == 7).all()
 
 
 # ── _resolve_target_crs ────────────────────────────────────────────────
@@ -951,7 +1107,7 @@ class TestMergeSharesTheWarpSeam:
         calls = spy_read_native(cog)
         res = 0.0002
 
-        await merge(
+        result = await merge(
             [cog],
             bbox=_AOI,
             bbox_crs=4326,
@@ -962,10 +1118,12 @@ class TestMergeSharesTheWarpSeam:
 
         assert len(calls) == 1
         got = BBox(*calls[0]["bbox"])
-        # Reference frame: the output grid's own extent, unpadded.
-        out_transform, out_w, out_h = _grid_for_bbox(_AOI, res)
+        # Reference frame: the result's own extent, unpadded, so the assertion
+        # measures the halo alone rather than halo plus grid convention.
         unpadded = transform_bbox(
-            bounds_from_transform(out_transform, out_w, out_h), 4326, 32633
+            bounds_from_transform(result.transform, result.width, result.height),
+            4326,
+            32633,
         )
         pad_x = unpadded.minx - got.minx
         pad_y = unpadded.miny - got.miny

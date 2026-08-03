@@ -6,6 +6,7 @@ from async_geotiff import RasterArray, Window
 from async_tiff.store import S3Store  # type: ignore[import-untyped]
 
 from .config import set_concurrency, set_warp_strategy
+from .geo import BBox, snapped_grid_for_bbox
 from .merge import merge
 from .reader import AsyncGeoTIFF, clear_cache, open, set_cache_size
 
@@ -16,6 +17,7 @@ if TYPE_CHECKING:
     from .index import open_from_index as open_from_index
 
 __all__ = [
+    "BBox",
     "RasterArray",
     "AsyncGeoTIFF",
     "S3Store",
@@ -26,6 +28,7 @@ __all__ = [
     "set_warp_strategy",
     "open",
     "merge",
+    "snapped_grid_for_bbox",
 ]
 
 _INDEX_EXPORTS = ("build_index", "open_from_index")

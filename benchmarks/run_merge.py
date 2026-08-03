@@ -44,9 +44,12 @@ SCENARIOS = [
         "target_crs": 32633,
         "target_resolution": 60.0,
         "expect": {
+            "shape_match": False,
             "max_pct_differ": 100,
             "max_rmse_pct": 2,
-            "note": "Snapping + 6x downsample: snapped origin + rasterio ratio drift (~6.005 vs 6.0).",
+            "note": "Grid snaps outward onto 60m multiples (bbox is off-grid at "
+            "60m, so +1-2 px per axis vs rasterio) + rasterio ratio drift "
+            "(~6.005 vs 6.0).",
         },
     },
     {
@@ -58,9 +61,11 @@ SCENARIOS = [
         "target_resolution": 60.0,
         "use_overviews": True,
         "expect": {
+            "shape_match": False,
             "max_pct_differ": 100,
             "max_rmse_pct": 2,
-            "note": "Snapping + 6x downsample + overview source: snapped origin + rasterio ratio drift.",
+            "note": "Grid snaps outward onto 60m multiples + overview source + "
+            "rasterio ratio drift.",
         },
     },
     {
@@ -73,9 +78,11 @@ SCENARIOS = [
         "target_crs": 32633,
         "target_resolution": 10.0,
         "expect": {
+            "shape_match": False,
             "max_pct_differ": 100,
             "max_rmse_pct": 2,
-            "note": "Snapping + cross-CRS warp: different warp math shifts most pixels.",
+            "note": "Grid snaps outward onto 10m multiples (transformed bbox is "
+            "off-grid) + cross-CRS warp: different warp math shifts most pixels.",
         },
     },
     {

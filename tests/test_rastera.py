@@ -10,11 +10,10 @@ from affine import Affine
 from async_geotiff import RasterArray, Window
 
 import rastera
-from rastera.geo import BBox
+from rastera.geo import BBox, snapped_grid_for_bbox
 from rastera.reader import (
     AsyncGeoTIFF,
     _geotiff_cache,
-    _grid_for_bbox,
     clear_cache,
     set_cache_size,
 )
@@ -24,6 +23,7 @@ from tests.conftest import (
     make_raster_array,
     slicing_read,
     spy_read_native,
+    spy_read_to_grid,
 )
 
 # ── Helpers ──────────────────────────────────────────────────────────────
@@ -318,10 +318,10 @@ class TestRead:
         with pytest.raises(ValueError, match="1-based"):
             await obj.read(band_indices=[0])
 
-    async def test_window_resample_matches_equivalent_bbox(self):
+    async def test_window_resample_reads_past_the_window(self):
         """The output grid is ceil-sized, so reading only the window left the
         trailing row/column with nothing behind it — nodata, even mid-image
-        where the source has plenty. The same region as a bbox is the oracle."""
+        where the source has plenty."""
         gt = make_mock_geotiff(
             width=20, height=20, scale=1.0, count=1, tile_width=20, nodata=0
         )
@@ -332,12 +332,35 @@ class TestRead:
         window = Window(col_off=5, row_off=5, width=10, height=10)
         arr = await obj.read(window=window, target_resolution=3.0)
         assert not np.any(np.asarray(arr.data) == 0)  # type: ignore[reportUnknownMemberType]
+        # A window is a pixel-space request: its extent anchors the output.
+        assert arr.transform.c == 5.0
+
+    async def test_window_resample_matches_equivalent_bbox(self):
+        """Window and bbox reads of the same region agree when the window's
+        extent lies on the target-resolution lattice (row_off ≡ 20 mod 3
+        here); a bbox read snaps onto that lattice, a window read stays
+        anchored on the window's own extent."""
+        gt = make_mock_geotiff(
+            width=20, height=20, scale=1.0, count=1, tile_width=20, nodata=0
+        )
+        full = (np.arange(400, dtype=np.uint16) + 1).reshape(1, 20, 20)
+        gt.read = slicing_read(gt, full)
+        obj = AsyncGeoTIFF("s3://b/k.tif", gt)
+
+        window = Window(col_off=6, row_off=2, width=9, height=9)
+        arr = await obj.read(window=window, target_resolution=3.0)
 
         equivalent = await obj.read(
-            bbox=(5.0, 5.0, 15.0, 15.0), bbox_crs=32632, target_resolution=3.0
+            bbox=(6.0, 9.0, 15.0, 18.0), bbox_crs=32632, target_resolution=3.0
         )
         np.testing.assert_array_equal(arr.data, equivalent.data)  # type: ignore[reportUnknownMemberType]
         assert arr.bounds == equivalent.bounds
+
+        offgrid = await obj.read(
+            bbox=(5.0, 5.0, 15.0, 15.0), bbox_crs=32632, target_resolution=3.0
+        )
+        assert offgrid.transform == Affine(3, 0, 3.0, 0, -3, 15.0)
+        assert (offgrid.width, offgrid.height) == (4, 4)
 
     async def test_window_resample_with_overview_reads_right_region(self):
         """*window* is in full-resolution pixels; it used to be handed to the
@@ -389,7 +412,7 @@ class TestRead:
         got = await obj.read(
             bbox=bbox, bbox_crs=32632, target_resolution=10.0, resampling=method
         )
-        out_transform, out_w, out_h = _grid_for_bbox(bbox, 10.0, use_ceil=True)
+        out_transform, out_w, out_h = snapped_grid_for_bbox(bbox, 10.0)
         want = resample(
             full,
             src_transform=src_transform,
@@ -434,6 +457,88 @@ class TestRead:
         arr = await obj.read(bbox=(0, 160, 80, 320), bbox_crs=32632, snap_to_grid=False)
         assert arr.transform.a == 10.0
         assert arr.transform.e == -20.0
+
+
+# ── read: output grid is a pure function of the arguments ───────────────
+
+
+class TestReadGridInvariance:
+    """With bbox + explicit target_resolution, the output grid matches
+    snapped_grid_for_bbox regardless of source grid phase or path."""
+
+    # Off-grid on every edge at res 1.0, and its edges rounded outward.
+    BBOX = (0.8, 0.3, 13.8, 10.3)
+    GRID = (Affine(1, 0, 0.0, 0, -1, 11.0), 14, 11)
+
+    @staticmethod
+    def _obj(origin_x: float = 0.0, origin_y: float = 20.0) -> AsyncGeoTIFF:
+        gt = make_mock_geotiff(
+            width=20,
+            height=20,
+            scale=1.0,
+            count=1,
+            tile_width=20,
+            origin_x=origin_x,
+            origin_y=origin_y,
+        )
+        full = (np.arange(400, dtype=np.uint16) + 1).reshape(1, 20, 20)
+        gt.read = slicing_read(gt, full)
+        return AsyncGeoTIFF("s3://b/k.tif", gt)
+
+    @staticmethod
+    def _grid(result: RasterArray) -> tuple[Affine, int, int]:
+        return result.transform, result.width, result.height
+
+    @pytest.mark.parametrize("phase", [0.0, 0.25, 0.5])
+    async def test_grid_ignores_source_phase(self, phase: float):
+        obj = self._obj(origin_x=phase, origin_y=20.0 + phase)
+        result = await obj.read(bbox=self.BBOX, bbox_crs=32632, target_resolution=1.0)
+        assert self._grid(result) == self.GRID
+
+    async def test_aligned_bbox_is_exact_and_copied_natively(self):
+        obj = self._obj()
+        calls = spy_read_to_grid(obj)
+        result = await obj.read(
+            bbox=(1.0, 2.0, 12.0, 9.0), bbox_crs=32632, target_resolution=1.0
+        )
+        assert self._grid(result) == (Affine(1, 0, 1.0, 0, -1, 9.0), 11, 7)
+        assert not calls
+
+    async def test_native_transform_is_stamped_onto_the_lattice(self):
+        # Origin 1e-7 off the lattice: inside the gate's tolerance, so the
+        # window copy runs — but the promised transform is the exact lattice.
+        obj = self._obj(origin_x=1e-7, origin_y=20.0 + 1e-7)
+        result = await obj.read(
+            bbox=(1.0, 2.0, 12.0, 9.0), bbox_crs=32632, target_resolution=1.0
+        )
+        assert result.transform == Affine(1, 0, 1.0, 0, -1, 9.0)
+
+    async def test_offgrid_source_is_resampled_to_the_lattice(self):
+        obj = self._obj(origin_x=0.5, origin_y=20.5)
+        calls = spy_read_to_grid(obj)
+        result = await obj.read(bbox=self.BBOX, bbox_crs=32632, target_resolution=1.0)
+        assert self._grid(result) == self.GRID
+        assert calls
+
+    async def test_non_square_source_is_resampled_to_the_lattice(self):
+        gt = make_mock_geotiff(width=20, height=20, scale=1.0, count=1, tile_width=20)
+        gt.transform = Affine(1.0, 0, 0.0, 0, -2.0, 40.0)
+        gt.res = (1.0, 2.0)
+        gt.bounds = (0.0, 0.0, 20.0, 40.0)
+        gt.read = slicing_read(gt, np.ones((1, 20, 20), np.uint16))
+        obj = AsyncGeoTIFF("s3://b/k.tif", gt)
+        calls = spy_read_to_grid(obj)
+        result = await obj.read(bbox=self.BBOX, bbox_crs=32632, target_resolution=1.0)
+        assert self._grid(result) == self.GRID
+        assert calls
+
+    async def test_bare_bbox_read_keeps_the_source_window(self):
+        # No target_resolution names no lattice: the read stays a 1:1 copy
+        # on the source grid, phase and all (clipped at the tile's bottom
+        # edge, which sits 0.2 above the bbox's miny).
+        obj = self._obj(origin_x=0.5, origin_y=20.5)
+        result = await obj.read(bbox=self.BBOX, bbox_crs=32632)
+        assert self._grid(result) == (Affine(1, 0, 0.5, 0, -1, 10.5), 14, 10)
 
 
 # ── The resampling seam's contract ──────────────────────────────────────
