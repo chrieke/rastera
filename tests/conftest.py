@@ -135,3 +135,20 @@ def spy_read_native(obj: Any) -> list[dict[str, Any]]:
 
     obj._read_native = _wrapped
     return calls
+
+
+def spy_read_to_grid(obj: Any) -> list[dict[str, Any]]:
+    """Record every ``_read_to_grid`` call, then delegate.
+
+    Which path ran is otherwise invisible from the output — the whole point
+    of the snapped grid is that both paths return the same one.
+    """
+    calls: list[dict[str, Any]] = []
+    real = obj._read_to_grid
+
+    async def _wrapped(**kwargs: Any) -> Any:
+        calls.append(kwargs)
+        return await real(**kwargs)
+
+    obj._read_to_grid = _wrapped
+    return calls

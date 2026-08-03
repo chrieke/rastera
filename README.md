@@ -64,6 +64,10 @@ raster_array = await rastera.merge(
     snap_to_grid=True,
     use_overviews=False,
 )
+
+# The exact grid read/merge return for snap_to_grid=True, without any I/O —
+# use it to pre-size buffers, key caches, or align a bbox to the grid.
+transform, width, height = rastera.snapped_grid_for_bbox(bbox_shared, 10)
 ```
 
 ### COG header cache via geoparquet index

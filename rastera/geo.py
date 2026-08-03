@@ -135,6 +135,34 @@ def bounds_from_transform(transform: Affine, width: int, height: int) -> BBox:
     return BBox(minx=min(xs), miny=min(ys), maxx=max(xs), maxy=max(ys))
 
 
+def snapped_grid_for_bbox(
+    bbox: BBox | tuple[float, float, float, float], res: float
+) -> tuple[Affine, int, int]:
+    """Outward-rounded grid on multiples of *res* (what GDAL calls ``-tap``).
+
+    Returns ``(transform, width, height)`` — exactly the grid
+    :func:`rastera.merge` and :meth:`rastera.AsyncGeoTIFF.read` return for
+    *bbox* at ``target_resolution=res`` with ``snap_to_grid=True`` (reads clip
+    it to the dataset extent). Depends only on the arguments, so callers can
+    size buffers or key caches on it; each edge not already on the grid grows
+    outward by less than one pixel.
+    """
+    bbox = ensure_bbox(bbox)
+    validate_resolution(res)
+    # _denoise sees coordinate/res magnitudes here (~6e7 px for a UTM northing
+    # at sub-metre resolution), where the division error is ~1e-8 px — inside
+    # its 1e-6 tolerance with two orders of magnitude to spare.
+    col_min = math.floor(_denoise(bbox.minx / res))
+    col_max = math.ceil(_denoise(bbox.maxx / res))
+    row_min = math.floor(_denoise(bbox.miny / res))
+    row_max = math.ceil(_denoise(bbox.maxy / res))
+
+    transform = Affine(res, 0, col_min * res, 0, -res, row_max * res)
+    # max(1): a bbox thinner than a pixel still names one, and merge callers
+    # rely on getting a grid rather than an exception for a degenerate strip.
+    return transform, max(1, col_max - col_min), max(1, row_max - row_min)
+
+
 class WindowOutOfRangeError(ValueError):
     """A bbox rounds to a zero-sized pixel window."""
 
@@ -309,6 +337,17 @@ def _denoise(pixel_coord: float) -> float:
     """
     nearest = round(pixel_coord)
     return float(nearest) if abs(pixel_coord - nearest) < _DENOISE_TOL else pixel_coord
+
+
+def _is_on_res_grid(coord: float, res: float, tol: float = 1e-6) -> bool:
+    """Whether *coord* lies on a multiple of *res*, within *tol* pixels.
+
+    Compared via ``round`` rather than ``% 1``: an origin written as k·res
+    with float error from below arrives as a phase of almost exactly *res*,
+    which a modulo test would read as maximally misaligned.
+    """
+    q = coord / res
+    return abs(q - round(q)) < tol
 
 
 def _normalize_crs(crs: int | CRS) -> int:

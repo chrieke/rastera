@@ -15,10 +15,12 @@ from pyproj import CRS, Transformer
 
 from .geo import (
     BBox,
+    _is_on_res_grid,
     _normalize_crs,
     bounds_from_transform,
     ensure_bbox,
     normalize_band_indices,
+    snapped_grid_for_bbox,
     transform_bbox,
     validate_resolution,
     window_from_bbox,
@@ -189,14 +191,21 @@ class AsyncGeoTIFF:
                 else the dataset CRS.
             window: Combines with *target_resolution* but not with *target_crs*.
             band_indices: 1-based.
-            snap_to_grid: When True (default), pixels are copied 1:1 from
-                the source grid and the extent grows outward to whole
-                pixels, so the result contains ``bbox`` and can exceed it
-                by up to 1 pixel per edge. When False, the transform is
-                anchored at ``bbox`` and the extent matches it to within
-                half a pixel — ``rasterio.read(window=from_bounds(...))``
-                behaviour. Ignored once ``target_crs`` or
-                ``target_resolution`` forces resampling.
+            snap_to_grid: When True (default) and *target_resolution* is
+                given with a bbox, the output grid is rounded outward onto
+                multiples of ``target_resolution`` — see
+                :func:`rastera.snapped_grid_for_bbox`. Transform and shape
+                are then a pure function of bbox and resolution; sources
+                already on that grid are copied 1:1 (clipped to the dataset
+                extent), anything else is resampled onto it, shifting
+                values by up to half a pixel. Without *target_resolution*
+                the window snaps outward on the source grid instead — a 1:1
+                copy of the stored pixels. When False, the transform is
+                anchored at ``bbox``. A native read then matches its extent
+                to within half a pixel —
+                ``rasterio.read(window=from_bounds(...))`` behaviour; a
+                resampled one is ceil-sized, so the max edges can overhang
+                ``bbox`` by up to a pixel.
             use_overviews: When True, reads from pre-computed COG overview
                 levels to save bandwidth. Overview pixels are resampled
                 aggregates, not original measurements — expect reduced
@@ -235,12 +244,29 @@ class AsyncGeoTIFF:
 
         needs_reproject = target_crs is not None and target_crs != self._crs_epsg
         needs_resample = target_resolution is not None and not math.isclose(
-            target_resolution, gt.res[0], rel_tol=1e-6
+            target_resolution, gt.res[0]
         )
+        # bbox + explicit resolution names an output lattice; only then does
+        # snap_to_grid mean "snap the output onto resolution multiples".
+        snap = snap_to_grid and bbox is not None and target_resolution is not None
 
         # Native fast path: no reprojection or resampling needed, so read
         # directly from the source without an extra copy through resample().
         use_native = not needs_reproject and not needs_resample
+        if use_native and snap:
+            # A 1:1 window copy lands on the lattice only if the source grid
+            # is on it: origin on multiples of the resolution, unrotated,
+            # north-up and square (needs_resample checks the x axis only;
+            # a negative -e can never isclose a positive resolution).
+            assert target_resolution is not None
+            t = gt.transform
+            use_native = (
+                _is_on_res_grid(float(t.c), target_resolution)
+                and _is_on_res_grid(float(t.f), target_resolution)
+                and float(t.b) == 0
+                and float(t.d) == 0
+                and math.isclose(target_resolution, -float(t.e))
+            )
 
         if bbox is not None and use_native:
             if bbox_crs != self._crs_epsg:
@@ -252,12 +278,30 @@ class AsyncGeoTIFF:
             bbox = ensure_bbox(bbox)
 
         if use_native:
-            return await self._read_native(
+            result = await self._read_native(
                 bbox=bbox,
                 window=window,
                 band_indices=band_indices,
                 snap_to_grid=snap_to_grid,
             )
+            if snap:
+                # Stamp the promised lattice: the file origin may carry float
+                # noise the gate tolerates, and int*res is the exact
+                # arithmetic snapped_grid_for_bbox uses.
+                assert target_resolution is not None
+                res, t = target_resolution, result.transform
+                result = dc_replace(
+                    result,
+                    transform=Affine(
+                        res,
+                        0,
+                        round(t.c / res) * res,
+                        0,
+                        -res,
+                        round(t.f / res) * res,
+                    ),
+                )
+            return result
 
         # Window + resample (window + reproject is rejected above)
         if window is not None:
@@ -278,6 +322,7 @@ class AsyncGeoTIFF:
             target_resolution=target_resolution,
             needs_reproject=needs_reproject,
             needs_resample=needs_resample,
+            snap=snap,
             use_overviews=use_overviews,
             resampling=resampling,
         )
@@ -326,6 +371,7 @@ class AsyncGeoTIFF:
         target_resolution: float | None,
         needs_reproject: bool,
         needs_resample: bool,
+        snap: bool,
         use_overviews: bool,
         resampling: ResamplingMethod,
     ) -> RasterArray:
@@ -360,7 +406,11 @@ class AsyncGeoTIFF:
         else:
             res = gt.res[0]
 
-        out_transform, out_w, out_h = _grid_for_bbox(target_bbox, res, use_ceil=True)
+        out_transform, out_w, out_h = (
+            snapped_grid_for_bbox(target_bbox, res)
+            if snap
+            else _grid_for_bbox(target_bbox, res, use_ceil=True)
+        )
         return await self._read_to_grid(
             dst_transform=out_transform,
             dst_width=out_w,
