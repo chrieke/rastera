@@ -521,11 +521,12 @@ class TestReadGridInvariance:
         assert calls
 
     async def test_non_square_source_is_resampled_to_the_lattice(self):
-        obj = self._obj()
-        gt = obj._geotiff
+        gt = make_mock_geotiff(width=20, height=20, scale=1.0, count=1, tile_width=20)
         gt.transform = Affine(1.0, 0, 0.0, 0, -2.0, 40.0)
         gt.res = (1.0, 2.0)
         gt.bounds = (0.0, 0.0, 20.0, 40.0)
+        gt.read = slicing_read(gt, np.ones((1, 20, 20), np.uint16))
+        obj = AsyncGeoTIFF("s3://b/k.tif", gt)
         calls = spy_read_to_grid(obj)
         result = await obj.read(bbox=self.BBOX, bbox_crs=32632, target_resolution=1.0)
         assert self._grid(result) == self.GRID
