@@ -167,6 +167,39 @@ async def _fetch_descriptor_bytes(uri: str, **store_kwargs: Any) -> bytes:
     return bytes(await result.bytes_async())
 
 
+def _check_source_uri(source_uri: str, descriptor_uri: str) -> None:
+    """Raise unless *descriptor_uri* may reference *source_uri*.
+
+    A descriptor fetched from a store may only reference that same store. Both
+    readers forward one ``store`` / ``store_kwargs`` to every source they open
+    (see ``_open_vrt_checked``), so a reference elsewhere was never supported:
+    it would be fetched with the descriptor's region and credentials rather
+    than its own. Checking it here turns that into a clear error instead of a
+    misdirected request, and keeps the set of objects an ``open()`` touches to
+    the store the caller named rather than one a document picked. Real
+    deliveries stay well inside: Airbus VRTs and DIMAPs name tiles relative to
+    the descriptor or absolutely within the same bucket. It composes — a
+    same-store source is itself checked here — so nothing reachable from a
+    remote descriptor leaves its store.
+
+    A *local* descriptor is unconstrained: its path came from the caller rather
+    than from a document, and confining it would reject a local VRT over remote
+    sources (``gdalbuildvrt out.vrt /vsis3/bucket/*.tif``). A descriptor whose
+    contents you did not produce is better read from object storage, where this
+    applies.
+    """
+    descriptor = _parse_uri(descriptor_uri)
+    if descriptor.local_path is not None:
+        return
+    if _parse_uri(source_uri).root != descriptor.root:
+        raise ValueError(
+            f"Descriptor {descriptor_uri!r} references source {source_uri!r}, "
+            f"outside its own store. rastera opens every source with the "
+            f"descriptor's own store settings, so a reference beyond that store "
+            f"is not supported. Open the source directly if you meant to read it."
+        )
+
+
 def _join_relative_uri(base_uri: str, relative: str) -> str:
     """Resolve *relative* against *base_uri*'s parent directory. Local
     paths are joined via pathlib; remote URIs via posix path normalization.

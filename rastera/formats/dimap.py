@@ -25,7 +25,7 @@ from pyproj import CRS
 from .. import config
 from ..geo import BBox, ensure_bbox, window_from_bbox
 from ..reader import AsyncGeoTIFF, MetaOverrides, _make_output_array
-from ..store import _fetch_descriptor_bytes, _join_relative_uri
+from ..store import _check_source_uri, _fetch_descriptor_bytes, _join_relative_uri
 
 
 @dataclass(frozen=True, slots=True)
@@ -760,5 +760,8 @@ def _resolve_tile_uri(href: str, dimap_uri: str) -> str:
     pass-through in case a delivery ever uses them.
     """
     if "://" in href or href.startswith("/"):
-        return href
-    return _join_relative_uri(dimap_uri, href)
+        tile_uri = href
+    else:
+        tile_uri = _join_relative_uri(dimap_uri, href)
+    _check_source_uri(tile_uri, dimap_uri)
+    return tile_uri

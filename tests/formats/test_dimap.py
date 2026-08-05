@@ -1031,9 +1031,16 @@ class TestResolveTileURI:
 
     def test_absolute_uri_href_passthrough(self):
         assert (
-            _resolve_tile_uri("s3://other/tile.tif", "s3://bucket/DIM_PNEO.XML")
-            == "s3://other/tile.tif"
+            _resolve_tile_uri("s3://bucket/sub/tile.tif", "s3://bucket/DIM_PNEO.XML")
+            == "s3://bucket/sub/tile.tif"
         )
+
+    def test_href_in_another_bucket_rejected(self):
+        """A DIMAP names tiles relative to itself, so an href in another bucket
+        is not a delivery shape — and the tile would be opened with this
+        descriptor's store settings, not its own."""
+        with pytest.raises(ValueError, match="outside its own store"):
+            _resolve_tile_uri("s3://other/tile.tif", "s3://bucket/DIM_PNEO.XML")
 
     def test_absolute_path_href_passthrough(self):
         assert (

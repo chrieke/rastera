@@ -44,7 +44,7 @@ from .reader import (
     _make_output_array,
 )
 from .resampling import ResamplingMethod
-from .store import _fetch_descriptor_bytes, _join_relative_uri
+from .store import _check_source_uri, _fetch_descriptor_bytes, _join_relative_uri
 
 
 @dataclass(frozen=True, slots=True)
@@ -1027,7 +1027,9 @@ def _source_filename_uri(parent: ET.Element, vrt_uri: str, missing_msg: str) -> 
     if el is None or not el.text:
         raise ValueError(missing_msg)
     relative = el.attrib.get("relativeToVRT", "0") == "1"
-    return _resolve_source_uri(el.text, relative, vrt_uri)
+    source_uri = _resolve_source_uri(el.text, relative, vrt_uri)
+    _check_source_uri(source_uri, vrt_uri)
+    return source_uri
 
 
 async def _open_vrt_source(
