@@ -151,11 +151,18 @@ class TestParseProcessedVRT:
 
     def test_absolute_input_uri_passes_through(self):
         spec = _parse_vrt_xml(
-            _processed_vrt(input_path="/vsis3/other/tile.xml", relative=False),
+            _processed_vrt(input_path="/vsis3/b/sub/tile.xml", relative=False),
             "s3://b/x.vrt",
         )
         assert isinstance(spec, _VRTProcessedSpec)
-        assert spec.input_uri == "s3://other/tile.xml"
+        assert spec.input_uri == "s3://b/sub/tile.xml"
+
+    def test_input_uri_in_another_bucket_rejected(self):
+        """``<Input>`` is a source like any other, so the same-store rule
+        applies to it too."""
+        xml = _processed_vrt(input_path="/vsis3/other/tile.xml", relative=False)
+        with pytest.raises(ValueError, match="outside its own store"):
+            _parse_vrt_xml(xml, "s3://b/x.vrt")
 
     def test_per_band_luts_are_distinct(self):
         """Each ``lut_N`` is compiled into its own row, in band order."""

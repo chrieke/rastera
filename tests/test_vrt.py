@@ -437,7 +437,8 @@ class TestDeclaredNodata:
             ),
             patch.object(AsyncGeoTIFF, "open", side_effect=fake_open),
         ):
-            ds = await _open_vrt("s3://bucket/v.vrt")
+            # Bucket "b": a descriptor may not reach out of its own store.
+            ds = await _open_vrt("s3://b/v.vrt")
         assert isinstance(ds, _VRTDataset)
         return ds
 
@@ -530,7 +531,7 @@ class TestDeclaredNodata:
             b'<VRTRasterBand dataType="Byte" band="4">',
             b'<VRTRasterBand dataType="Byte" band="4"><NoDataValue>0</NoDataValue>',
         )
-        bands = _parse_vrt_xml(xml, "s3://b/x.vrt")
+        bands = _parse_vrt_xml(xml, "s3://bucket/x.vrt")
         assert isinstance(bands, list)
         assert _declared_nodata(bands) == 0
 
@@ -639,7 +640,7 @@ class TestDeclaredNodata:
         )
         # Rejected at parse time, before any source header is fetched.
         with pytest.raises(NotImplementedError, match="differing <NoDataValue>"):
-            _parse_vrt_xml(xml, "s3://b/x.vrt")
+            _parse_vrt_xml(xml, "s3://bucket/x.vrt")
 
     def test_all_nan_nodata_collapses_to_nan(self):
         """NaN != NaN, so the disagreement check must special-case it."""
@@ -660,7 +661,7 @@ class TestDeclaredNodata:
         xml = RGBNIR_VRT.replace(
             b"<SimpleSource>", b"<NoDataValue>nan</NoDataValue><SimpleSource>"
         )
-        bands = _parse_vrt_xml(xml, "s3://b/x.vrt")
+        bands = _parse_vrt_xml(xml, "s3://bucket/x.vrt")
         assert isinstance(bands, list) and len(bands) == 4
         assert len({id(b.nodata) for b in bands}) == 4  # four distinct NaN objects
         declared = _declared_nodata(bands)
@@ -675,7 +676,7 @@ class TestDeclaredNodata:
             b'<VRTRasterBand dataType="Byte" band="4"><NoDataValue>0</NoDataValue>',
         )
         with pytest.raises(NotImplementedError, match="both NaN"):
-            _parse_vrt_xml(xml, "s3://b/x.vrt")
+            _parse_vrt_xml(xml, "s3://bucket/x.vrt")
 
 
 class TestRejectOutOfScopeFeatures:
@@ -973,7 +974,8 @@ class TestValidateSourceWindows:
             ),
             patch.object(AsyncGeoTIFF, "open", side_effect=fake_open),
         ):
-            return await _open_vrt("s3://bucket/v.vrt")
+            # Bucket "b": a descriptor may not reach out of its own store.
+            return await _open_vrt("s3://b/v.vrt")
 
     async def test_src_rect_windowing_larger_source_rejected(self):
         """SrcRect sizes match DstRect and offsets are 0, so the parse-time
