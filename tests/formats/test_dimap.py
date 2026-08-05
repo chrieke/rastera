@@ -237,6 +237,74 @@ class TestParseDIMAP:
         with pytest.raises(NotImplementedError, match="Regular_Tiling"):
             _parse_dimap_xml(xml)
 
+    @pytest.mark.parametrize(
+        ("tag", "declared"), [("NROWS", "1000"), ("NCOLS", "800"), ("NBANDS", "6")]
+    )
+    @pytest.mark.parametrize("value", ["0", "-100"])
+    def test_rejects_non_positive_dimensions(self, tag: str, declared: str, value: str):
+        """A negative NCOLS used to build a layout with backwards bounds."""
+        xml = _modified(
+            PNEO_DIMAP,
+            f"<{tag}>{declared}</{tag}>".encode(),
+            f"<{tag}>{value}</{tag}>".encode(),
+        )
+        with pytest.raises(ValueError, match=f"<{tag}> is {value}"):
+            _parse_dimap_xml(xml)
+
+    def test_rejects_non_integer_dimension(self):
+        xml = _modified(PNEO_DIMAP, b"<NCOLS>800</NCOLS>", b"<NCOLS>8e2</NCOLS>")
+        with pytest.raises(ValueError, match="non-integer <NCOLS>"):
+            _parse_dimap_xml(xml)
+
+    @pytest.mark.parametrize(
+        "attrs",
+        [
+            'ncols="0" nrows="500"',
+            'ncols="400" nrows="0"',
+            'ncols="-400" nrows="500"',
+        ],
+    )
+    def test_rejects_non_positive_tile_size(self, attrs: str):
+        """A tile size of 0 divided by zero inside ``_tile_decomposition``."""
+        xml = _modified(
+            PNEO_DIMAP,
+            b'<NTILES_SIZE ncols="400" nrows="500" />',
+            f"<NTILES_SIZE {attrs} />".encode(),
+        )
+        with pytest.raises(ValueError, match="NTILES_SIZE"):
+            _parse_dimap_xml(xml)
+
+    def test_rejects_non_positive_tile_count(self):
+        xml = _modified(
+            PNEO_DIMAP,
+            b'<NTILES_COUNT ntiles_C="2" ntiles_R="2" />',
+            b'<NTILES_COUNT ntiles_C="2" ntiles_R="0" />',
+        )
+        with pytest.raises(ValueError, match="NTILES_COUNT"):
+            _parse_dimap_xml(xml)
+
+    def test_rejects_missing_tile_size_attribute(self):
+        """Was a bare KeyError, which named neither the file nor the format."""
+        xml = _modified(
+            PNEO_DIMAP,
+            b'<NTILES_SIZE ncols="400" nrows="500" />',
+            b'<NTILES_SIZE nrows="500" />',
+        )
+        with pytest.raises(ValueError, match="missing ncols attribute"):
+            _parse_dimap_xml(xml)
+
+    @pytest.mark.parametrize("value", ["0", "-3"])
+    def test_rejects_non_positive_band_index(self, value: str):
+        """``BAND_INDEX`` reaches NumPy as ``index - 1``, where 0 selected the
+        tile's last band rather than raising."""
+        xml = _modified(
+            PNEO_DIMAP,
+            b"<BAND_INDEX>1</BAND_INDEX>",
+            f"<BAND_INDEX>{value}</BAND_INDEX>".encode(),
+        )
+        with pytest.raises(ValueError, match="<BAND_INDEX>"):
+            _parse_dimap_xml(xml)
+
     def test_rejects_overlapping_tiles(self):
         """Overlap would require resolving which tile's pixels 'win' on the
         seam. MVP just refuses rather than guess, to avoid silently

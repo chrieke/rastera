@@ -523,12 +523,7 @@ def _parse_vrt_xml(
         source_uri = _source_filename_uri(
             src, vrt_uri, f"Malformed VRT band {band_no}: missing <SourceFilename>"
         )
-        source_band_el = src.find("SourceBand")
-        source_band = (
-            int(source_band_el.text)
-            if source_band_el is not None and source_band_el.text
-            else 1
-        )
+        source_band = _source_band(src, band_no)
         band_nodata = _band_nodata(vrt_band, band_no)
         src_rect_size, dst_rect_size = _reject_unsupported_source(
             src, band_no, band_nodata
@@ -710,6 +705,31 @@ def _reject_unsupported_source(
         None if src_rect is None else (src_rect[2], src_rect[3]),
         None if dst_rect is None else (dst_rect[2], dst_rect[3]),
     )
+
+
+def _source_band(src: ET.Element, band_no: str) -> int:
+    """The source's ``<SourceBand>``, 1-based; 1 when the element is absent.
+
+    Checked here because ``_read_native`` subtracts 1 and indexes NumPy with the
+    result, where a non-positive band is a valid negative index rather than an
+    error: ``<SourceBand>0</SourceBand>`` silently returned the source's *last*
+    band on every resampled or reprojected read, and in ``merge``.
+    """
+    el = src.find("SourceBand")
+    if el is None or not el.text or not el.text.strip():
+        return 1
+    try:
+        band = int(el.text.strip())
+    except ValueError as e:
+        raise ValueError(
+            f"VRT band {band_no} has a non-integer <SourceBand>: {e}"
+        ) from e
+    if band < 1:
+        raise ValueError(
+            f"VRT band {band_no} has <SourceBand>{band}</SourceBand>; source "
+            f"bands are 1-based, so this does not name a band."
+        )
+    return band
 
 
 def _band_nodata(vrt_band: ET.Element, band_no: str) -> float | None:
@@ -1174,9 +1194,10 @@ def _parse_processed_vrt(root: ET.Element, vrt_uri: str) -> _VRTProcessedSpec:
             args[name] = arg.text
 
     try:
+        # OverflowError too: that, not ValueError, is what int(float("inf")) raises.
         src_nodata = int(float(args.get("src_nodata", "0")))
         dst_nodata = int(float(args.get("dst_nodata", "0")))
-    except ValueError as e:
+    except (ValueError, OverflowError) as e:
         raise ValueError(f"VRTProcessedDataset: bad src/dst nodata: {e}") from e
     if not 0 <= dst_nodata <= 255:
         raise ValueError(
