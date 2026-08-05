@@ -7,6 +7,12 @@ Measures wall-clock time, peak RSS, output accuracy (pixel comparison),
 result consistency (mean, dtype, shape), and spatial alignment (transform,
 pixel size, bounds).
 
+Timings and spatial alignment describe each library on its own defaults — its own
+grid anchoring, and GDAL free to pick an overview. Accuracy cannot: on two grids a
+pixel apart it would measure the offset rather than the pixels. So rasterio is
+re-run on rastera's terms and only those pixels are compared — see
+:func:`check_shared_grid` for what that proves.
+
 Usage (as scripts, not ``-m``: run_read/run_merge import this module as a
 sibling, which needs their own directory on sys.path):
     python benchmarks/run_read.py [--runs 5]
@@ -38,6 +44,11 @@ URI_33TUG = "s3://e84-earth-search-sentinel-data/sentinel-2-c1-l2a/33/T/UG/2025/
 # Adjacent tile in different UTM zone (EPSG:32632) — overlaps 33TTG across zone boundary
 URI_32TQM = "s3://e84-earth-search-sentinel-data/sentinel-2-c1-l2a/32/T/QM/2025/7/S2B_T32TQM_20250703T100029_L2A/B03.tif"
 
+# How far a densified bbox hull may outgrow a four-corner one before the difference
+# stops being edge curvature and starts being a bug (under a pixel per axis on this
+# suite's UTM/4326 bboxes).
+_HULL_SLACK_PX = 2
+
 
 def purge_page_cache():
     """Drop OS page cache for cold-cache benchmarks. Requires sudo on macOS."""
@@ -58,8 +69,11 @@ def run_once(
     library: str,
     save_array: str | None = None,
     cold_cache: bool = False,
-    snap_to_grid: bool = True,
-    no_overviews: bool = False,
+    *,
+    # Required: which library gets which value is the whole basis of the
+    # comparison, so there is no default that is right for both.
+    snap_to_grid: bool,
+    use_overviews: bool,
 ) -> dict:
     if cold_cache:
         purge_page_cache()
@@ -70,16 +84,10 @@ def run_once(
     bbox_str = scenario["bbox"]
     bbox_crs = scenario["bbox_crs"]
 
-    # rastera requires bbox_crs == target_crs; reproject the bbox upfront
-    if (
-        scenario.get("reproject_bbox")
-        and library == "rastera"
-        and "target_crs" in scenario
-    ):
-        target_crs = scenario["target_crs"]
-        bbox = tuple(float(x) for x in bbox_str.split(","))
-        bbox_str = ",".join(str(v) for v in _corner_hull(bbox, bbox_crs, target_crs))
-        bbox_crs = target_crs
+    if library == "rastera":
+        bbox, bbox_crs = _rastera_bbox(scenario)
+        if bbox_crs != scenario["bbox_crs"]:
+            bbox_str = ",".join(str(v) for v in bbox)
 
     cmd = [
         PYTHON,
@@ -103,10 +111,8 @@ def run_once(
         cmd += ["--target-resolution", str(scenario["target_resolution"])]
     if save_array:
         cmd += ["--save-array", save_array]
-    if not snap_to_grid and library == "rastera":
-        cmd += ["--no-snap-to-grid"]
-    if no_overviews and library == "rastera":
-        cmd += ["--no-overviews"]
+    cmd += ["--snap-to-grid" if snap_to_grid else "--no-snap-to-grid"]
+    cmd += ["--overviews" if use_overviews else "--no-overviews"]
 
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
     if result.returncode != 0:
@@ -156,23 +162,51 @@ def check_borders(path: str, threshold: float = 0.5) -> dict:
     return {"ok": ok, "edges": results}
 
 
-def compare_arrays(path_a: str, path_b: str) -> dict:
+def compare_arrays(path_a: str, path_b: str, *, by_transform: bool = True) -> dict:
+    """Compare two rasters over the ground they share.
+
+    With *by_transform* both must be on one grid — same pixel size, origins a whole
+    number of pixels apart — which is what the aligned re-run guarantees; out of
+    phase raises rather than being reported as a resampling difference. Extents may
+    still differ by outward rounding, so each array is sliced to the overlap via its
+    transform: cropping from ``[0, 0]`` would compare ground a row apart as soon as
+    one grid rounds north rather than south.
+
+    A native-resolution read passes ``by_transform=False``. Both sides read the same
+    source pixels from ``floor(offset)``, but an unsnapped output reports the *bbox*
+    as its origin — a sub-pixel fiction rastera mirrors from rasterio deliberately
+    (``geo.window_from_bbox``) that says nothing about the pixels.
+    """
     import rasterio
 
     with rasterio.open(path_a) as src:
-        a_raw = src.read()
+        a_raw, t_a = src.read(), src.transform
     with rasterio.open(path_b) as src:
-        b_raw = src.read()
-    a = a_raw.astype(np.float64)
-    b = b_raw.astype(np.float64)
+        b_raw, t_b = src.read(), src.transform
 
-    # Crop to overlapping region (off-by-one from rounding differences is expected)
-    exact_match = a.shape == b.shape
-    min_bands = min(a.shape[0], b.shape[0])
-    min_h = min(a.shape[1], b.shape[1])
-    min_w = min(a.shape[2], b.shape[2])
-    a = a[:min_bands, :min_h, :min_w]
-    b = b[:min_bands, :min_h, :min_w]
+    if (t_a.a, t_a.e) != (t_b.a, t_b.e):
+        raise ValueError(
+            f"pixel sizes differ: {(t_a.a, t_a.e)} vs {(t_b.a, t_b.e)}; nothing to compare"
+        )
+    off_x, off_y = _pixel_offset(t_a, t_b) if by_transform else (0, 0)
+
+    # b's origin sits off_x cols / off_y rows into a's grid; negative means a's
+    # origin sits inside b's instead, so the leading pixels to drop swap sides.
+    a_col, b_col = max(0, off_x), max(0, -off_x)
+    a_row, b_row = max(0, off_y), max(0, -off_y)
+    min_bands = min(a_raw.shape[0], b_raw.shape[0])
+    min_h = min(a_raw.shape[1] - a_row, b_raw.shape[1] - b_row)
+    min_w = min(a_raw.shape[2] - a_col, b_raw.shape[2] - b_col)
+    if min_h <= 0 or min_w <= 0:
+        raise ValueError("the two rasters cover no common ground")
+
+    exact_match = a_raw.shape == b_raw.shape and (off_x, off_y) == (0, 0)
+    a = a_raw[:min_bands, a_row : a_row + min_h, a_col : a_col + min_w].astype(
+        np.float64
+    )
+    b = b_raw[:min_bands, b_row : b_row + min_h, b_col : b_col + min_w].astype(
+        np.float64
+    )
 
     diff = np.abs(a - b)
     data_range = float(max(a.max(), b.max()) - min(a.min(), b.min()))
@@ -196,10 +230,15 @@ def compare_arrays(path_a: str, path_b: str) -> dict:
     return result
 
 
-def format_accuracy(accuracy: dict) -> list[str]:
+def format_accuracy(accuracy: dict, expect: dict) -> list[str]:
+    """Render the pixel comparison against *expect*'s own limits, so a scenario
+    whose point is a bounded difference does not print ❌ under an ✅ verdict.
+    """
     lines = []
     rmse_pct = accuracy.get("rmse_pct_of_range", 0)
     pct_diff = accuracy["pct_pixels_differ"]
+    max_rmse = expect.get("max_rmse_pct", 0)
+    max_pct = expect.get("max_pct_differ", 0)
 
     if not accuracy["shapes_exact_match"]:
         lines.append(
@@ -211,12 +250,12 @@ def format_accuracy(accuracy: dict) -> list[str]:
     else:
         lines.append(f"    ✅ Shape: {accuracy['shape_rastera']}")
     lines.append(
-        f"    {'✅' if rmse_pct < 1 else '⚠️' if rmse_pct < 5 else '❌'} "
-        f"RMSE: {accuracy['rmse']}  ({rmse_pct}% of data range)"
+        f"    {'✅' if rmse_pct <= max_rmse else '❌'} "
+        f"RMSE: {accuracy['rmse']}  ({rmse_pct}% of data range, limit {max_rmse}%)"
     )
     lines.append(
-        f"    {'✅' if pct_diff < 1 else '⚠️' if pct_diff < 10 else '❌'} "
-        f"Pixels that differ: {pct_diff}%"
+        f"    {'✅' if pct_diff <= max_pct else '❌'} "
+        f"Pixels that differ: {pct_diff}%  (limit {max_pct}%)"
     )
     return lines
 
@@ -280,6 +319,8 @@ def _assess_result(
     accuracy: dict | None,
     consistency: dict | None,
     border_check: dict | None = None,
+    grid_check: dict | None = None,
+    accuracy_error: str | None = None,
 ) -> tuple[bool, str]:
     """Determine overall pass/fail against the scenario's ``expect`` spec.
 
@@ -289,6 +330,10 @@ def _assess_result(
         max_pct_differ: float — max % pixels that differ (default 0)
         max_rmse_pct:   float — max RMSE as % of data range (default 0)
         note:         str    — explanation shown when expected differences occur
+
+    ``shape_match`` judges the libraries' *default* grids; the pixel limits judge a
+    shared one (:func:`compare_arrays`), so a nonzero limit there means the
+    resampling differs, not the grids.
     """
     if "expect" not in scenario:
         return False, "missing 'expect' in scenario definition"
@@ -299,7 +344,13 @@ def _assess_result(
     max_rmse = expect.get("max_rmse_pct", 0)
     note = expect.get("note", "")
 
+    # A missing comparison has to fail, or a scenario that never produced a pixel
+    # reports "as expected".
     problems = []
+    if accuracy is None:
+        problems.append(f"no accuracy comparison ({accuracy_error or 'a run failed?'})")
+    if consistency is None:
+        problems.append("no result consistency (a run failed?)")
 
     if consistency:
         if expect_dtype and not consistency["dtype_ok"]:
@@ -314,6 +365,9 @@ def _assess_result(
             problems.append(f"{pct_diff}% pixels differ (limit {max_pct}%)")
         if rmse_pct > max_rmse:
             problems.append(f"RMSE {rmse_pct}% of range (limit {max_rmse}%)")
+
+    if grid_check and not grid_check["ok"]:
+        problems.append(f"shared grid not reached: {grid_check['detail']}")
 
     if border_check and not border_check["ok"]:
         bad_edges = [
@@ -379,7 +433,7 @@ def run_benchmarks(scenarios: list[dict]):
         slug = slug.replace("(", "").replace(")", "")
         slug = "_".join(slug.split())
 
-        no_overviews = not scenario.get("use_overviews", False)
+        use_overviews = scenario.get("use_overviews", False)
         snap_to_grid = scenario.get("snap_to_grid", True)
         timings = {"rastera": [], "rasterio": []}
         mem = {"rastera": [], "rasterio": []}
@@ -387,18 +441,24 @@ def run_benchmarks(scenarios: list[dict]):
         # First run: save arrays for accuracy comparison
         first_results = {}
         saved_paths = {}
+        names = ["rastera", "rasterio", "rasterio_aligned"]
         if export_dir:
-            for library in ["rastera", "rasterio"]:
-                saved_paths[library] = str(export_dir / f"{slug}_{library}.tif")
+            for name in names:
+                saved_paths[name] = str(export_dir / f"{slug}_{name}.tif")
         else:
-            for library, suffix in [("rastera", "_ra.tif"), ("rasterio", "_rio.tif")]:
-                f = tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
-                saved_paths[library] = f.name
+            for name in names:
+                f = tempfile.NamedTemporaryFile(suffix=f"_{name}.tif", delete=False)
+                saved_paths[name] = f.name
                 f.close()
 
         accuracy = None
+        accuracy_error = None
         consistency = None
         spatial_lines = None
+        grid_check = None
+        border_check = None
+        # rasterio's own output is what gets compared unless a re-run aligns it.
+        compare_path = saved_paths["rasterio"]
 
         try:
             for library in ["rastera", "rasterio"]:
@@ -408,13 +468,34 @@ def run_benchmarks(scenarios: list[dict]):
                     library,
                     save_array=save_path,
                     cold_cache=args.cold_cache,
-                    snap_to_grid=snap_to_grid,
-                    no_overviews=no_overviews,
+                    # rasterio's timed run keeps its own defaults, so timings and
+                    # spatial alignment describe each library as it ships; the
+                    # matched re-run below is what gets compared.
+                    snap_to_grid=snap_to_grid if library == "rastera" else False,
+                    use_overviews=use_overviews if library == "rastera" else True,
                 )
                 if "error" not in result:
                     first_results[library] = result
                     timings[library].append(result["elapsed_s"])
                     mem[library].append(result.get("peak_rss_mb", 0))
+
+            if _needs_matched_rerun(scenario, first_results):
+                aligned = run_once(
+                    scenario,
+                    "rasterio",
+                    save_array=saved_paths["rasterio_aligned"],
+                    cold_cache=False,  # its timing is discarded, so don't pay for a purge
+                    snap_to_grid=snap_to_grid,
+                    use_overviews=use_overviews,
+                )
+                if "error" in aligned:
+                    compare_path = None
+                    accuracy_error = "the aligned rasterio re-run failed"
+                else:
+                    compare_path = saved_paths["rasterio_aligned"]
+                    grid_check = check_shared_grid(
+                        scenario, first_results["rastera"], aligned
+                    )
 
             # Result consistency
             if "rastera" in first_results and "rasterio" in first_results:
@@ -436,23 +517,28 @@ def run_benchmarks(scenarios: list[dict]):
                     )
 
             # Accuracy comparison
-            try:
-                accuracy = compare_arrays(
-                    saved_paths["rastera"],
-                    saved_paths["rasterio"],
-                )
-            except Exception:
-                pass
+            if compare_path:
+                try:
+                    accuracy = compare_arrays(
+                        saved_paths["rastera"],
+                        compare_path,
+                        by_transform=_lands_on_res_grid(scenario),
+                    )
+                except Exception as exc:
+                    accuracy_error = str(exc) or type(exc).__name__
 
             # Border sanity check (rastera output)
-            border_check = None
             try:
                 border_check = check_borders(saved_paths["rastera"])
             except Exception:
                 pass
 
             if export_dir:
-                export_paths = [saved_paths[lib] for lib in ["rastera", "rasterio"]]
+                export_paths = [
+                    saved_paths[name]
+                    for name in names
+                    if os.path.exists(saved_paths[name])
+                ]
             else:
                 export_paths = None
         finally:
@@ -470,8 +556,10 @@ def run_benchmarks(scenarios: list[dict]):
                     scenario,
                     library,
                     cold_cache=args.cold_cache,
-                    snap_to_grid=snap_to_grid,
-                    no_overviews=no_overviews,
+                    # Same split as the first run: a timing series that changed
+                    # configuration halfway through would have no median to take.
+                    snap_to_grid=snap_to_grid if library == "rastera" else False,
+                    use_overviews=use_overviews if library == "rastera" else True,
                 )
                 if "error" not in result:
                     timings[library].append(result["elapsed_s"])
@@ -483,7 +571,14 @@ def run_benchmarks(scenarios: list[dict]):
         out(f"{'=' * 60}")
 
         # Overall verdict
-        passed, reason = _assess_result(scenario, accuracy, consistency, border_check)
+        passed, reason = _assess_result(
+            scenario,
+            accuracy,
+            consistency,
+            border_check,
+            grid_check,
+            accuracy_error=accuracy_error,
+        )
         out(f"\n  Result: {'✅ AS EXPECTED' if passed else '❌ UNEXPECTED DIFFERENCE'}")
         out(f"  Reason: {reason}")
 
@@ -509,6 +604,12 @@ def run_benchmarks(scenarios: list[dict]):
             for line in spatial_lines:
                 out(line)
 
+        if grid_check:
+            out(
+                f"\n  Shared grid (rasterio re-run on rastera's terms): "
+                f"{'✅' if grid_check['ok'] else '❌'} {grid_check['detail']}"
+            )
+
         if border_check:
             if border_check["ok"]:
                 out("\n  Border sanity: ✅ no suspect edges")
@@ -523,8 +624,10 @@ def run_benchmarks(scenarios: list[dict]):
 
         if accuracy:
             out("\n  Accuracy:")
-            for line in format_accuracy(accuracy):
+            for line in format_accuracy(accuracy, scenario.get("expect", {})):
                 out(line)
+        elif accuracy_error:
+            out(f"\n  Accuracy: ❌ not compared ({accuracy_error})")
 
         out(f"\n  Speed ({args.runs} run{'s' if args.runs > 1 else ''}):")
         for library in ["rastera", "rasterio"]:
@@ -565,3 +668,131 @@ def run_benchmarks(scenarios: list[dict]):
         out(f"\n{'─' * 60}")
         out(f"All arrays exported to: {export_dir}")
         out(f"Report written to:      {report_path}")
+
+
+def _rastera_bbox(scenario: dict) -> tuple[tuple[float, ...], int]:
+    """The bbox and CRS rastera is called with, after any upfront reprojection.
+
+    ``read()`` requires ``bbox_crs == target_crs`` (``rastera/reader.py``), so read
+    scenarios flagged ``reproject_bbox`` hand it a bbox already moved into the target
+    CRS. ``merge()`` takes the two apart and reprojects the bbox itself, which is the
+    case :func:`_rastera_reprojects_bbox` picks out.
+    """
+    bbox = tuple(float(x) for x in scenario["bbox"].split(","))
+    bbox_crs = scenario["bbox_crs"]
+    if scenario.get("reproject_bbox") and "target_crs" in scenario:
+        target_crs = scenario["target_crs"]
+        return _corner_hull(bbox, bbox_crs, target_crs), target_crs
+    return bbox, bbox_crs
+
+
+def check_shared_grid(scenario: dict, ra: dict, rio: dict) -> dict:
+    """Whether the re-run really landed on the same grid rastera chose.
+
+    How much that proves depends on the mode. On the merge path rasterio derives the
+    grid with its own ``-tap`` (``merge(target_aligned_pixels=True)``), so agreement
+    is the suite's only independent evidence that rastera's rounding matches GDAL's.
+    On the read path rasterio has no bounds-based tap to call, so the worker
+    reimplements the arithmetic (``_worker._tap_grid``) and agreement confirms the
+    plumbing, not the formula — ``tests/test_merge.py`` covers that.
+
+    Phase (pixel size, whole-pixel origin offset) and extent must both match, except
+    where rastera reprojects the bbox itself: it densifies each edge where the worker
+    takes the four corners, so that hull may be a pixel or two larger and only has
+    to *contain* rasterio's within ``_HULL_SLACK_PX``.
+    """
+    from affine import Affine
+
+    t_ra, t_rio = Affine(*ra["transform"]), Affine(*rio["transform"])
+    if (t_ra.a, t_ra.e) != (t_rio.a, t_rio.e):
+        return {
+            "ok": False,
+            "detail": f"pixel size {(t_rio.a, t_rio.e)} vs rastera's {(t_ra.a, t_ra.e)}",
+        }
+    try:
+        off = _pixel_offset(t_ra, t_rio)
+    except ValueError as exc:
+        return {"ok": False, "detail": str(exc)}
+
+    if off == (0, 0) and ra["shape"] == rio["shape"]:
+        return {"ok": True, "detail": "identical transform and shape"}
+    mismatch = {
+        "ok": False,
+        "detail": f"same phase but offset {off} px, "
+        f"shape {rio['shape']} vs rastera's {ra['shape']}",
+    }
+    if not _rastera_reprojects_bbox(scenario):
+        return mismatch
+
+    off_x, off_y = off
+    _, ra_h, ra_w = ra["shape"]
+    _, rio_h, rio_w = rio["shape"]
+    contained = (
+        0 <= off_x <= _HULL_SLACK_PX
+        and 0 <= off_y <= _HULL_SLACK_PX
+        and off_x + rio_w <= ra_w
+        and off_y + rio_h <= ra_h
+    )
+    if not contained:
+        return mismatch | {
+            "detail": mismatch["detail"]
+            + f" — outside the {_HULL_SLACK_PX}px a densified bbox hull can explain",
+        }
+    return {
+        "ok": True,
+        "detail": f"same phase, rastera's grid contains rasterio's with {off} px "
+        f"to spare ({ra['shape']} vs {rio['shape']}) — rastera densifies the "
+        "bbox hull, the worker takes its corners",
+    }
+
+
+def _needs_matched_rerun(scenario: dict, results: dict) -> bool:
+    """Whether rasterio has to be re-run on rastera's terms before comparing pixels.
+
+    Both flags only bite where there is a target resolution — the only branch with a
+    grid to snap, and the only one where GDAL is asked to decimate and so gets to
+    choose a pyramid level. Deliberately not conditioned on the two grids happening
+    to disagree: where the bbox already sits on resolution multiples they agree
+    anyway, and skipping the re-run there would leave rasterio on a different
+    pyramid level.
+    """
+    if "rastera" not in results or "rasterio" not in results:
+        return False
+    if not _lands_on_res_grid(scenario):
+        return False
+    return scenario.get("snap_to_grid", True) or not scenario.get(
+        "use_overviews", False
+    )
+
+
+def _lands_on_res_grid(scenario: dict) -> bool:
+    """Whether the output sits on resolution multiples rather than source pixels.
+
+    Without a target resolution both libraries read the source's own pixels, so
+    there is no grid to snap rasterio onto and the reported origins are not
+    comparable — see :func:`compare_arrays`.
+    """
+    return "target_resolution" in scenario
+
+
+def _rastera_reprojects_bbox(scenario: dict) -> bool:
+    """Whether rastera, not the harness, moves the bbox into the target CRS."""
+    target_crs = scenario.get("target_crs")
+    return (
+        target_crs is not None
+        and target_crs != scenario["bbox_crs"]
+        and not scenario.get("reproject_bbox")
+    )
+
+
+def _pixel_offset(t_a, t_b) -> tuple[int, int]:
+    """``(cols, rows)`` from *t_a*'s origin to *t_b*'s. Raises if not a whole number.
+
+    Origins a fractional pixel apart cannot be compared by array index at all, so
+    this is a hard error rather than something to round away.
+    """
+    off_x = (t_b.c - t_a.c) / t_a.a
+    off_y = (t_b.f - t_a.f) / t_a.e
+    if abs(off_x - round(off_x)) > 1e-6 or abs(off_y - round(off_y)) > 1e-6:
+        raise ValueError(f"grids are out of phase by ({off_x:.4f}, {off_y:.4f}) px")
+    return round(off_x), round(off_y)
