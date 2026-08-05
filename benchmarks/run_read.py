@@ -38,10 +38,9 @@ SCENARIOS = [
         "target_resolution": 60.0,
         "expect": {
             "shape_match": False,
-            "max_pct_differ": 100,
-            "max_rmse_pct": 2,
             "note": "Grid snaps outward onto 60m multiples (bbox is off-grid at "
-            "60m): origin shifts vs rasterio's bbox-anchored grid.",
+            "60m): origin shifts vs rasterio's bbox-anchored grid. On one grid "
+            "the decimation is identical.",
         },
     },
     {
@@ -54,9 +53,11 @@ SCENARIOS = [
         "expect": {
             "shape_match": False,
             "max_pct_differ": 100,
-            "max_rmse_pct": 2,
-            "note": "Grid snaps outward onto 60m multiples; rastera reads the "
-            "40m COG overview while rasterio downsamples full 10m.",
+            "max_rmse_pct": 3,
+            "note": "Grid snaps outward onto 60m multiples; rastera reads the 40m "
+            "COG overview while rasterio's pinned-transform WarpedVRT warps from "
+            "full 10m. Nearly every pixel is a different source sample, so the "
+            "percentage carries no signal; RMSE is the check.",
         },
     },
     {
@@ -69,10 +70,12 @@ SCENARIOS = [
         "reproject_bbox": True,
         "expect": {
             "shape_match": False,
-            "max_pct_differ": 100,
-            "max_rmse_pct": 2,
-            "note": "Grid snaps outward onto 0.001 deg multiples (reprojected "
-            "bbox is off-grid): sub-pixel origin shift moves NN picks.",
+            "max_pct_differ": 5,
+            "max_rmse_pct": 1,
+            "note": "Grid snaps outward onto 0.001 deg multiples (reprojected bbox "
+            "is off-grid). ~2% of pixels still differ on a shared grid: the "
+            "coarse-grid warp (step=16) interpolates coords, moving some picks "
+            "across a nearest-neighbour boundary.",
         },
     },
     {
@@ -87,9 +90,10 @@ SCENARIOS = [
         "expect": {
             "shape_match": False,
             "max_pct_differ": 100,
-            "max_rmse_pct": 5,
+            "max_rmse_pct": 4,
             "note": "Grid snaps outward onto 0.001 deg multiples + COG overview "
-            "source + coarse-grid warp interpolation.",
+            "source + coarse-grid warp interpolation. As in scenario 4 the "
+            "percentage carries no signal; RMSE is the check.",
         },
     },
 ]

@@ -21,9 +21,8 @@ SCENARIOS = [
         "target_resolution": 10.0,
         "expect": {
             "shape_match": False,
-            "max_pct_differ": 100,
-            "max_rmse_pct": 2,
-            "note": "Snapping shifts origin ~0.8 px and rounds outward: +1 row/col vs rasterio.",
+            "note": "Snapping shifts origin ~0.8 px and rounds outward: +1 row/col "
+            "vs rasterio. On one grid both tiles and the seam match exactly.",
         },
     },
     {
@@ -45,11 +44,10 @@ SCENARIOS = [
         "target_resolution": 60.0,
         "expect": {
             "shape_match": False,
-            "max_pct_differ": 100,
-            "max_rmse_pct": 2,
             "note": "Grid snaps outward onto 60m multiples (bbox is off-grid at "
-            "60m, so +1-2 px per axis vs rasterio) + rasterio ratio drift "
-            "(~6.005 vs 6.0).",
+            "60m, so +1-2 px per axis vs rasterio). On one grid, and with GDAL "
+            "held to full resolution like rastera, the decimation is identical — "
+            "left to itself GDAL auto-selects the 40m overview here.",
         },
     },
     {
@@ -62,10 +60,8 @@ SCENARIOS = [
         "use_overviews": True,
         "expect": {
             "shape_match": False,
-            "max_pct_differ": 100,
-            "max_rmse_pct": 2,
-            "note": "Grid snaps outward onto 60m multiples + overview source + "
-            "rasterio ratio drift.",
+            "note": "Grid snaps outward onto 60m multiples. Both sides read the "
+            "same 40m overview, so on one grid the pixels are identical.",
         },
     },
     {
@@ -79,10 +75,9 @@ SCENARIOS = [
         "target_resolution": 10.0,
         "expect": {
             "shape_match": False,
-            "max_pct_differ": 100,
-            "max_rmse_pct": 2,
             "note": "Grid snaps outward onto 10m multiples (transformed bbox is "
-            "off-grid) + cross-CRS warp: different warp math shifts most pixels.",
+            "off-grid). Both warps agree pixel for pixel on one grid, across the "
+            "32632/32633 zone boundary included.",
         },
     },
     {
@@ -95,9 +90,13 @@ SCENARIOS = [
         "target_crs": 4326,
         "target_resolution": 0.001,
         "expect": {
-            "max_pct_differ": 100,
-            "max_rmse_pct": 2,
-            "note": "Snapping + cross-CRS warp: different warp math shifts most pixels.",
+            "max_pct_differ": 5,
+            "max_rmse_pct": 0.5,
+            "note": "The bbox is already on 0.001 deg multiples, so both grids "
+            "agree without a re-run. ~3% of pixels differ where the coarse-grid "
+            "warp interpolates coordinates across a nearest-neighbour boundary. "
+            "rasterio is the slower side because each WarpedVRT carries the final "
+            "grid and so warps from full 10m in one step.",
         },
     },
     {
@@ -112,8 +111,11 @@ SCENARIOS = [
         "use_overviews": True,
         "expect": {
             "max_pct_differ": 100,
-            "max_rmse_pct": 5,
-            "note": "Snapping + cross-CRS warp + overview source.",
+            "max_rmse_pct": 2,
+            "note": "rastera warps from the 40m overview while rasterio warps from "
+            "full 10m — a pinned-grid WarpedVRT leaves GDAL no window to pick an "
+            "overview for. Nearly every pixel is therefore a different source "
+            "sample and the percentage carries no signal; RMSE is the check.",
         },
     },
 ]

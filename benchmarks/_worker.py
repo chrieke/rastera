@@ -33,16 +33,55 @@ def _corner_hull(bbox: tuple, from_crs: int, to_crs: int) -> tuple:
     return min(txs), min(tys), max(txs), max(tys)
 
 
+def _tap_grid(bounds: tuple, res: float) -> tuple:
+    """Outward-rounded grid on multiples of *res* — what GDAL calls ``-tap``.
+
+    Returns ``(transform, width, height)``. Arithmetic rather than
+    ``rasterio.warp.aligned_target``, which rounds the edges of a *grid* instead
+    of raw bounds: a bbox-derived grid has already been rounded outward once, so
+    rounding it again can overshoot by a pixel — bounds ``(1, 15)`` at res 10
+    gives width 3 where the bbox covers 2.
+    """
+    import math
+
+    from affine import Affine
+
+    # A bbox edge exactly on the grid arrives from the divide as 12500.000000000002,
+    # whose ceil is a whole pixel too far.
+    def denoise(v: float) -> float:
+        return round(v) if abs(v - round(v)) < 1e-6 else v
+
+    minx, miny, maxx, maxy = bounds
+    col_min, col_max = math.floor(denoise(minx / res)), math.ceil(denoise(maxx / res))
+    row_min, row_max = math.floor(denoise(miny / res)), math.ceil(denoise(maxy / res))
+    transform = Affine(res, 0, col_min * res, 0, -res, row_max * res)
+    return transform, max(1, col_max - col_min), max(1, row_max - row_min)
+
+
+def _open_kwargs(use_overviews: bool) -> dict:
+    """GDAL open options mirroring rastera's ``use_overviews``.
+
+    Left to itself GDAL picks a pyramid level whenever it is asked to downsample,
+    so a "no overviews" scenario would compare against whatever level it chose.
+    """
+    return {} if use_overviews else {"OVERVIEW_LEVEL": "NONE"}
+
+
 def _run_rastera(
     uri: str | list[str],
     bbox: tuple,
     bbox_crs: int,
     target_crs: int | None,
     target_resolution: float | None,
-    snap_to_grid: bool = True,
-    use_overviews: bool = True,
+    *,
+    snap_to_grid: bool,
+    use_overviews: bool,
 ) -> tuple[np.ndarray, list]:
-    """Read one URI, or merge a list of them; both take the same arguments."""
+    """Read one URI, or merge a list of them; both take the same arguments.
+
+    Both flags are required, as on the rasterio side: rastera's own defaults differ
+    from GDAL's, so a default here would quietly decide which library it describes.
+    """
     import asyncio
 
     import rastera
@@ -80,7 +119,14 @@ def read_rasterio(
     bbox_crs: int,
     target_crs: int | None,
     target_resolution: float | None,
+    *,
+    snap_to_grid: bool,
+    use_overviews: bool,
 ) -> tuple[np.ndarray, list]:
+    """*snap_to_grid* has no effect on the same-CRS/same-resolution branch below:
+    a plain window read already lands on the source's own pixels, so a grid there
+    would only make GDAL resample a region it can copy.
+    """
     import math
     import os
 
@@ -96,7 +142,7 @@ def read_rasterio(
 
     out_crs = CRS.from_epsg(target_crs) if target_crs else CRS.from_epsg(bbox_crs)
 
-    with rasterio.open(uri) as src:
+    with rasterio.open(uri, **_open_kwargs(use_overviews)) as src:
         src_crs_epsg = src.crs.to_epsg()
 
         # Grid construction needs the bbox in the output CRS; without a
@@ -112,7 +158,14 @@ def read_rasterio(
                 "crs": out_crs,
                 "resampling": Resampling.nearest,
             }
-            if target_resolution:
+            if target_resolution and snap_to_grid:
+                dst_transform, width, height = _tap_grid(
+                    (minx, miny, maxx, maxy), target_resolution
+                )
+                vrt_kwargs["transform"] = dst_transform
+                vrt_kwargs["width"] = width
+                vrt_kwargs["height"] = height
+            elif target_resolution:
                 width = max(1, math.ceil((maxx - minx) / target_resolution))
                 height = max(1, math.ceil((maxy - miny) / target_resolution))
                 dst_transform = Affine(
@@ -142,6 +195,9 @@ def merge_rasterio(
     bbox_crs: int,
     target_crs: int | None,
     target_resolution: float | None,
+    *,
+    snap_to_grid: bool,
+    use_overviews: bool,
 ) -> tuple[np.ndarray, list]:
     import os
 
@@ -158,7 +214,7 @@ def merge_rasterio(
         assert target_crs is not None
         merge_bounds = _corner_hull(bbox, bbox_crs, target_crs)
 
-    datasets = [rasterio.open(u) for u in uris]
+    datasets = [rasterio.open(u, **_open_kwargs(use_overviews)) for u in uris]
     vrts = []
     try:
         # Only use WarpedVRT when actual reprojection is needed.
@@ -167,12 +223,30 @@ def merge_rasterio(
         needs_vrt = out_crs and any(ds.crs != out_crs for ds in datasets)
         if needs_vrt:
             from rasterio.vrt import WarpedVRT
-            from rasterio.warp import Resampling
+            from rasterio.warp import (
+                Resampling,
+                aligned_target,
+                calculate_default_transform,
+            )
 
-            vrts = [
-                WarpedVRT(ds, crs=out_crs, resampling=Resampling.nearest)
-                for ds in datasets
-            ]
+            for ds in datasets:
+                vrt_kwargs = {"crs": out_crs, "resampling": Resampling.nearest}
+                if target_resolution is not None:
+                    # Each VRT has to carry the *final* resolution and phase.
+                    # Left on its own default warp grid, merge() resamples a
+                    # second time to reach the target and the two nearest-
+                    # neighbour picks compose into a different source pixel.
+                    grid = calculate_default_transform(
+                        ds.crs,
+                        out_crs,
+                        ds.width,
+                        ds.height,
+                        *ds.bounds,
+                        resolution=target_resolution,
+                    )
+                    t, w, h = aligned_target(*grid, target_resolution)
+                    vrt_kwargs.update(transform=t, width=w, height=h)
+                vrts.append(WarpedVRT(ds, **vrt_kwargs))
             sources = vrts
         else:
             sources = datasets
@@ -180,6 +254,10 @@ def merge_rasterio(
         merge_kwargs = {"bounds": merge_bounds}
         if target_resolution is not None:
             merge_kwargs["res"] = target_resolution
+        if snap_to_grid:
+            # merge() takes no transform, but its own -tap rounding of raw bounds
+            # is the same arithmetic as rastera's snapped_grid_for_bbox.
+            merge_kwargs["target_aligned_pixels"] = True
         array, out_transform = merge(sources, **merge_kwargs)
     finally:
         for v in vrts:
@@ -203,17 +281,20 @@ def main():
     parser.add_argument(
         "--save-array", default=None, help="Path to write the output GeoTIFF"
     )
+    # Both flags apply to both libraries: comparing pixels needs one grid and one
+    # pyramid level. Required rather than defaulted — rastera and GDAL disagree on
+    # both, so the caller has to say which behaviour it is asking for.
     parser.add_argument(
-        "--no-snap-to-grid",
-        action="store_true",
-        default=False,
-        help="Disable snap-to-grid (rastera only)",
+        "--snap-to-grid",
+        action=argparse.BooleanOptionalAction,
+        required=True,
+        help="Round the output onto resolution multiples (GDAL -tap)",
     )
     parser.add_argument(
-        "--no-overviews",
-        action="store_true",
-        default=False,
-        help="Disable COG overview usage (rastera only)",
+        "--overviews",
+        action=argparse.BooleanOptionalAction,
+        required=True,
+        help="Allow reading from COG overviews",
     )
     args = parser.parse_args()
 
@@ -231,12 +312,18 @@ def main():
                 args.bbox_crs,
                 args.target_crs,
                 args.target_resolution,
-                snap_to_grid=not args.no_snap_to_grid,
-                use_overviews=not args.no_overviews,
+                snap_to_grid=args.snap_to_grid,
+                use_overviews=args.overviews,
             )
         else:
             data, transform = merge_rasterio(
-                uris, bbox, args.bbox_crs, args.target_crs, args.target_resolution
+                uris,
+                bbox,
+                args.bbox_crs,
+                args.target_crs,
+                args.target_resolution,
+                snap_to_grid=args.snap_to_grid,
+                use_overviews=args.overviews,
             )
     else:
         if args.library == "rastera":
@@ -246,12 +333,18 @@ def main():
                 args.bbox_crs,
                 args.target_crs,
                 args.target_resolution,
-                snap_to_grid=not args.no_snap_to_grid,
-                use_overviews=not args.no_overviews,
+                snap_to_grid=args.snap_to_grid,
+                use_overviews=args.overviews,
             )
         else:
             data, transform = read_rasterio(
-                args.uri, bbox, args.bbox_crs, args.target_crs, args.target_resolution
+                args.uri,
+                bbox,
+                args.bbox_crs,
+                args.target_crs,
+                args.target_resolution,
+                snap_to_grid=args.snap_to_grid,
+                use_overviews=args.overviews,
             )
     elapsed = time.perf_counter() - t0
 
