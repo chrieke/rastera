@@ -364,8 +364,8 @@ def _parse_dimap_xml(xml_bytes: bytes) -> _DIMAPLayout:
 
     raster_data = _require(root, "Raster_Data")
     dims = _require(raster_data, "Raster_Dimensions")
-    width = int(_require_text(dims, "NCOLS"))
-    height = int(_require_text(dims, "NROWS"))
+    width = _require_positive_int(dims, "NCOLS")
+    height = _require_positive_int(dims, "NROWS")
 
     tile_rows, tile_cols, tile_h, tile_w = _parse_regular_tiling(dims)
 
@@ -382,7 +382,7 @@ def _parse_dimap_xml(xml_bytes: bytes) -> _DIMAPLayout:
             f"DIMAP DATA_FILE_FORMAT={fmt!r}; only 'image/tiff' is supported"
         )
 
-    nbands = int(_require_text(dims, "NBANDS"))
+    nbands = _require_positive_int(dims, "NBANDS")
     groups, bands = _parse_band_groups(data_access, nbands)
 
     transform = _parse_transform(_require(root, "Geoposition"))
@@ -418,6 +418,38 @@ def _require_text(parent: ET.Element, tag: str) -> str:
     return el.text.strip()
 
 
+def _require_positive_int(parent: ET.Element, tag: str) -> int:
+    """A required element's text as an int >= 1.
+
+    A negative NCOLS/NROWS builds a layout whose bounds run backwards.
+    """
+    text = _require_text(parent, tag)
+    try:
+        value = int(text)
+    except ValueError as e:
+        raise ValueError(f"DIMAP: non-integer <{tag}>: {e}") from e
+    if value < 1:
+        raise ValueError(f"DIMAP: <{tag}> is {value}; expected a positive count")
+    return value
+
+
+def _require_positive_attr(el: ET.Element, attr: str) -> int:
+    """One of ``<NTILES_SIZE>``/``<NTILES_COUNT>``'s counts, as an int >= 1.
+
+    A tile size of 0 divides by zero in ``_tile_decomposition``.
+    """
+    raw = el.attrib.get(attr)
+    if raw is None:
+        raise ValueError(f"DIMAP: <{el.tag}> missing {attr} attribute")
+    try:
+        value = int(raw)
+    except ValueError as e:
+        raise ValueError(f"DIMAP: non-integer <{el.tag}> {attr}={raw!r}: {e}") from e
+    if value < 1:
+        raise ValueError(f"DIMAP: <{el.tag}> {attr}={value}; expected a positive count")
+    return value
+
+
 def _parse_regular_tiling(dims: ET.Element) -> tuple[int, int, int, int]:
     tile_set = dims.find("Tile_Set")
     if tile_set is None:
@@ -425,8 +457,8 @@ def _parse_regular_tiling(dims: ET.Element) -> tuple[int, int, int, int]:
         # Data_File entries still carry tile_R="1" tile_C="1", so the
         # mosaic stitcher works unchanged with a 1x1 grid sized to the
         # full raster.
-        nrows = int(_require_text(dims, "NROWS"))
-        ncols = int(_require_text(dims, "NCOLS"))
+        nrows = _require_positive_int(dims, "NROWS")
+        ncols = _require_positive_int(dims, "NCOLS")
         return 1, 1, nrows, ncols
     regular = tile_set.find("Regular_Tiling")
     if regular is None:
@@ -445,10 +477,10 @@ def _parse_regular_tiling(dims: ET.Element) -> tuple[int, int, int, int]:
                 f"DIMAP NTILES_OVERLAP=({o_cols},{o_rows}); only zero-overlap "
                 f"tilings are supported"
             )
-    tile_w = int(size.attrib["ncols"])
-    tile_h = int(size.attrib["nrows"])
-    n_cols = int(count.attrib["ntiles_C"])
-    n_rows = int(count.attrib["ntiles_R"])
+    tile_w = _require_positive_attr(size, "ncols")
+    tile_h = _require_positive_attr(size, "nrows")
+    n_cols = _require_positive_attr(count, "ntiles_C")
+    n_rows = _require_positive_attr(count, "ntiles_R")
     return n_rows, n_cols, tile_h, tile_w
 
 
@@ -510,7 +542,8 @@ def _parse_band_groups(
                 band_id=(ri.findtext("BAND_ID") or "").strip(),
                 band_name=(ri.findtext("BAND_NAME") or "").strip(),
                 group_index=group_index,
-                source_band=int(_require_text(ri, "BAND_INDEX")),
+                # Positive: 0 subtracts to -1, selecting the tile's last band.
+                source_band=_require_positive_int(ri, "BAND_INDEX"),
             )
             for ri in index_list.findall("Raster_Index")
         ]

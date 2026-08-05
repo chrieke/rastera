@@ -211,6 +211,17 @@ class TestParseProcessedVRT:
         with pytest.raises(ValueError, match="dst_nodata=300"):
             _parse_vrt_xml(xml, "s3://b/x.vrt")
 
+    @pytest.mark.parametrize("value", ["inf", "-inf", "nan", "abc"])
+    def test_rejects_unusable_src_nodata(self, value: str):
+        """``int(float("inf"))`` raises OverflowError, not ValueError, so this
+        escaped as a bare traceback."""
+        xml = _processed_vrt(n_bands=1).replace(
+            b'<Argument name="src_nodata">0</Argument>',
+            f'<Argument name="src_nodata">{value}</Argument>'.encode(),
+        )
+        with pytest.raises(ValueError, match="bad src/dst nodata"):
+            _parse_vrt_xml(xml, "s3://b/x.vrt")
+
     def test_rejects_missing_lut_for_band(self):
         # Strip the second band's LUT.
         xml = _processed_vrt(n_bands=2).replace(

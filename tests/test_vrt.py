@@ -1110,6 +1110,46 @@ class TestVRTCycle:
             await _open_vrt("s3://bucket/self.vrt")
 
 
+class TestSourceBand:
+    """``<SourceBand>`` reaches NumPy as ``band - 1``, where a non-positive
+    value is a valid *negative* index instead of an error."""
+
+    @pytest.mark.parametrize("band", ["0", "-5"])
+    def test_non_positive_source_band_rejected(self, band: str):
+        xml = _one_band_vrt().replace(
+            b"<SourceBand>1</SourceBand>", f"<SourceBand>{band}</SourceBand>".encode()
+        )
+        with pytest.raises(ValueError, match="source bands are 1-based"):
+            _parse_vrt_xml(xml, "s3://b/x.vrt")
+
+    def test_non_integer_source_band_rejected(self):
+        xml = _one_band_vrt().replace(
+            b"<SourceBand>1</SourceBand>", b"<SourceBand>2.5</SourceBand>"
+        )
+        with pytest.raises(ValueError, match="non-integer <SourceBand>"):
+            _parse_vrt_xml(xml, "s3://b/x.vrt")
+
+    def test_absent_source_band_defaults_to_one(self):
+        xml = _one_band_vrt().replace(b"<SourceBand>1</SourceBand>", b"")
+        bands = _parse_vrt_xml(xml, "s3://b/x.vrt")
+        assert isinstance(bands, list)
+        assert bands[0].source_band == 1
+
+    async def test_read_native_no_longer_returns_the_wrong_band(self):
+        """Used to subtract to -1 and return the source's *last* band from every
+        ``_read_native`` read while the public path raised: one VRT, two answers."""
+        xml = _one_band_vrt().replace(
+            b"<SourceBand>1</SourceBand>", b"<SourceBand>0</SourceBand>"
+        )
+        with (
+            patch(
+                "rastera.vrt._fetch_descriptor_bytes", new=AsyncMock(return_value=xml)
+            ),
+            pytest.raises(ValueError, match="source bands are 1-based"),
+        ):
+            await _open_vrt("s3://b/x.vrt")
+
+
 def _make_rgbnir_ds() -> _VRTDataset:
     """A 4-band VRT: bands 1-3 from rgb.tif, band 4 from nir.tif."""
     rgb_src = AsyncGeoTIFF("s3://bucket/rgb.tif", make_mock_geotiff(count=3))
