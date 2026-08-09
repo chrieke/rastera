@@ -7,6 +7,25 @@ import pytest
 from affine import Affine
 from async_geotiff import RasterArray
 
+# The attribute surface a real GeoTIFF offers rastera, plus ``read``. Spec'ing
+# the mock to it turns a read outside that contract into an AttributeError
+# instead of a Mock that compares unequal, iterates empty and floats to 1.0.
+_GEOTIFF_ATTRS = (
+    "bounds",
+    "count",
+    "crs",
+    "dtype",
+    "height",
+    "nodata",
+    "overviews",
+    "read",
+    "res",
+    "tile_height",
+    "tile_width",
+    "transform",
+    "width",
+)
+
 
 @pytest.fixture(autouse=True)
 def _clear_aws_region(monkeypatch: pytest.MonkeyPatch):
@@ -55,7 +74,7 @@ def make_mock_geotiff(
     if origin_y is None:
         origin_y = height * scale
 
-    gt = MagicMock()
+    gt = MagicMock(spec=_GEOTIFF_ATTRS)
     gt.width = width
     gt.height = height
     gt.count = count

@@ -1169,6 +1169,23 @@ def _make_rgbnir_ds() -> _VRTDataset:
     )
 
 
+class TestVRTMetadata:
+    def test_count_is_the_stack_not_the_first_source(self):
+        """``_geotiff`` is band 1's source, so reading count off it sees 3."""
+        ds = _make_rgbnir_ds()
+        assert ds.count == 4
+        assert ds._geotiff.count == 3
+        assert ds.profile["count"] == 4
+
+    def test_grid_comes_from_band_one(self):
+        """Safe because ``_validate_source_windows`` has already rejected any
+        stack whose sources disagree on size, dtype, CRS or transform."""
+        profile = _make_rgbnir_ds().profile
+        first = _make_rgbnir_ds()._band_sources[0][0].profile
+        for key in ("bounds", "transform", "res", "dtype", "crs_epsg"):
+            assert profile[key] == first[key]
+
+
 class TestVRTRead:
     async def test_read_all_bands_groups_by_source(self):
         ds = _make_rgbnir_ds()

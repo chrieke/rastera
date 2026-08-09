@@ -41,6 +41,7 @@ from .reader import (
     AsyncGeoTIFF,
     MetaOverrides,
     _CrsNodata,
+    _GeoTIFFLike,
     _make_output_array,
 )
 from .resampling import ResamplingMethod
@@ -244,6 +245,10 @@ class _VRTDataset(AsyncGeoTIFF):
         for src in {id(s): s for s, _ in self._band_sources}.values():
             src._override_nodata(nodata)
 
+    # Together with ``overviews`` and ``_nodata``, set above, this is all a
+    # stack restates: ``_validate_source_windows`` has already rejected sources
+    # disagreeing on size, dtype, CRS or transform, so band 1's ``_geotiff`` is
+    # authoritative for the rest.
     @property
     def count(self) -> int:
         return len(self._band_sources)
@@ -1295,8 +1300,12 @@ def _compile_lut(arg_text: str, *, src_nodata: int, dst_nodata: int) -> np.ndarr
 
 
 def _processed_virtual_geotiff(
-    src_geotiff: Any, *, count: int, dtype: np.dtype, nodata: int | float | None
-) -> Any:
+    src_geotiff: _GeoTIFFLike,
+    *,
+    count: int,
+    dtype: np.dtype,
+    nodata: int | float | None,
+) -> _GeoTIFFLike:
     """Wrap the source's ``_geotiff`` metadata with our output dtype/count.
 
     Reuses ``_DIMAPDataset``'s ``_VirtualGeoTIFF`` (lazy import to avoid the
@@ -1313,10 +1322,10 @@ def _processed_virtual_geotiff(
         count=count,
         width=src_geotiff.width,
         height=src_geotiff.height,
-        res=tuple(src_geotiff.res),
-        bounds=tuple(src_geotiff.bounds),
+        res=src_geotiff.res,
+        bounds=src_geotiff.bounds,
         transform=src_geotiff.transform,
-        overviews=tuple(getattr(src_geotiff, "overviews", ()) or ()),
+        overviews=tuple(src_geotiff.overviews),
     )
 
 

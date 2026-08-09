@@ -105,7 +105,7 @@ class _DIMAPDataset(AsyncGeoTIFF):
         # to 0 — the Airbus convention for integer products.
         nodata: int | float | None = first_tile._nodata if first_tile is not None else 0
         virtual = _virtual_geotiff_for(layout, nodata=nodata)
-        super().__init__(uri, virtual, meta_overrides=meta_overrides)  # type: ignore[arg-type]
+        super().__init__(uri, virtual, meta_overrides=meta_overrides)
         self._layout = layout
         self._tile_open_kwargs: dict[str, Any] = {
             "store": store,

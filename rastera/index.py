@@ -108,22 +108,25 @@ async def build_index(
     geometries: list[Any] = []
 
     for src, hdr in results:
-        gt = src._geotiff
+        # Every column but uri/header_bytes is a profile key, so read them off
+        # the profile: hand-copying them is how this came to record a
+        # band-stack VRT's first source's band count rather than the stack's.
+        p = src.profile
         rows["uri"].append(src.uri)
         rows["header_bytes"].append(hdr)
-        rows["crs_epsg"].append(src._crs_epsg)
-        rows["width"].append(gt.width)
-        rows["height"].append(gt.height)
-        rows["count"].append(gt.count)
-        rows["res_x"].append(gt.res[0])
-        rows["res_y"].append(gt.res[1])
-        rows["dtype"].append(str(gt.dtype))
-        rows["nodata"].append(src._nodata)
-        rows["overviews"].append(json.dumps(src.overviews or []))
-        b = gt.bounds  # (minx, miny, maxx, maxy)
-        geom = box(b[0], b[1], b[2], b[3])
-        if src._crs_epsg is not None and src._crs_epsg != 4326:
-            t = Transformer.from_crs(src._crs_epsg, 4326, always_xy=True)
+        rows["crs_epsg"].append(p["crs_epsg"])
+        rows["width"].append(p["width"])
+        rows["height"].append(p["height"])
+        rows["count"].append(p["count"])
+        rows["res_x"].append(p["res"][0])
+        rows["res_y"].append(p["res"][1])
+        rows["dtype"].append(p["dtype"])
+        rows["nodata"].append(p["nodata"])
+        rows["overviews"].append(json.dumps(p["overviews"]))
+        b = p["bounds"]
+        geom = box(b.minx, b.miny, b.maxx, b.maxy)
+        if p["crs_epsg"] is not None and p["crs_epsg"] != 4326:
+            t = Transformer.from_crs(p["crs_epsg"], 4326, always_xy=True)
             geom = ops.transform(t.transform, geom)
         geometries.append(geom)
 

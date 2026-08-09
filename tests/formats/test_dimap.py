@@ -20,6 +20,7 @@ from rastera.formats.dimap import (
     _resolve_tile_uri,
     _tile_decomposition,
 )
+from rastera.geo import BBox
 from rastera.reader import AsyncGeoTIFF
 
 # Minimal but realistic PNEO-flavoured DIMAP: two band-groups (RGB + NED),
@@ -680,6 +681,19 @@ def _mock_tile_ds(fill_fn: _TileFillFn) -> AsyncGeoTIFF:
 
     ds._read_native = _read_native
     return ds
+
+
+class TestDIMAPMetadata:
+    def test_grid_comes_from_the_layout(self):
+        layout = _two_group_layout()
+        profile = _DIMAPDataset("/fake/DIM.xml", layout).profile
+        assert profile["width"] == 800
+        assert profile["height"] == 1000
+        assert profile["count"] == len(layout.bands)
+        assert profile["crs_epsg"] == 32633
+        assert profile["res"] == (0.3, 0.3)
+        assert profile["dtype"] == "uint16"
+        assert profile["bounds"] == BBox(369516.0, 6446886.0, 369756.0, 6447186.0)
 
 
 class TestDIMAPRead:
