@@ -110,7 +110,6 @@ async def merge(
 
     bbox = ensure_bbox(bbox)
     base = cogs[0]
-    base_gt = base._geotiff
 
     # Validate + resolve count; keep original band_indices for cog.read() calls.
     n_out_bands = len(normalize_band_indices(band_indices, base.count))
@@ -119,6 +118,7 @@ async def merge(
     # n_out_bands rows, so those must line up before either dispatches.
     _require_stackable_bands(cogs, band_indices)
 
+    base_gt = base._geotiff
     all_same_crs = all(cog._crs_epsg == base._crs_epsg for cog in cogs[1:])
     all_same_res = all(
         math.isclose(float(cog._geotiff.transform.a), float(base_gt.transform.a))

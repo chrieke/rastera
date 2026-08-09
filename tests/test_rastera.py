@@ -2,15 +2,18 @@
 
 from pathlib import Path
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
 import numpy as np
 import pytest
 from affine import Affine
 from async_geotiff import RasterArray, Window
+from pyproj import CRS
 
 import rastera
+from rastera.formats.dimap import _DIMAPDataset
 from rastera.geo import BBox, snapped_grid_for_bbox
+from rastera.profile import RasterProfile
 from rastera.reader import (
     AsyncGeoTIFF,
     _geotiff_cache,
@@ -73,6 +76,120 @@ class TestAsyncGeoTIFFInit:
         gt.overviews = [ovr]
         obj = AsyncGeoTIFF("s3://b/k.tif", gt)
         assert obj.overviews == [(50, 50)]
+
+
+# ── profile ─────────────────────────────────────────────────────────────
+
+
+class TestProfile:
+    def test_grid_keys(self):
+        src = AsyncGeoTIFF(
+            "s3://b/k.tif",
+            make_mock_geotiff(width=1024, height=1024, count=3, nodata=0.0),
+        )
+        gt = src._geotiff
+        profile = src.profile
+        assert set(profile) == set(RasterProfile.__required_keys__)
+        assert profile["width"] == 1024
+        assert profile["height"] == 1024
+        assert profile["count"] == 3
+        assert profile["dtype"] == "uint16"
+        assert profile["crs"] is gt.crs
+        assert profile["crs_epsg"] == 32632
+        assert profile["transform"] == gt.transform
+        assert profile["res"] == (10.0, 10.0)
+        assert profile["nodata"] == 0
+        assert profile["overviews"] == []
+
+    def test_bounds_is_a_bbox(self):
+        """Not the raw 4-tuple: BBox is rastera's own spatial type, so a bbox
+        out of the profile goes straight back into read() or merge()."""
+        profile = AsyncGeoTIFF("s3://b/k.tif", make_mock_geotiff()).profile
+        assert profile["bounds"] == BBox(0.0, 0.0, 1000.0, 1000.0)
+        assert isinstance(profile["bounds"], BBox)
+
+    def test_crs_is_the_files_own_object(self):
+        """Not CRS.from_epsg(crs_epsg): to_epsg() matches at 70% confidence, so
+        rebuilding from the code can relabel a WKT as a CRS it isn't."""
+        gt = make_mock_geotiff(crs_epsg=32632)
+        assert AsyncGeoTIFF("s3://b/k.tif", gt).profile["crs"] is gt.crs
+
+    def test_codeless_wkt_keeps_the_crs(self):
+        gt = make_mock_geotiff()
+        gt.crs.to_epsg.return_value = None
+        profile = AsyncGeoTIFF("s3://b/k.tif", gt).profile
+        assert profile["crs_epsg"] is None
+        assert profile["crs"] is gt.crs
+
+    def test_crs_override_wins(self):
+        gt = make_mock_geotiff(crs_epsg=32632)
+        profile = AsyncGeoTIFF("s3://b/k.tif", gt, meta_overrides={"crs": 3006}).profile
+        assert profile["crs"] == CRS.from_epsg(3006)
+        assert profile["crs_epsg"] == 3006
+
+    async def test_crs_override_never_touches_an_unparseable_crs(self):
+        """The whole reason _crs_override is stored apart from _crs_epsg: geo
+        keys that raise are exactly what an override exists to replace. Reads
+        have to survive it too, not just the profile — ``_output_geotiff_ref``
+        asks the file for its EPSG on every read path."""
+        gt = make_mock_geotiff(width=20, height=20, count=1)
+        gt.read = slicing_read(gt, np.ones((1, 20, 20), np.uint16))
+        type(gt).crs = PropertyMock(side_effect=ValueError("bad geo keys"))
+        try:
+            src = AsyncGeoTIFF("s3://b/k.tif", gt, meta_overrides={"crs": 3006})
+            assert src.profile["crs"] == CRS.from_epsg(3006)
+            arr = await src._read_native()
+            assert arr.crs == CRS.from_epsg(3006)
+        finally:
+            del type(gt).crs
+
+    def test_nodata_is_the_coerced_sentinel(self):
+        """A uint16 band cannot hold -9999, so the dataset has no sentinel even
+        though the file declares one."""
+        gt = make_mock_geotiff(dtype=np.dtype("u2"), nodata=-9999.0)
+        assert AsyncGeoTIFF("s3://b/k.tif", gt).profile["nodata"] is None
+        assert gt.nodata == -9999.0
+
+    def test_representable_sentinel_passes_through(self):
+        gt = make_mock_geotiff(dtype=np.dtype("u2"), nodata=0.0)
+        assert AsyncGeoTIFF("s3://b/k.tif", gt).profile["nodata"] == 0
+
+    def test_dtype_is_a_string(self):
+        """rasterio takes the dtype by name, not as a numpy object."""
+        gt = make_mock_geotiff()
+        assert isinstance(AsyncGeoTIFF("s3://b/k.tif", gt).profile["dtype"], str)
+
+    def test_unmapped_dtype_is_none_not_the_string_none(self):
+        """str(None) would put "None" in the profile, which rasterio accepts
+        as far as the key check and then fails on obscurely."""
+        gt = make_mock_geotiff(width=1024, height=1024)
+        gt.dtype = None
+        assert AsyncGeoTIFF("s3://b/k.tif", gt).profile["dtype"] is None
+
+
+# ── profile reachability across the synthesized datasets ───────────────
+
+
+def _synthesized_datasets() -> dict[str, AsyncGeoTIFF]:
+    """One of each dataset whose ``_geotiff`` is not a real GeoTIFF."""
+    from tests.formats.test_dimap import _two_group_layout
+    from tests.test_vrt import _make_rgbnir_ds
+    from tests.test_vrt_processed import _make_processed_ds
+
+    return {
+        "vrt": _make_rgbnir_ds(),
+        "processed": _make_processed_ds()[0],
+        "dimap": _DIMAPDataset("s3://b/DIM.xml", _two_group_layout()),
+    }
+
+
+@pytest.mark.parametrize("flavour", ["vrt", "processed", "dimap"])
+def test_profile_is_reachable_on_synthesized_datasets(flavour: str) -> None:
+    """A VRT or DIMAP dataset builds its ``_geotiff`` from a ten-field stand-in,
+    so a profile key reading anything wider raises AttributeError only for the
+    users on those formats. Every required key must resolve on all three."""
+    profile = _synthesized_datasets()[flavour].profile
+    assert set(RasterProfile.__required_keys__) <= set(profile)
 
 
 # ── open() classmethod ──────────────────────────────────────────────────

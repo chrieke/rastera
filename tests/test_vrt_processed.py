@@ -290,6 +290,18 @@ def _make_processed_ds(
     return _VRTProcessedDataset("s3://b/x.vrt", spec, source), source
 
 
+class TestProcessedMetadata:
+    def test_dtype_is_the_lut_output(self):
+        ds, source = _make_processed_ds(n_bands=3, src_dtype=np.uint16)
+        assert ds.profile["dtype"] == "uint8"
+        assert source.profile["dtype"] == "uint16"
+
+    def test_grid_passes_through(self):
+        ds, source = _make_processed_ds()
+        for key in ("bounds", "res", "crs_epsg"):
+            assert ds.profile[key] == source.profile[key]
+
+
 class TestProcessedRead:
     def test_count_reflects_output_band_count(self):
         ds, _ = _make_processed_ds(n_bands=4)

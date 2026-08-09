@@ -29,8 +29,13 @@ def _make_mock_async_geotiff(
     count: int = 3,
     dtype: np.dtype[Any] = np.dtype("u2"),
     nodata: float | None = None,
-) -> MagicMock:
-    """Build a mock AsyncGeoTIFF with _geotiff, _crs_epsg, _nodata."""
+) -> AsyncGeoTIFF:
+    """A real AsyncGeoTIFF over a mock header.
+
+    Not ``MagicMock(spec=AsyncGeoTIFF)``: ``count`` is a property, and a
+    spec'd mock answers it with a Mock that lands in the parquet column
+    unnoticed.
+    """
     gt = make_mock_geotiff(
         width=width,
         height=height,
@@ -40,14 +45,7 @@ def _make_mock_async_geotiff(
         nodata=float(nodata) if nodata is not None else None,
         crs_epsg=crs_epsg,
     )
-
-    obj = MagicMock(spec=AsyncGeoTIFF)
-    obj.uri = uri
-    obj._geotiff = gt
-    obj._crs_epsg = crs_epsg
-    obj._nodata = nodata
-    obj.overviews = []
-    return obj
+    return AsyncGeoTIFF(uri, gt)
 
 
 # Return type is Any, not gpd.GeoDataFrame: gpd comes from importorskip, so it
@@ -193,6 +191,26 @@ class TestBuildIndex:
             "geometry",
         }
         assert set(gdf.columns) == expected_cols
+
+    @patch("rastera.index._build_obstore")
+    @patch("rastera.index.AsyncGeoTIFF.open", new_callable=AsyncMock)
+    @patch("rastera.index.obstore.get_range_async", new_callable=AsyncMock)
+    async def test_records_the_datasets_band_count_not_the_headers(
+        self, mock_get_range: Any, mock_open: Any, mock_build_obs: Any
+    ) -> None:
+        """A band-stack VRT's header is its first source's, so indexing one
+        used to record 3 bands for a 4-band dataset."""
+        from tests.test_vrt import _make_rgbnir_ds
+
+        mock_build_obs.return_value = MagicMock()
+        mock_get_range.return_value = b"\x00" * 32768
+        stacked = _make_rgbnir_ds()
+        assert stacked._geotiff.count == 3
+        mock_open.return_value = stacked
+
+        gdf = await build_index([stacked.uri])
+
+        assert gdf.iloc[0]["count"] == 4
 
     @patch("rastera.index._build_obstore")
     @patch("rastera.index.AsyncGeoTIFF.open", new_callable=AsyncMock)

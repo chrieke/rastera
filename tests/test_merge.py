@@ -45,7 +45,7 @@ def _make_cog(
     dtype: np.dtype[Any] = np.dtype("u2"),
     nodata: float | None = None,
 ):
-    """Build a mock AsyncGeoTIFF."""
+    """Build a real AsyncGeoTIFF over a mock header."""
     gt = make_mock_geotiff(
         width=width,
         height=height,
@@ -57,21 +57,9 @@ def _make_cog(
         dtype=dtype,
         nodata=float(nodata) if nodata is not None else None,
     )
-    cog = MagicMock()
-    cog._geotiff = gt
-    cog._crs_epsg = crs
-    cog._nodata = nodata
-    cog.overviews = []
-    cog.count = bands
-    cog.read = AsyncMock()
-    # Bind the real warp seam: merge routes its reprojected reads through it, so
-    # auto-mocking it would skip the code under test and swallow the
-    # ``_read_native`` mocks these tests install.
-    cog._read_to_grid = AsyncGeoTIFF._read_to_grid.__get__(cog)
-    cog._best_overview_for_resolution = (
-        AsyncGeoTIFF._best_overview_for_resolution.__get__(cog)
-    )
-    return cog
+    # A real dataset, not a MagicMock: merge calls ``cog.count`` and the read
+    # helpers, so this drops the hand-binding a mock needed to stand in.
+    return AsyncGeoTIFF("s3://bucket/cog.tif", gt)
 
 
 def _make_array(
@@ -671,7 +659,7 @@ def _make_windowed_cog(
         transform = gt.transform * Affine.translation(win.col_off, win.row_off)
         return _make_array(data, transform, geotiff=gt)
 
-    cog._read_native = _read_native
+    cog._read_native = _read_native  # type: ignore[method-assign]
     return cog
 
 
@@ -814,7 +802,7 @@ class TestMergeGridInvariance:
 
     async def test_non_square_source_is_resampled(self):
         cog = _make_windowed_cog(origin_x=-10.0, width=30, value=1)
-        gt = cog._geotiff
+        gt: Any = cog._geotiff  # a MagicMock header, mutable unlike the contract
         gt.transform = Affine(1.0, 0, -10.0, 0, -2.0, 15.0)
         gt.res = (1.0, 2.0)
         gt.bounds = (-10.0, 15.0 - 2.0 * gt.height, -10.0 + gt.width, 15.0)
@@ -938,6 +926,7 @@ class TestMergeConcurrencyInvariance:
         # The first batch (size 4) covers the full output, so the early-exit
         # check between batches should prevent later batches from being read.
         cogs = [_make_strip_cog(0.0, value=i + 1) for i in range(12)]
+        spies = [spy_read_native(cog) for cog in cogs]
 
         await merge(
             cogs,
@@ -951,7 +940,7 @@ class TestMergeConcurrencyInvariance:
         )
 
         # First batch (4 COGs) should be read; subsequent 8 should not.
-        called = [c._read_native.await_count for c in cogs]
+        called = [len(spy) for spy in spies]
         assert called[:4] == [1, 1, 1, 1]
         assert called[4:] == [0] * 8
 

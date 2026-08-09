@@ -44,6 +44,10 @@ raster_array = await src.read(
 )
 ```
 
+### Dataset metadata
+
+`src.profile` returns the header's metadata as one dict — grid, CRS, dtype, nodata, bounds, overviews — costing no request. Keys and caveats are documented on `rastera.RasterProfile`.
+
 ### Merge to mosaic
 
 ```python

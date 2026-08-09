@@ -6,7 +6,7 @@ from collections import OrderedDict
 from collections.abc import Sequence
 from dataclasses import dataclass
 from dataclasses import replace as dc_replace
-from typing import Any, TypedDict, overload
+from typing import Any, Protocol, TypedDict, cast, overload
 
 import numpy as np
 from affine import Affine
@@ -25,6 +25,7 @@ from .geo import (
     validate_resolution,
     window_from_bbox,
 )
+from .profile import RasterProfile, _build_profile
 from .resampling import (
     ResamplingMethod,
     _kernel_halo,
@@ -53,15 +54,22 @@ class AsyncGeoTIFF:
     def __init__(
         self,
         uri: str,
-        geotiff: GeoTIFF,
+        geotiff: _GeoTIFFLike,
         *,
         meta_overrides: MetaOverrides | None = None,
     ):
         self.uri = uri
         self._geotiff = geotiff
         resolved = _resolve_meta_overrides(meta_overrides)
+        # Kept apart from ``_crs_epsg``, which conflates "the caller declared
+        # this" with "the file resolved to this". ``_resolved_crs`` needs the
+        # difference: an override is the one case where reading ``geotiff.crs``
+        # is both lossy and liable to raise.
+        self._crs_override: int | None = resolved.get("crs")
         self._crs_epsg: int | None = (
-            resolved["crs"] if "crs" in resolved else geotiff.crs.to_epsg()
+            self._crs_override
+            if self._crs_override is not None
+            else geotiff.crs.to_epsg()
         )
         self._nodata: int | float | None = _coerce_nodata(geotiff.nodata, geotiff.dtype)
 
@@ -85,9 +93,32 @@ class AsyncGeoTIFF:
     def count(self) -> int:
         return self._geotiff.count
 
+    @property
+    def profile(self) -> RasterProfile:
+        """Everything this dataset's header says about it, as one dict.
+
+        See ``RasterProfile`` for the keys and their caveats.
+        """
+        return _build_profile(self)
+
+    @property
+    def _resolved_crs(self) -> CRS:
+        """``profile["crs"]``: the file's own CRS, not one rebuilt from its
+        EPSG code, since ``to_epsg()`` matches at 70% confidence and would
+        relabel a near-miss WKT. An override wins and is read without touching
+        the file's — geo keys that don't parse are what it exists for."""
+        if self._crs_override is not None:
+            return CRS.from_epsg(self._crs_override)
+        return self._geotiff.crs
+
     def _best_overview_for_resolution(self, target_resolution: float):
         """Return the Overview whose resolution is closest to *target_resolution*
-        without being coarser. Returns None to use full resolution."""
+        without being coarser. Returns None to use full resolution.
+
+        Reads the pyramid off ``_geotiff``, not ``self.overviews``: this needs
+        readable ``Overview`` objects, while ``self.overviews`` holds (width,
+        height) pairs and is emptied by both VRT flavours.
+        """
         native_res = self._geotiff.res[0]
         valid = [
             (o, native_res * (self._geotiff.width / o.width))
@@ -223,7 +254,7 @@ class AsyncGeoTIFF:
                 :func:`rastera.resampling.resample` for the precise rules.
         """
         gt = self._geotiff
-        band_indices = normalize_band_indices(band_indices, gt.count)
+        band_indices = normalize_band_indices(band_indices, self.count)
         if window is not None and bbox is not None:
             raise ValueError("Cannot specify both bbox and window")
         if bbox is not None and bbox_crs is None:
@@ -515,7 +546,9 @@ class AsyncGeoTIFF:
             assert bbox is not None
             window = window_from_bbox(readable, bbox, snap_to_grid=snap_to_grid)
 
-        result = await readable.read(window=window)
+        # ``_GeoTIFFLike`` carries no ``read``. The datasets that synthesize
+        # their ``_geotiff`` override ``_read_native``, so this is always real.
+        result = await cast("_Readable", readable).read(window=window)
 
         if band_indices is not None:
             result = dc_replace(
@@ -549,7 +582,7 @@ class AsyncGeoTIFF:
             result = dc_replace(result, _geotiff=geotiff_ref)
         return result
 
-    def _output_geotiff_ref(self, out_crs: int | None) -> GeoTIFF | _CrsNodata:
+    def _output_geotiff_ref(self, out_crs: int | None) -> _GeoTIFFLike | _CrsNodata:
         """What ``RasterArray.crs``/``.nodata`` should read off for our output.
 
         The real GeoTIFF whenever it already agrees, so ``arr._geotiff`` stays
@@ -560,11 +593,19 @@ class AsyncGeoTIFF:
         reporting ``nodata=-9999`` and crashes ``as_masked()``.
         """
         gt = self._geotiff
-        if out_crs == gt.crs.to_epsg() and _same_nodata(self._nodata, gt.nodata):
+        # An override skips the agreement check rather than running it: asking
+        # the file would raise on exactly the unparseable geo keys the
+        # override replaces. An override that happens to match the file just
+        # gets the stub, which carries everything the output reads.
+        if (
+            self._crs_override is None
+            and out_crs == gt.crs.to_epsg()
+            and _same_nodata(self._nodata, gt.nodata)
+        ):
             return gt
-        # No EPSG to build from means no override was given, so the file's own
-        # CRS object is the resolved one — possibly a WKT that has no code.
-        crs = CRS.from_epsg(out_crs) if out_crs is not None else gt.crs
+        # No EPSG to build from leaves whatever this dataset resolved to —
+        # possibly a WKT that has no code.
+        crs = CRS.from_epsg(out_crs) if out_crs is not None else self._resolved_crs
         return _CrsNodata(crs, self._nodata)
 
     def __repr__(self) -> str:
@@ -729,6 +770,57 @@ def set_cache_size(n: int) -> None:
 # ---- Internal helpers for constructing output Arrays ----
 
 
+class _Readable(Protocol):
+    """The one member ``_GeoTIFFLike`` withholds: the pixel fetch."""
+
+    async def read(self, *, window: Window | None = None) -> RasterArray: ...
+
+
+class _OverviewLike(_Readable, Protocol):
+    """One level of a real file's pyramid — readable, unlike its parent header."""
+
+    @property
+    def width(self) -> int: ...
+    @property
+    def height(self) -> int: ...
+    @property
+    def res(self) -> tuple[float, float]: ...
+    @property
+    def bounds(self) -> tuple[float, float, float, float]: ...
+
+
+class _GeoTIFFLike(Protocol):
+    """The ``self._geotiff`` contract: header metadata, no I/O.
+
+    Only plain files hold a real ``async_geotiff.GeoTIFF``; the VRT and DIMAP
+    datasets synthesize theirs (``_VirtualGeoTIFF``). Reading anything wider
+    than this raises ``AttributeError`` on those, and annotating the attribute
+    ``GeoTIFF`` is what let that pass unchecked — so widening this Protocol
+    means every synthesized dataset must supply the new field.
+    """
+
+    @property
+    def count(self) -> int: ...
+    @property
+    def crs(self) -> CRS: ...
+    @property
+    def nodata(self) -> float | None: ...
+    @property
+    def dtype(self) -> np.dtype[Any] | None: ...
+    @property
+    def width(self) -> int: ...
+    @property
+    def height(self) -> int: ...
+    @property
+    def res(self) -> tuple[float, float]: ...
+    @property
+    def bounds(self) -> tuple[float, float, float, float]: ...
+    @property
+    def transform(self) -> Affine: ...
+    @property
+    def overviews(self) -> Sequence[_OverviewLike]: ...
+
+
 @dataclass(frozen=True, slots=True)
 class _CrsNodata:
     """Stub standing in for ``_geotiff`` on constructed RasterArray objects."""
@@ -758,7 +850,7 @@ def _make_output_array(
     transform: Affine,
     width: int,
     height: int,
-    geotiff: GeoTIFF | _CrsNodata,
+    geotiff: _GeoTIFFLike | _CrsNodata,
 ) -> RasterArray:
     return RasterArray(
         data=data,

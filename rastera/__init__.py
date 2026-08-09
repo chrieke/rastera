@@ -8,6 +8,7 @@ from async_tiff.store import S3Store  # type: ignore[import-untyped]
 from .config import set_concurrency, set_warp_strategy
 from .geo import BBox, snapped_grid_for_bbox
 from .merge import merge
+from .profile import RasterProfile
 from .reader import AsyncGeoTIFF, clear_cache, open, set_cache_size
 
 if TYPE_CHECKING:
@@ -20,6 +21,7 @@ __all__ = [
     "BBox",
     "RasterArray",
     "AsyncGeoTIFF",
+    "RasterProfile",
     "S3Store",
     "Window",
     "clear_cache",
