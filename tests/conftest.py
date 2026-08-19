@@ -65,14 +65,18 @@ def make_mock_geotiff(
     crs_epsg: int | None = 32632,
     origin_x: float = 0.0,
     origin_y: float | None = None,
+    y_scale: float | None = None,
 ) -> MagicMock:
     """Build a mock async_geotiff.GeoTIFF.
 
     *origin_y* defaults to the north edge of a scene whose south edge sits on
     zero, so the default grid is the familiar (0, 0, w*scale, h*scale) box.
+    *y_scale* defaults to *scale*; pass it to build a non-square-pixel source.
     """
+    if y_scale is None:
+        y_scale = scale
     if origin_y is None:
-        origin_y = height * scale
+        origin_y = height * y_scale
 
     gt = MagicMock(spec=_GEOTIFF_ATTRS)
     gt.width = width
@@ -83,8 +87,8 @@ def make_mock_geotiff(
     gt.tile_width = tile_width
     gt.tile_height = tile_height
 
-    gt.transform = Affine(scale, 0, origin_x, 0, -scale, origin_y)
-    gt.res = (scale, scale)
+    gt.transform = Affine(scale, 0, origin_x, 0, -y_scale, origin_y)
+    gt.res = (scale, y_scale)
 
     crs_mock = MagicMock()
     crs_mock.to_epsg.return_value = crs_epsg
@@ -92,7 +96,7 @@ def make_mock_geotiff(
 
     gt.bounds = (
         origin_x,
-        origin_y - height * scale,
+        origin_y - height * y_scale,
         origin_x + width * scale,
         origin_y,
     )

@@ -274,8 +274,12 @@ class AsyncGeoTIFF:
             target_crs = _normalize_crs(target_crs)
 
         needs_reproject = target_crs is not None and target_crs != self._crs_epsg
-        needs_resample = target_resolution is not None and not math.isclose(
-            target_resolution, gt.res[0]
+        # Both axes: a source with non-square pixels matching *target_resolution*
+        # on x alone still has to be resampled, or the rows come back at the
+        # source's y resolution while the caller is told they are square.
+        needs_resample = target_resolution is not None and not (
+            math.isclose(target_resolution, gt.res[0])
+            and math.isclose(target_resolution, gt.res[1])
         )
         # bbox + explicit resolution names an output lattice; only then does
         # snap_to_grid mean "snap the output onto resolution multiples".
@@ -286,9 +290,10 @@ class AsyncGeoTIFF:
         use_native = not needs_reproject and not needs_resample
         if use_native and snap:
             # A 1:1 window copy lands on the lattice only if the source grid
-            # is on it: origin on multiples of the resolution, unrotated,
-            # north-up and square (needs_resample checks the x axis only;
-            # a negative -e can never isclose a positive resolution).
+            # is on it: origin on multiples of the resolution, unrotated and
+            # north-up. ``needs_resample`` already matched both axes' *sizes*;
+            # the -e test here is about the y axis' *sign*, since a south-up
+            # grid's positive e can never isclose a positive resolution.
             assert target_resolution is not None
             t = gt.transform
             use_native = (
