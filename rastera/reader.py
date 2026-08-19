@@ -15,6 +15,7 @@ from pyproj import CRS, Transformer
 
 from .geo import (
     BBox,
+    WindowOutOfRangeError,
     _is_on_res_grid,
     _normalize_crs,
     bounds_from_transform,
@@ -228,16 +229,25 @@ class AsyncGeoTIFF:
                 multiples of ``target_resolution`` — see
                 :func:`rastera.snapped_grid_for_bbox`. Transform and shape
                 are then a pure function of bbox and resolution; sources
-                already on that grid are copied 1:1 (clipped to the dataset
-                extent), anything else is resampled onto it, shifting
-                values by up to half a pixel. Without *target_resolution*
-                the window snaps outward on the source grid instead — a 1:1
-                copy of the stored pixels. When False, the transform is
-                anchored at ``bbox``. A native read then matches its extent
-                to within half a pixel —
+                already on that grid are copied 1:1, anything else is
+                resampled onto it, shifting values by up to half a pixel.
+                Without *target_resolution* the window snaps outward on the
+                source grid instead — a 1:1 copy of the stored pixels. When
+                False, the transform is anchored at ``bbox``. A native read
+                then matches its extent to within half a pixel —
                 ``rasterio.read(window=from_bounds(...))`` behaviour; a
                 resampled one is ceil-sized, so the max edges can overhang
                 ``bbox`` by up to a pixel.
+
+                Within one CRS the result is clipped to the dataset either
+                way, so a bbox reaching past the edge comes back smaller
+                rather than padded — ``rasterio.read``'s default, where
+                padding is ``boundless=True``. A reprojecting read is not
+                clipped, matching ``gdalwarp -te``: it returns the whole grid
+                the bbox names, and the pixels with no source behind them
+                carry the dataset's ``nodata``, or 0 where it declares none.
+                Reprojecting leaves some of those regardless, since the grid
+                is the envelope of a footprint that arrives rotated.
             use_overviews: When True, reads from pre-computed COG overview
                 levels to save bandwidth, and only when the read actually
                 changes resolution — a native-resolution or purely
@@ -382,6 +392,23 @@ class AsyncGeoTIFF:
         region entirely.
         """
         gt = self._geotiff
+        # A window naming pixels the image does not have is a mistake, not a
+        # request to pad. The native path already says so — async-geotiff
+        # rejects the window it is handed — but this path converts the window to
+        # world coordinates first, so nothing downstream ever saw it and an
+        # oversized one came back silently resampled to the larger shape.
+        if (
+            window.col_off < 0
+            or window.row_off < 0
+            or window.col_off + window.width > gt.width
+            or window.row_off + window.height > gt.height
+        ):
+            raise ValueError(
+                f"Window extends outside image bounds. Window: "
+                f"cols={window.col_off}:{window.col_off + window.width}, "
+                f"rows={window.row_off}:{window.row_off + window.height}. "
+                f"Image: {gt.width}x{gt.height}."
+            )
         target_bbox = bounds_from_transform(
             gt.transform * Affine.translation(window.col_off, window.row_off),
             window.width,
@@ -432,6 +459,23 @@ class AsyncGeoTIFF:
             target_bbox = transform_bbox(BBox(*gt.bounds), src_crs, out_crs)
         else:
             target_bbox = BBox(*gt.bounds)
+
+        # Clip to the dataset, matching the native path (see read()'s docstring
+        # for the semantics). The *bbox* and not the grid, so the result stays an
+        # integer-pixel sub-window of the unclipped grid and
+        # ``snapped_grid_for_bbox``'s lattice still describes it.
+        #
+        # Same CRS only. The native path this agrees with is itself unreachable
+        # when reprojecting, so that is the whole of the disagreement — and
+        # clipping a warp would mean transforming the dataset's extent into
+        # *out_crs*, which ``transform_bounds`` under-reports badly for a wide
+        # source: a global EPSG:4326 extent comes back as x ∈ [500000, 1505647]
+        # in UTM32N, rejecting any AOI west of the central meridian.
+        if bbox is not None and not needs_reproject:
+            clipped = target_bbox.intersect(BBox(*gt.bounds))
+            if clipped is None:
+                raise WindowOutOfRangeError("BBox does not intersect image")
+            target_bbox = clipped
 
         if target_resolution is not None:
             res = target_resolution

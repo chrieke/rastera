@@ -12,7 +12,12 @@ from pyproj import CRS
 
 import rastera
 from rastera.formats.dimap import _DIMAPDataset
-from rastera.geo import BBox, snapped_grid_for_bbox, transform_bbox
+from rastera.geo import (
+    BBox,
+    WindowOutOfRangeError,
+    snapped_grid_for_bbox,
+    transform_bbox,
+)
 from rastera.profile import RasterProfile
 from rastera.reader import (
     AsyncGeoTIFF,
@@ -739,6 +744,71 @@ class TestReadGridInvariance:
         corners = (data[0, 0, 0], data[0, 0, -1], data[0, -1, 0], data[0, -1, -1])
         assert corners == (0, 0, 0, 0)
         assert data[0, data.shape[1] // 2, data.shape[2] // 2] == 100
+
+    @pytest.mark.parametrize("res", [1.0, 2.0])
+    async def test_oversized_bbox_clips_to_the_dataset(self, res: float):
+        # res 1.0 takes the native path, 2.0 the resampled one. Only the native
+        # one clipped, so the same bbox described two different extents — and
+        # the resampled grid's pixels beyond the file came from the kernel
+        # clamping at the edge.
+        obj = self._obj()  # 20x20 at 1.0, world (0, 0, 20, 20)
+        result = await obj.read(
+            bbox=(-20.0, -20.0, 40.0, 40.0), bbox_crs=32632, target_resolution=res
+        )
+        assert tuple(result.bounds) == (0.0, 0.0, 20.0, 20.0)
+        assert (result.width, result.height) == (20 / res, 20 / res)
+
+    async def test_reprojecting_read_is_not_clipped_to_the_extent(self):
+        """A reprojecting warp must not clip, for the reason ``gdalwarp -te``
+        does not: the extent would have to be transformed into the target CRS,
+        and ``transform_bounds`` under-reports a wide one badly. A global
+        EPSG:4326 extent comes back as x in [500000, 1505647] in UTM32N, so
+        clipping against it threw away every AOI west of the central meridian.
+        """
+        gt = make_mock_geotiff(
+            width=360, height=180, scale=1.0, count=1, tile_width=360, crs_epsg=4326
+        )
+        gt.transform = Affine(1, 0, -180, 0, -1, 90)
+        gt.bounds = (-180.0, -90.0, 180.0, 90.0)
+        gt.read = slicing_read(gt, np.full((1, 180, 360), 7, np.uint16))
+        obj = AsyncGeoTIFF("s3://b/global.tif", gt)
+
+        # 200000 and 300000 are west of UTM32N's false easting, well inside the
+        # zone and covered by a global source.
+        for minx in (200000.0, 300000.0, 600000.0):
+            result = await obj.read(
+                bbox=(minx, 5000000.0, minx + 40000.0, 5040000.0),
+                bbox_crs=32632,
+                target_crs=32632,
+                target_resolution=1000.0,
+            )
+            data: np.ndarray[Any, Any] = result.data  # type: ignore[reportUnknownMemberType]
+            assert data.shape == (1, 40, 40), minx
+            assert (data == 7).all(), minx
+
+    async def test_oversized_window_is_rejected_on_both_paths(self):
+        """The native path lets async-geotiff reject the window it is handed.
+        The resampled path resolves the window to world coordinates first, so
+        nothing downstream ever saw it and an oversized one came back silently
+        resampled to the larger shape.
+        """
+        obj = self._obj()  # 20x20
+        window = Window(col_off=0, row_off=0, width=30, height=30)
+        # res 1.0 is the native path (async-geotiff's own WindowError, whose
+        # class is not importable), 2.0 the resampled one.
+        for res in (1.0, 2.0):
+            with pytest.raises(Exception, match="outside image bounds"):
+                await obj.read(window=window, target_resolution=res)
+
+    async def test_disjoint_bbox_raises_on_both_paths(self):
+        obj = self._obj()
+        for res in (1.0, 2.0):
+            with pytest.raises(WindowOutOfRangeError, match="does not intersect"):
+                await obj.read(
+                    bbox=(100.0, 100.0, 200.0, 200.0),
+                    bbox_crs=32632,
+                    target_resolution=res,
+                )
 
     async def test_bare_bbox_read_keeps_the_source_window(self):
         # No target_resolution names no lattice: the read stays a 1:1 copy
