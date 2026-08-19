@@ -238,7 +238,10 @@ class AsyncGeoTIFF:
                 resampled one is ceil-sized, so the max edges can overhang
                 ``bbox`` by up to a pixel.
             use_overviews: When True, reads from pre-computed COG overview
-                levels to save bandwidth. Overview pixels are resampled
+                levels to save bandwidth, and only when the read actually
+                changes resolution — a native-resolution or purely
+                reprojecting read ignores it, since every overview is coarser
+                than what such a read asks for. Overview pixels are resampled
                 aggregates, not original measurements — expect reduced
                 variance, dampened extremes, and altered spectral ratios
                 compared to full-resolution data. Suitable for thumbnails
