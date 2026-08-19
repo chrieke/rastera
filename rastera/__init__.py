@@ -6,10 +6,11 @@ from async_geotiff import RasterArray, Window
 from async_tiff.store import S3Store  # type: ignore[import-untyped]
 
 from .config import set_concurrency, set_warp_strategy
-from .geo import BBox, snapped_grid_for_bbox
+from .geo import BBox, WindowOutOfRangeError, snapped_grid_for_bbox
 from .merge import merge
 from .profile import RasterProfile
 from .reader import AsyncGeoTIFF, clear_cache, open, set_cache_size
+from .resampling import ResamplingMethod
 
 if TYPE_CHECKING:
     # ``as`` marks these re-exported without __all__, which would make
@@ -22,8 +23,14 @@ __all__ = [
     "RasterArray",
     "AsyncGeoTIFF",
     "RasterProfile",
+    "ResamplingMethod",
     "S3Store",
     "Window",
+    # Raised by read() when a bbox misses the image, which is ordinary when
+    # walking an AOI over a tile set — exported so that case can be caught
+    # without a bare `except ValueError` swallowing the argument-validation
+    # errors alongside it.
+    "WindowOutOfRangeError",
     "clear_cache",
     "set_cache_size",
     "set_concurrency",

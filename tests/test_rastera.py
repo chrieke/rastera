@@ -192,6 +192,25 @@ def test_profile_is_reachable_on_synthesized_datasets(flavour: str) -> None:
     assert set(RasterProfile.__required_keys__) <= set(profile)
 
 
+# ── the public namespace ────────────────────────────────────────────────
+
+
+class TestPublicExports:
+    def test_all_names_resolve(self):
+        for name in rastera.__all__:
+            assert getattr(rastera, name, None) is not None, name
+
+    async def test_missed_bbox_is_catchable_from_the_top_level(self):
+        """A bbox that misses a tile is ordinary when walking an AOI over a tile
+        set, so it must be catchable by name rather than as a bare ValueError
+        alongside every argument-validation error."""
+        gt = make_mock_geotiff(width=4, height=4, scale=10.0, count=1, tile_width=4)
+        gt.read = slicing_read(gt, np.zeros((1, 4, 4), np.uint16))
+        obj = AsyncGeoTIFF("s3://b/k.tif", gt)
+        with pytest.raises(rastera.WindowOutOfRangeError):
+            await obj.read(bbox=(1e6, 1e6, 1e6 + 10, 1e6 + 10), bbox_crs=32632)
+
+
 # ── open() classmethod ──────────────────────────────────────────────────
 
 
