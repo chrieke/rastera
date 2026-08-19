@@ -649,6 +649,46 @@ class TestReadGridInvariance:
         assert self._grid(result) == self.GRID
         assert calls
 
+    @staticmethod
+    def _non_square_obj() -> AsyncGeoTIFF:
+        """20x10 px at 1.0 x 2.0, so world bounds are the square (0, 0, 20, 20)."""
+        gt = make_mock_geotiff(
+            width=20, height=10, scale=1.0, y_scale=2.0, count=1, tile_width=20
+        )
+        gt.read = slicing_read(gt, np.ones((1, 10, 20), np.uint16))
+        return AsyncGeoTIFF("s3://b/k.tif", gt)
+
+    async def test_non_square_source_resamples_for_a_window_read(self):
+        # target_resolution was matched against res[0] alone, so a source
+        # already 1.0 wide took the native path and kept its 2.0-tall rows.
+        obj = self._non_square_obj()
+        result = await obj.read(
+            window=Window(col_off=0, row_off=0, width=20, height=10),
+            target_resolution=1.0,
+        )
+        assert self._grid(result) == (Affine(1, 0, 0.0, 0, -1, 20.0), 20, 20)
+
+    async def test_non_square_source_resamples_when_unsnapped(self):
+        obj = self._non_square_obj()
+        result = await obj.read(
+            bbox=(0.0, 0.0, 20.0, 20.0),
+            bbox_crs=32632,
+            target_resolution=1.0,
+            snap_to_grid=False,
+        )
+        assert self._grid(result) == (Affine(1, 0, 0.0, 0, -1, 20.0), 20, 20)
+
+    async def test_square_source_still_copies_natively(self):
+        # The guard against over-correcting: res[1] now participates, so a
+        # square source must not be pushed off its own fast path.
+        obj = self._obj()
+        calls = spy_read_to_grid(obj)
+        await obj.read(
+            window=Window(col_off=0, row_off=0, width=20, height=20),
+            target_resolution=1.0,
+        )
+        assert not calls
+
     async def test_bare_bbox_read_keeps_the_source_window(self):
         # No target_resolution names no lattice: the read stays a 1:1 copy
         # on the source grid, phase and all (clipped at the tile's bottom
