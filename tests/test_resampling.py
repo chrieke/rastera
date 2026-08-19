@@ -761,6 +761,87 @@ class TestTwoPassReproject:
         assert np.abs(two[0][coverage] - single[0][coverage]).max() < 1e-3
 
 
+# ── pixels outside the source extent ─────────────────────────────────────
+
+
+def _rotated_footprint_setup(
+    src_res: float = 10.0, dst_res: float = 10.0, n: int = 64
+) -> tuple[np.ndarray[Any, Any], Affine, Affine, int, int, Transformer]:
+    """A constant-valued UTM32N square + the *full* EPSG:3006 envelope over it.
+
+    UTM33N/3006 share a central meridian, so ``TestTwoPassReproject``'s pair
+    barely rotates. UTM32N → 3006 crosses six degrees of convergence, so the
+    footprint arrives visibly rotated inside its own envelope and the envelope's
+    corners fall outside the source — which is what exercises the out-of-source
+    gate. The destination is also not padded inwards as ``_cross_setup``'s is.
+
+    The source is constant, so any value that is neither the constant nor the
+    fill is the kernel having invented something.
+    """
+    arr = np.full((1, n, n), 100, dtype=np.uint16)
+    x0, y0 = 600000.0, 6600000.0 + n * src_res
+    src_t = Affine(src_res, 0, x0, 0, -src_res, y0)
+    fwd = Transformer.from_crs(32632, 3006, always_xy=True)
+    gx, gy = np.meshgrid([x0, x0 + n * src_res], [y0 - n * src_res, y0])
+    ux, uy = fwd.transform(gx.ravel(), gy.ravel())
+    dw = int((ux.max() - ux.min()) // dst_res)
+    dh = int((uy.max() - uy.min()) // dst_res)
+    dst_t = Affine(dst_res, 0, ux.min(), 0, -dst_res, uy.min() + dh * dst_res)
+    return arr, src_t, dst_t, dw, dh, Transformer.from_crs(3006, 32632, always_xy=True)
+
+
+class TestOutOfSourceFill:
+    """A dst pixel whose centre falls outside the source is filled — with the
+    sentinel when there is one, otherwise 0.
+
+    Without a sentinel this used to edge-clamp, so the whole envelope around a
+    rotated footprint came back holding the footprint's edge values.
+    """
+
+    @pytest.mark.parametrize("method", ["nearest", "bilinear", "cubic"])
+    def test_same_crs_beyond_the_source_is_zero(self, method: ResamplingMethod):
+        arr, src_t = _src_grid(4)
+        # Shifted right by 20 m, so the last two columns have no source behind.
+        dst_t = Affine(10, 0, 20, 0, -10, 40)
+        out = resample(arr, src_t, dst_t, 4, 4, None, None, method)
+        assert (out[0, :, 2:] == 0).all()
+        assert (out[0, :, :2] != 0).any()
+
+    @pytest.mark.parametrize("method", ["nearest", "bilinear", "cubic"])
+    def test_cross_crs_envelope_corners_are_zero(self, method: ResamplingMethod):
+        arr, st, dt, dw, dh, T = _rotated_footprint_setup()
+        out = resample(arr, st, dt, dw, dh, None, T, method)
+        corners = (out[0, 0, 0], out[0, 0, -1], out[0, -1, 0], out[0, -1, -1])
+        assert corners == (0, 0, 0, 0)
+        assert out[0, dh // 2, dw // 2] == 100
+
+    def test_fill_region_is_the_same_with_and_without_a_sentinel(self):
+        # Only the value written differs; which pixels get it does not. Nearest
+        # so the comparison is not blurred by the kernels' extra nodata gates.
+        arr, st, dt, dw, dh, T = _rotated_footprint_setup()
+        no_sentinel = resample(arr, st, dt, dw, dh, None, T, "nearest")
+        # 1 is absent from the constant-100 source, so it marks only the fill.
+        sentinel = resample(arr, st, dt, dw, dh, 1, T, "nearest")
+        np.testing.assert_array_equal(no_sentinel == 0, sentinel == 1)
+
+    @pytest.mark.parametrize("method", ["bilinear", "cubic"])
+    def test_two_pass_has_no_zero_fringe(self, method: ResamplingMethod):
+        # The gate has to run once at the end, against the true source. Applying
+        # it inside Pass A fills that pass's halo instead, and Pass B averages
+        # those zeros into legitimate edge pixels — a full-signal ring, not a
+        # rounding artifact. Over a constant source the two strategies have
+        # nothing to disagree about, so any difference is that fringe.
+        arr, st, dt, dw, dh, T = _rotated_footprint_setup(
+            src_res=10.0, dst_res=30.0, n=192
+        )
+        kw: dict[str, Any] = dict(transformer=T, method=method)
+        sp = resample(arr, st, dt, dw, dh, warp_strategy="single_pass", **kw)
+        tp = resample(arr, st, dt, dw, dh, warp_strategy="auto", **kw)
+        np.testing.assert_array_equal(tp, sp)
+        assert tp[0, dh // 2, dw // 2] == 100
+        assert tp[0, 0, 0] == 0
+
+
 # ── input validation ─────────────────────────────────────────────────────
 
 

@@ -12,7 +12,7 @@ from pyproj import CRS
 
 import rastera
 from rastera.formats.dimap import _DIMAPDataset
-from rastera.geo import BBox, snapped_grid_for_bbox
+from rastera.geo import BBox, snapped_grid_for_bbox, transform_bbox
 from rastera.profile import RasterProfile
 from rastera.reader import (
     AsyncGeoTIFF,
@@ -707,6 +707,38 @@ class TestReadGridInvariance:
             target_resolution=1.0,
         )
         assert not calls
+
+    @pytest.mark.parametrize("nodata", [None, 0])
+    async def test_reprojected_footprint_corners_are_empty(self, nodata: int | None):
+        # The output grid is the axis-aligned envelope of a rotated footprint,
+        # so its corners are inside the bbox and outside the file. With no
+        # declared sentinel those corners used to come back holding the
+        # footprint's own edge values.
+        n, res = 32, 10.0
+        gt = make_mock_geotiff(
+            width=n,
+            height=n,
+            scale=res,
+            count=1,
+            tile_width=n,
+            nodata=nodata,
+            crs_epsg=32632,
+            origin_x=600000.0,
+            origin_y=6600000.0 + n * res,
+        )
+        gt.read = slicing_read(gt, np.full((1, n, n), 100, np.uint16))
+        obj = AsyncGeoTIFF("s3://b/k.tif", gt)
+
+        # UTM32N -> SWEREF99 TM is six degrees of convergence, so the footprint
+        # arrives visibly rotated inside its envelope.
+        bbox = transform_bbox(BBox(*gt.bounds), 32632, 3006)
+        result = await obj.read(
+            bbox=bbox, bbox_crs=3006, target_crs=3006, target_resolution=res
+        )
+        data: np.ndarray[Any, Any] = result.data  # type: ignore[reportUnknownMemberType]
+        corners = (data[0, 0, 0], data[0, 0, -1], data[0, -1, 0], data[0, -1, -1])
+        assert corners == (0, 0, 0, 0)
+        assert data[0, data.shape[1] // 2, data.shape[2] // 2] == 100
 
     async def test_bare_bbox_read_keeps_the_source_window(self):
         # No target_resolution names no lattice: the read stays a 1:1 copy
