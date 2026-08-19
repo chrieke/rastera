@@ -2,6 +2,7 @@
 
 import asyncio
 from collections.abc import Callable
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -942,22 +943,33 @@ class TestDIMAPRead:
         assert open_count == 1  # tile (1,1) of group 0 opened exactly once
 
 
-def _fake_first_tile(nodata: int | float | None = 0) -> Any:
-    """Minimal stand-in for the pre-opened first tile supplied to
-    ``_DIMAPDataset`` by ``_maybe_open_dimap``. Only ``_nodata`` is read
-    on the open path."""
+def _fake_first_tile(
+    nodata: int | float | None = 0,
+    dtype: np.dtype[Any] = np.dtype("uint16"),
+    count: int = 4,
+    width: int = 400,
+    height: int = 500,
+) -> Any:
+    """Stand-in for the pre-opened first tile supplied to ``_DIMAPDataset`` by
+    ``_maybe_open_dimap``. Carries the ``_nodata`` the dataset inherits plus the
+    dtype/band-count/size ``_validate_first_tile`` checks against the
+    descriptor. The defaults agree with both fixtures' declared tiling — 400x500
+    uint16 — and with 4 bands, enough for PHR's NBANDS and PNEO's per-group 3."""
     tile = MagicMock(spec=AsyncGeoTIFF)
+    tile.uri = "s3://bucket/prod/R1C1.TIF"
     tile._nodata = nodata
+    tile.count = count
+    tile._geotiff = SimpleNamespace(dtype=dtype, width=width, height=height)
     return tile
 
 
-def _patch_sniff(nodata: int | float | None = 0) -> Any:
+def _patch_sniff(nodata: int | float | None = 0, **tile_kwargs: Any) -> Any:
     """Patch ``_sniff_first_tile`` to hand back a fake tile + key. Used
     by every test that exercises the open path but doesn't care about
     real tile TIFF I/O."""
 
     async def _fake(layout: Any, uri: str, kwargs: Any) -> Any:
-        return (0, 1, 1), _fake_first_tile(nodata=nodata)
+        return (0, 1, 1), _fake_first_tile(nodata=nodata, **tile_kwargs)
 
     return patch("rastera.formats.dimap._sniff_first_tile", new=_fake)
 
@@ -1019,6 +1031,45 @@ class TestDetection:
         assert ds._nodata == 65535
         # Pre-populated tile cache: no re-fetch when the first read hits (1,1).
         assert (0, 1, 1) in ds._tiles
+
+    async def _open_pneo(self, **tile_kwargs: Any) -> Any:
+        with (
+            patch(
+                "rastera.formats.dimap._fetch_descriptor_bytes",
+                new=AsyncMock(return_value=PNEO_DIMAP),
+            ),
+            _patch_sniff(**tile_kwargs),
+        ):
+            return await _maybe_open_dimap("s3://bucket/prod/DIM_PNEO.XML")
+
+    async def test_tile_dtype_must_match_the_declared_encoding(self):
+        """The mosaic is allocated in the declared dtype and tile pixels are
+        assigned into it, so a mismatch was a silent cast — uint16 300 landing
+        as 44 in a uint8 mosaic."""
+        with pytest.raises(ValueError, match="declares uint16"):
+            await self._open_pneo(dtype=np.dtype("uint8"))
+
+    async def test_tile_must_carry_the_bands_the_group_asks_for(self):
+        # Previously a bare NumPy IndexError from deep inside the paste loop.
+        with pytest.raises(ValueError, match=r"<BAND_INDEX>3 but tile"):
+            await self._open_pneo(count=2)
+
+    async def test_band_count_is_checked_per_group_not_in_total(self):
+        """PNEO declares 6 bands across two 3-band groups, so a 3-band RGB tile
+        is correct and must not be read as short by 3."""
+        ds = await self._open_pneo(count=3)
+        assert ds is not None
+        assert ds.count == 6
+
+    async def test_tile_smaller_than_the_declared_tiling_is_rejected(self):
+        with pytest.raises(ValueError, match="reads would run past its edge"):
+            await self._open_pneo(width=399)
+
+    async def test_padded_tile_is_accepted(self):
+        """A delivery may pad a tile beyond the declared size; the check is a
+        lower bound, so that stays readable."""
+        ds = await self._open_pneo(width=512, height=512)
+        assert ds is not None
 
     def test_missing_sign_defaults_to_unsigned(self):
         """Some older DIMAP deliveries omit the <SIGN> element. Treat a
@@ -1118,6 +1169,39 @@ class TestReadDefaults:
         expected = [1, 2, 3, 101, 102, 103]
         for i, tag in enumerate(expected):
             np.testing.assert_array_equal(data[i], tag)
+
+    @pytest.mark.parametrize(
+        ("bbox", "want_origin"),
+        [
+            # Inside the mosaic: the transform anchors on the bbox itself,
+            # rather than on the pixel-snapped window origin.
+            ((369517.0, 6447100.0, 369520.0, 6447185.0), (369517.0, 6447185.0)),
+            # Overhanging the north-west corner: the window was clipped to the
+            # mosaic, so anchoring on the bbox would label the pixels somewhere
+            # they are not. Clamps to the mosaic origin instead.
+            ((369000.0, 6447100.0, 369520.0, 6448000.0), (369516.0, 6447186.0)),
+        ],
+    )
+    async def test_unsnapped_transform_anchors_on_the_bbox(
+        self,
+        bbox: tuple[float, float, float, float],
+        want_origin: tuple[float, float],
+    ):
+        layout = _two_group_layout()
+        ds = _DIMAPDataset("/fake/DIM.xml", layout)
+
+        async def _get_tile(g: int, r: int, c: int) -> AsyncGeoTIFF:
+            return _mock_tile_ds(
+                lambda bands, w: np.zeros(
+                    (len(bands), w.height, w.width), dtype=np.uint16
+                )
+            )
+
+        ds._get_tile = _get_tile  # type: ignore[assignment]
+        arr = await ds._read_native(bbox=bbox, band_indices=[0], snap_to_grid=False)
+        assert (arr.transform.c, arr.transform.f) == want_origin
+        # The pixel size is the layout's, on both axes.
+        assert (arr.transform.a, arr.transform.e) == (0.3, -0.3)
 
     async def test_non_zero_nodata_fills_past_edge(self):
         """When the first tile carries a non-zero nodata (common for uint16

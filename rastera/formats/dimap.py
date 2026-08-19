@@ -339,6 +339,7 @@ async def _maybe_open_dimap(
         **store_kwargs,
     }
     first_key, first_tile = await _sniff_first_tile(layout, uri, tile_open_kwargs)
+    _validate_first_tile(layout, first_tile, first_key)
     return _DIMAPDataset(
         uri,
         layout,
@@ -774,6 +775,61 @@ def _tile_decomposition(layout: _DIMAPLayout, window: Window) -> list[_TileRead]
                 )
             )
     return reads
+
+
+def _validate_first_tile(
+    layout: _DIMAPLayout, tile: AsyncGeoTIFF, key: tuple[int, int, int]
+) -> None:
+    """Check the descriptor against the one tile that is already open.
+
+    The XML declares what the tiles hold and nothing verifies it, so a
+    descriptor that disagrees with its own imagery used to surface as corrupt
+    pixels or an error naming neither the tile nor the descriptor. This is
+    ``vrt.py``'s ``_validate_source_windows`` for DIMAP; only the tile
+    ``_sniff_first_tile`` already fetched is checked, so it costs no request.
+
+    Tiles disagreeing *among themselves* is out of scope — catching that means
+    opening all of them at open time, which is what the lazy tile cache exists
+    to avoid.
+    """
+    group_idx, tile_row, tile_col = key
+
+    if tile._geotiff.dtype != layout.dtype:
+        raise ValueError(
+            f"DIMAP declares {layout.dtype} (<DATA_TYPE>/<NBITS>/<SIGN>) but tile "
+            f"{tile.uri!r} is {tile._geotiff.dtype}. The mosaic is assembled in "
+            f"the declared dtype, so the tile's pixels would be cast into it "
+            f"silently — a uint16 value of 300 arriving as 44 in a uint8 mosaic."
+        )
+
+    # Per group, not the total: each group's BAND_INDEX values are 1-based
+    # within its own tiles, so a 6-band PNEO reads bands 1-3 of an RGB tile.
+    highest = max(
+        (b.source_band for b in layout.bands if b.group_index == group_idx),
+        default=0,
+    )
+    if highest > tile.count:
+        raise ValueError(
+            f"DIMAP band group {group_idx} asks for <BAND_INDEX>{highest} but tile "
+            f"{tile.uri!r} has {tile.count} band(s)."
+        )
+
+    # Lower bound only: a delivery is free to pad a tile beyond the declared
+    # size, and rejecting that would turn a readable product away. What matters
+    # is that the window ``_tile_decomposition`` will ask for exists.
+    want_w = min(tile_col * layout.tile_width, layout.width) - (
+        (tile_col - 1) * layout.tile_width
+    )
+    want_h = min(tile_row * layout.tile_height, layout.height) - (
+        (tile_row - 1) * layout.tile_height
+    )
+    if tile._geotiff.width < want_w or tile._geotiff.height < want_h:
+        raise ValueError(
+            f"DIMAP tiling implies tile ({tile_row},{tile_col}) covers "
+            f"{want_w}x{want_h} pixels, but {tile.uri!r} is "
+            f"{tile._geotiff.width}x{tile._geotiff.height}; reads would run past "
+            f"its edge. Check <NTILES_SIZE> against the delivered tiles."
+        )
 
 
 def _resolve_tile_uri(href: str, dimap_uri: str) -> str:
