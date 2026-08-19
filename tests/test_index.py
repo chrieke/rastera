@@ -11,6 +11,7 @@ box = pytest.importorskip("shapely.geometry").box
 
 from rastera.index import (  # noqa: E402
     HeaderCacheStore,
+    _read_geoparquet,
     build_index,
     open_from_index,
 )
@@ -371,6 +372,83 @@ class TestOpenFromIndex:
         result = await open_from_index(gdf, bbox=(0, 0, 1, 1), bbox_crs=4326)
 
         assert result == []
+
+
+class TestReadGeoparquet:
+    """Reading an index back off disk with a bbox.
+
+    ``header_bytes`` is picked by row *position*, so a slip here serves one
+    COG's header as another's — the failure ``_require_same_bucket`` guards
+    against on the URI side. Nothing covered this path before.
+    """
+
+    @staticmethod
+    def _write(path: Any, n: int = 5) -> Any:
+        """*n* rows with per-row header bytes, alternating between two
+        locations so a single bbox selects a non-contiguous set of positions."""
+        entries = [
+            {
+                "uri": f"s3://b/{i}.tif",
+                "header_bytes": bytes([i]) * 64,
+                "minx": 0 if i % 2 == 0 else 100,
+                "miny": 0,
+                "maxx": 1 if i % 2 == 0 else 101,
+                "maxy": 1,
+            }
+            for i in range(n)
+        ]
+        gdf = _make_index_gdf(entries)
+        gdf.to_parquet(path, row_group_size=2)
+        return gdf
+
+    @staticmethod
+    def _col(frame: Any, name: str) -> list[Any]:
+        values: list[Any] = frame[name].tolist()
+        return values
+
+    def test_no_bbox_reads_everything(self, tmp_path: Any) -> None:
+        path = str(tmp_path / "index.parquet")
+        self._write(path)
+        out = _read_geoparquet(path)
+        assert self._col(out, "uri") == [f"s3://b/{i}.tif" for i in range(5)]
+        assert self._col(out, "header_bytes") == [bytes([i]) * 64 for i in range(5)]
+
+    # 1024 is the shipped batch size; 2 forces the wanted rows to land in
+    # different batches, which is where the running offset can slip.
+    @pytest.mark.parametrize("batch_rows", [2, 1024])
+    def test_bbox_keeps_each_rows_own_header_bytes(
+        self, tmp_path: Any, monkeypatch: pytest.MonkeyPatch, batch_rows: int
+    ) -> None:
+        monkeypatch.setattr("rastera.index._HEADER_BATCH_ROWS", batch_rows)
+        path = str(tmp_path / "index.parquet")
+        self._write(path)
+        out = _read_geoparquet(path, bbox=(99, -1, 102, 2), bbox_crs=4326)
+        assert self._col(out, "uri") == ["s3://b/1.tif", "s3://b/3.tif"]
+        assert self._col(out, "header_bytes") == [bytes([1]) * 64, bytes([3]) * 64]
+
+    def test_bbox_matching_nothing_returns_empty(self, tmp_path: Any) -> None:
+        path = str(tmp_path / "index.parquet")
+        self._write(path)
+        out = _read_geoparquet(path, bbox=(500, 500, 501, 501), bbox_crs=4326)
+        assert len(out) == 0
+
+    async def test_open_from_index_path_round_trips(self, tmp_path: Any) -> None:
+        """The bbox-filtered read is only reached through a *path*; every other
+        test in this file hands ``open_from_index`` a frame directly."""
+        path = str(tmp_path / "index.parquet")
+        self._write(path)
+        with (
+            patch("rastera.index._build_obstore", return_value=MagicMock()),
+            patch("rastera.index.get_cached_geotiff", return_value=None),
+            patch(
+                "rastera.index.AsyncGeoTIFF.open",
+                new=AsyncMock(return_value=MagicMock(spec=AsyncGeoTIFF)),
+            ) as mock_open,
+        ):
+            result = await open_from_index(path, bbox=(99, -1, 102, 2), bbox_crs=4326)
+        assert len(result) == 2
+        cached = mock_open.await_args_list[0].kwargs["store"]._cache
+        assert cached == {"1.tif": bytes([1]) * 64, "3.tif": bytes([3]) * 64}
 
 
 class TestBuildIndexStore:

@@ -289,30 +289,71 @@ def _read_geoparquet(
 ) -> gpd.GeoDataFrame:
     """Read a geoparquet index, optionally filtering spatially.
 
-    When *bbox* is provided, reads only metadata columns first for spatial
-    filtering, then loads ``header_bytes`` only for matched rows.
+    When *bbox* is provided, the metadata columns are read and filtered first,
+    then ``header_bytes`` is streamed in batches and only the matched rows are
+    kept. That column dominates the file — one prefetch window per COG, 32 KiB
+    by default — so materializing it whole costs roughly its own size on top of
+    the result, however few rows the bbox selects. Measured on a 131 MB header
+    column selecting 2 rows: 429 MB peak RSS reading the column at once against
+    307 MB streaming it, so the saving tracks the column and reaches GBs on a
+    100k-COG index.
+
+    The bytes still have to come off disk. geopandas writes a single row group
+    at any realistic index size, so there is no row-group boundary to skip past;
+    this bounds what is resident, not what is read.
     """
     if bbox is None:
         return gpd.read_parquet(path)  # type: ignore[reportUnknownMemberType]
 
-    schema = pq.read_schema(path)  # type: ignore[reportUnknownMemberType]
-    all_names: list[str] = schema.names  # type: ignore[reportUnknownMemberType]
-    meta_cols = [c for c in all_names if c != "header_bytes"]
-    gdf_meta = gpd.read_parquet(  # type: ignore[reportUnknownMemberType]
-        path, columns=meta_cols
-    ).reset_index(drop=True)
+    # Closed rather than left to the GC: a process opening index after index
+    # would otherwise sit on a file handle per call until collection.
+    with pq.ParquetFile(path) as pf:
+        all_names: list[str] = pf.schema_arrow.names  # type: ignore[reportUnknownMemberType]
+        meta_cols = [c for c in all_names if c != "header_bytes"]
+        gdf_meta = gpd.read_parquet(  # type: ignore[reportUnknownMemberType]
+            path, columns=meta_cols
+        ).reset_index(drop=True)
 
-    filtered = _filter_gdf(gpd.GeoDataFrame(gdf_meta), bbox, bbox_crs)
-    if len(filtered) == 0:
-        return filtered
+        filtered = _filter_gdf(gpd.GeoDataFrame(gdf_meta), bbox, bbox_crs)
+        if len(filtered) == 0:
+            return filtered
 
-    row_indices: list[int] = filtered.index.tolist()  # type: ignore[reportUnknownMemberType]
-    tbl = pq.read_table(path, columns=["header_bytes"])  # type: ignore[reportUnknownMemberType]
-    header_col = tbl.column("header_bytes")  # type: ignore[reportUnknownMemberType]
-    filtered = filtered.copy()
-    filtered["header_bytes"] = header_col.take(row_indices).to_pylist()  # type: ignore[reportUnknownMemberType]
+        row_indices: list[int] = filtered.index.tolist()  # type: ignore[reportUnknownMemberType]
+        filtered = filtered.copy()
+        filtered["header_bytes"] = _take_header_bytes(pf, row_indices)
 
     return filtered
+
+
+# Rows of ``header_bytes`` held in memory at once while picking out the matched
+# ones. pyarrow's own default is 65536, which at a 32 KiB prefetch window is 2 GB
+# a batch — the thing this streaming exists to avoid. 1024 puts a batch at ~32 MB.
+_HEADER_BATCH_ROWS = 1024
+
+
+def _take_header_bytes(pf: pq.ParquetFile, row_indices: Sequence[int]) -> list[bytes]:
+    """The ``header_bytes`` of *row_indices*, in that order, read in batches.
+
+    *row_indices* are positions into the file's row order, which is what
+    ``_read_geoparquet``'s ``reset_index(drop=True)`` makes the filtered frame's
+    index. Batches arrive in that same order, so each one covers a contiguous
+    span of positions and only the wanted rows are retained.
+    """
+    wanted = set(row_indices)
+    found: dict[int, bytes] = {}
+    offset = 0
+    batches = pf.iter_batches(  # type: ignore[reportUnknownMemberType]
+        batch_size=_HEADER_BATCH_ROWS, columns=["header_bytes"]
+    )
+    for batch in batches:
+        n: int = batch.num_rows  # type: ignore[reportUnknownMemberType]
+        # intersection() over a range iterates it without materialising a set.
+        for i in wanted.intersection(range(offset, offset + n)):
+            found[i] = batch.column(0)[i - offset].as_py()  # type: ignore[reportUnknownMemberType]
+        offset += n
+        if len(found) == len(wanted):
+            break
+    return [found[i] for i in row_indices]
 
 
 def _filter_gdf(
