@@ -905,6 +905,72 @@ class TestOutputLabels:
         assert (await obj.read(target_resolution=20.0))._geotiff is gt
 
 
+# ── Coverage on the output ──────────────────────────────────────────────
+
+
+class TestReadCoverage:
+    """A read whose grid runs past the image reports where the image stopped.
+
+    Without a declared sentinel nothing did: the warp clamps its source
+    indices, so the overhang came back as a copy of the border column.
+    """
+
+    @staticmethod
+    def _ramp(nodata: float | None) -> AsyncGeoTIFF:
+        """20x20 @1m over (0.3, 0.3)-(20.3, 20.3), values 1..20 across."""
+        gt = make_mock_geotiff(
+            width=20,
+            height=20,
+            scale=1.0,
+            count=1,
+            origin_x=0.3,
+            origin_y=20.3,
+            crs_epsg=32632,
+            dtype=np.dtype("u2"),
+            nodata=nodata,
+        )
+        gt.read = slicing_read(
+            gt, np.tile(np.arange(1, 21, dtype=np.uint16), (20, 1))[None]
+        )
+        return AsyncGeoTIFF("s3://b/k.tif", gt)
+
+    async def _read(self, nodata: float | None) -> RasterArray:
+        return await self._ramp(nodata).read(
+            bbox=BBox(0.3, 0.3, 25.3, 20.3), bbox_crs=32632, target_resolution=1.0
+        )
+
+    async def test_overhang_is_masked_and_blank(self):
+        arr = await self._read(None)
+        data: np.ndarray[Any, Any] = arr.data  # type: ignore[reportUnknownMemberType]
+        assert arr.mask is not None
+        # The snapped grid rounds 0.3..20.3 outward, so row 0 (centre y=20.5)
+        # clears the image's north edge and columns from 20 on clear its east.
+        assert not arr.mask[0].any()
+        assert arr.mask[1:, :20].all()
+        assert not arr.mask[:, 20:].any()
+        assert (data[0, :, 20:] == 0).all(), "border column replicated outward"
+        # The covered part is untouched: blanking must not eat a real column.
+        assert data[0, 10, :20].tolist() == list(range(1, 21))
+        assert np.ma.is_masked(arr.as_masked()[0, 10, 20])
+
+    async def test_a_declared_sentinel_keeps_the_masked_equal_fallback(self):
+        """Coverage knows nothing about *interior* nodata, so handing it over as
+        the mask would unmask every pixel the file itself marked invalid."""
+        arr = await self._read(7.0)
+        data: np.ndarray[Any, Any] = arr.data  # type: ignore[reportUnknownMemberType]
+        assert arr.mask is None
+        assert (data[0, :, 20:] == 7).all()
+        masked = arr.as_masked()
+        assert np.ma.is_masked(masked[0, 10, 20])  # outside the image
+        assert np.ma.is_masked(masked[0, 10, 6])  # the ramp's own 7
+
+    async def test_a_read_inside_the_image_has_no_mask(self):
+        arr = await self._ramp(None).read(
+            bbox=BBox(2.0, 2.0, 18.0, 18.0), bbox_crs=32632, target_resolution=1.0
+        )
+        assert arr.mask is None
+
+
 # ── LRU cache behaviour ────────────────────────────────────────────────
 
 
