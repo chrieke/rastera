@@ -945,7 +945,7 @@ class TestDIMAPRead:
 
 def _fake_first_tile(
     nodata: int | float | None = 0,
-    dtype: np.dtype[Any] = np.dtype("uint16"),
+    dtype: np.dtype[Any] | None = np.dtype("uint16"),
     count: int = 4,
     width: int = 400,
     height: int = 500,
@@ -1032,22 +1032,49 @@ class TestDetection:
         # Pre-populated tile cache: no re-fetch when the first read hits (1,1).
         assert (0, 1, 1) in ds._tiles
 
-    async def _open_pneo(self, **tile_kwargs: Any) -> Any:
+    async def _open_pneo(self, descriptor: bytes = PNEO_DIMAP, **tile_kwargs: Any):
         with (
             patch(
                 "rastera.formats.dimap._fetch_descriptor_bytes",
-                new=AsyncMock(return_value=PNEO_DIMAP),
+                new=AsyncMock(return_value=descriptor),
             ),
             _patch_sniff(**tile_kwargs),
         ):
             return await _maybe_open_dimap("s3://bucket/prod/DIM_PNEO.XML")
 
-    async def test_tile_dtype_must_match_the_declared_encoding(self):
-        """The mosaic is allocated in the declared dtype and tile pixels are
-        assigned into it, so a mismatch was a silent cast — uint16 300 landing
-        as 44 in a uint8 mosaic."""
-        with pytest.raises(ValueError, match="declares uint16"):
-            await self._open_pneo(dtype=np.dtype("uint8"))
+    async def test_tile_wider_than_the_declared_encoding_is_rejected(self):
+        """The motivating case: the mosaic is allocated in the *declared* dtype
+        and tile pixels are assigned into it, so a uint8 declaration over uint16
+        tiles truncated silently — 300 landing as 44."""
+        uint8_declared = _modified(
+            PNEO_DIMAP, b"<NBITS>16</NBITS>", b"<NBITS>8</NBITS>"
+        )
+        with pytest.raises(ValueError, match="declares uint8.*is uint16"):
+            await self._open_pneo(uint8_declared, dtype=np.dtype("uint16"))
+
+    @pytest.mark.parametrize("tile_dtype", ["int16", "uint32", "float32"])
+    async def test_tile_that_does_not_fit_the_declaration_is_rejected(
+        self, tile_dtype: str
+    ):
+        # Same width but signed, wider, and a different kind: none of these
+        # survive assignment into a uint16 mosaic.
+        with pytest.raises(ValueError, match="does not fit inside it"):
+            await self._open_pneo(dtype=np.dtype(tile_dtype))
+
+    async def test_tile_narrower_than_the_declaration_is_accepted(self):
+        """A uint8 tile assigns into a uint16 mosaic losslessly, so the
+        declaration merely being wider than the imagery is not grounds to
+        reject — same lower-bound reasoning as the tile-size check."""
+        ds = await self._open_pneo(dtype=np.dtype("uint8"))
+        assert ds is not None
+        # The declared dtype still wins: it is what the mosaic is allocated in.
+        assert ds._geotiff.dtype == np.dtype("uint16")
+
+    async def test_untypeable_tile_says_so(self):
+        # async-geotiff returns None for a sample format it cannot map, which
+        # would otherwise read as "declares uint16 but tile is None".
+        with pytest.raises(ValueError, match="cannot type"):
+            await self._open_pneo(dtype=None)
 
     async def test_tile_must_carry_the_bands_the_group_asks_for(self):
         # Previously a bare NumPy IndexError from deep inside the paste loop.

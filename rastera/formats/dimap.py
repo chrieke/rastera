@@ -790,16 +790,29 @@ def _validate_first_tile(
 
     Tiles disagreeing *among themselves* is out of scope — catching that means
     opening all of them at open time, which is what the lazy tile cache exists
-    to avoid.
+    to avoid. For the same reason the band-count check only ever covers the
+    group that tile belongs to (group 0); a later group declaring more bands
+    than its own tiles carry still fails at read time.
     """
     group_idx, tile_row, tile_col = key
 
-    if tile._geotiff.dtype != layout.dtype:
+    tile_dtype = tile._geotiff.dtype
+    if tile_dtype is None:
+        raise ValueError(
+            f"DIMAP tile {tile.uri!r} has a sample format async-geotiff cannot "
+            f"type, so it cannot be checked against the declared {layout.dtype}."
+        )
+    # ``can_cast`` rather than ``!=``: the harm is truncation, and a tile
+    # narrower than the declaration assigns into the mosaic losslessly. Same
+    # reasoning as the tile-size lower bound below — a declaration the imagery
+    # fits inside is not grounds to turn a readable product away.
+    if not np.can_cast(tile_dtype, layout.dtype):
         raise ValueError(
             f"DIMAP declares {layout.dtype} (<DATA_TYPE>/<NBITS>/<SIGN>) but tile "
-            f"{tile.uri!r} is {tile._geotiff.dtype}. The mosaic is assembled in "
-            f"the declared dtype, so the tile's pixels would be cast into it "
-            f"silently — a uint16 value of 300 arriving as 44 in a uint8 mosaic."
+            f"{tile.uri!r} is {tile_dtype}, which does not fit inside it. The "
+            f"mosaic is assembled in the declared dtype, so the tile's pixels "
+            f"would be cast into it silently — a uint16 value of 300 arriving as "
+            f"44 in a uint8 mosaic."
         )
 
     # Per group, not the total: each group's BAND_INDEX values are 1-based
