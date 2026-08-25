@@ -55,6 +55,11 @@ async def merge(
         bbox_crs: The bbox is transformed to the COGs' native CRS automatically.
         band_indices: 1-based.
         fill_value: For output-grid pixels covered by no input (not always 0).
+            Those pixels are reported as invalid on the returned
+            ``RasterArray.mask``, which merge always populates. The result's
+            ``nodata`` is the first input's sentinel and the gaps do not use
+            it, so tag a written file from *fill_value* or from the mask, not
+            from ``arr.nodata``.
         target_crs: Each COG is reprojected into this CRS before merging when
             it differs from the source. When ``None``, inferred from the
             inputs using *crs_method*.
@@ -199,7 +204,7 @@ async def merge(
         # fill it with its own pixels.
         return await cog._read_native(bbox=sb, band_indices=indices)
 
-    out_data = await _gather_and_paste(
+    out_data, coverage = await _gather_and_paste(
         contributing=sub_bboxes,
         dst_transform=window_transform,
         dst_width=win_width,
@@ -216,7 +221,7 @@ async def merge(
     # sentinel the pixels don't use.
     geotiff_ref = _CrsNodata(CRS.from_epsg(native_crs), base._nodata)
     return _make_output_array(
-        out_data, window_transform, win_width, win_height, geotiff_ref
+        out_data, window_transform, win_width, win_height, geotiff_ref, mask=coverage
     )
 
 
@@ -283,7 +288,7 @@ async def _merge_reprojected(
             use_overviews=use_overviews,
         )
 
-    out_data = await _gather_and_paste(
+    out_data, coverage = await _gather_and_paste(
         contributing=contributing,
         dst_transform=out_transform,
         dst_width=out_w,
@@ -296,7 +301,9 @@ async def _merge_reprojected(
     )
 
     geotiff_ref = _CrsNodata(CRS.from_epsg(out_crs), base._nodata)
-    return _make_output_array(out_data, out_transform, out_w, out_h, geotiff_ref)
+    return _make_output_array(
+        out_data, out_transform, out_w, out_h, geotiff_ref, mask=coverage
+    )
 
 
 async def _gather_and_paste(
@@ -310,8 +317,13 @@ async def _gather_and_paste(
     fill_value: int | float,
     read_fn: Callable[[AsyncGeoTIFF, BBox], Awaitable[RasterArray]],
     mosaic_method: Literal["first", "last"] = "first",
-) -> np.ndarray:
+) -> tuple[np.ndarray, np.ndarray]:
     """Read contributing COGs and paste into a single output array.
+
+    Returns the array and the ``(dst_height, dst_width)`` coverage it was
+    pasted under: True where an output pixel holds a real source value, False
+    where it is still *fill_value* because no contributor reached it or every
+    one that did was its own nodata there.
 
     Results are pasted in input order, each masked by its own nodata. Overlap
     is resolved by ``mosaic_method``: ``"first"`` keeps the first valid pixel,
@@ -330,14 +342,14 @@ async def _gather_and_paste(
         dtype=dtype,
     )
 
-    if not contributing:
-        return out_array
+    # Allocated for both methods, and returned even when it ends up all True:
+    # a caller handed mask=None falls back to masked_equal(data, nodata), which
+    # knows nothing of fill_value and masks a second contributor's real pixels
+    # that happen to equal the first one's sentinel.
+    filled = np.zeros((dst_height, dst_width), dtype=bool)
 
-    filled = (
-        np.zeros((dst_height, dst_width), dtype=bool)
-        if mosaic_method == "first"
-        else None
-    )
+    if not contributing:
+        return out_array, filled
 
     n = config._merge_concurrency
     for i in range(0, len(contributing), n):
@@ -380,7 +392,6 @@ async def _gather_and_paste(
                 )
 
             if mosaic_method == "first":
-                assert filled is not None
                 unfilled = ~filled[dst_rows, dst_cols]
                 if src_valid is not None:
                     paste_mask = unfilled & src_valid
@@ -389,17 +400,22 @@ async def _gather_and_paste(
                 np.copyto(out_array[:, dst_rows, dst_cols], src_data, where=paste_mask)
                 filled[dst_rows, dst_cols] |= paste_mask
             else:
+                # ``|=``, not ``=``: "last" overwrites pixels by design, but an
+                # earlier contributor's coverage still stands where this one is
+                # invalid. Accumulating never gates what "last" pastes.
                 if src_valid is not None:
                     np.copyto(
                         out_array[:, dst_rows, dst_cols], src_data, where=src_valid
                     )
+                    filled[dst_rows, dst_cols] |= src_valid
                 else:
                     out_array[:, dst_rows, dst_cols] = src_data
+                    filled[dst_rows, dst_cols] = True
 
-        if mosaic_method == "first" and filled is not None and filled.all():
-            return out_array
+        if mosaic_method == "first" and filled.all():
+            return out_array, filled
 
-    return out_array
+    return out_array, filled
 
 
 def _output_subgrid(
