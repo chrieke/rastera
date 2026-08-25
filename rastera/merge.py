@@ -54,17 +54,15 @@ async def merge(
     Args:
         bbox_crs: The bbox is transformed to the COGs' native CRS automatically.
         band_indices: 1-based.
-        nodata: The output's sentinel, in both senses: it fills every pixel
-            no input covered, and it is what the result reports as
-            ``nodata`` — so a file written from the result can be tagged
-            with the value its own pixels use. Defaults to the first
-            input's declared sentinel; when that input declares none the
-            gaps hold 0 and the result reports ``None``, since 0 is a real
-            measurement in most rasters and claiming it would blank them.
-            This is ``rasterio.merge.merge``'s ``nodata=``. Either way
-            ``RasterArray.mask`` marks the filled pixels, and is the only
-            signal that separates them from real data holding the same
-            value.
+        nodata: The value that means "no data" in the output: merge fills
+            every uncovered pixel with it and reports it as ``arr.nodata``,
+            so a file written from the result can be tagged with it.
+            Defaults to the first input's nodata, like
+            ``rasterio.merge.merge``; if that input has none, gaps get 0 and
+            ``arr.nodata`` stays ``None``, since 0 is usually real data.
+            The inputs are unaffected — each is still read through its own
+            nodata — and real pixels can hold this value too, so
+            ``RasterArray.mask`` is what actually marks the gaps.
         target_crs: Each COG is reprojected into this CRS before merging when
             it differs from the source. When ``None``, inferred from the
             inputs using *crs_method*.
