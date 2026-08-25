@@ -1,5 +1,6 @@
 """Unit tests for merge and helpers."""
 
+from dataclasses import replace as dc_replace
 from typing import Any, Literal
 from unittest.mock import AsyncMock, MagicMock
 
@@ -1190,3 +1191,162 @@ class TestMergeSharesTheWarpSeam:
         # generous slack; the bug produced hundreds of pixels, not a few.
         assert got.width < 500.0, f"halo blew up: read {got.width:.0f} m wide"
         assert got.height < cog._geotiff.bounds[3] - cog._geotiff.bounds[1] + 500.0
+
+
+# ── Coverage, for sources that declare no nodata ─────────────────────────
+
+
+def _tile(
+    origin_x: float,
+    origin_y: float,
+    value: int,
+    *,
+    crs: int = 32632,
+    scale: float = 1.0,
+    size: int = 20,
+    nodata: float | None = None,
+) -> AsyncGeoTIFF:
+    """A uniform-*value* tile whose reads go through the real window arithmetic.
+
+    ``_make_windowed_cog`` cannot stand in: it pins nodata to 0, which is the
+    one thing these tests vary.
+    """
+    cog = _make_cog(
+        width=size,
+        height=size,
+        scale=scale,
+        origin_x=origin_x,
+        origin_y=origin_y,
+        crs=crs,
+        nodata=nodata,
+    )
+    gt: Any = cog._geotiff
+    gt.read = slicing_read(gt, np.full((1, size, size), value, np.uint16))
+    return cog
+
+
+class TestMergeCoverage:
+    """A source that declares no nodata still has an edge.
+
+    The warp clamps its source indices, so a destination pixel past that edge
+    used to receive a replicated border pixel; merge pasted it as data and
+    marked the ground filled, which locked out whichever tile actually covered
+    it.  Merging tiles that do not overlap then depended on their order.
+    """
+
+    # Off-grid origins: the output grid snaps to multiples of the resolution,
+    # so a source edge at x.3 leaves the sub-grid overhanging it by 0.7 px.
+    OFF_GRID = 0.3
+
+    def _pair(self, nodata: float | None) -> tuple[AsyncGeoTIFF, AsyncGeoTIFF]:
+        o = self.OFF_GRID
+        return (
+            _tile(o, 20 + o, 1, nodata=nodata),
+            _tile(20 + o, 20 + o, 2, nodata=nodata),
+        )
+
+    async def _merge(self, cogs: list[AsyncGeoTIFF], **kw: Any) -> np.ndarray[Any, Any]:
+        o = self.OFF_GRID
+        result = await merge(
+            cogs,
+            bbox=BBox(o, o, 40 + o, 20 + o),
+            bbox_crs=32632,
+            target_crs=32632,
+            target_resolution=1.0,
+            fill_value=0,
+            **kw,
+        )
+        return result.data  # type: ignore[reportUnknownMemberType]
+
+    @pytest.mark.parametrize("nodata", [None, 0.0], ids=["no_nodata", "nodata"])
+    @pytest.mark.parametrize("mosaic_method", ["first", "last"])
+    async def test_order_invariant_for_tiles_that_do_not_overlap(
+        self, nodata: float | None, mosaic_method: Literal["first", "last"]
+    ):
+        left, right = self._pair(nodata)
+        forward = await self._merge([left, right], mosaic_method=mosaic_method)
+        reverse = await self._merge([right, left], mosaic_method=mosaic_method)
+        np.testing.assert_array_equal(forward, reverse)
+
+    @pytest.mark.parametrize("nodata", [None, 0.0], ids=["no_nodata", "nodata"])
+    async def test_seam_column_belongs_to_the_tile_that_covers_it(
+        self, nodata: float | None
+    ):
+        """Output column 20 spans x 20..21, centre 20.5 — inside the right
+        tile's first pixel and past the left tile's last one."""
+        left, right = self._pair(nodata)
+        data = await self._merge([left, right])
+        # Row 0 (y 20..21, centre 20.5) clears both tiles' north edge at 20.3.
+        assert (data[0, 0] == 0).all()
+        assert data[0, 1:, 20].tolist() == [2] * (data.shape[1] - 1)
+        assert data[0, 1:, 19].tolist() == [1] * (data.shape[1] - 1)
+
+    @pytest.mark.parametrize("nodata", [None, 0.0], ids=["no_nodata", "nodata"])
+    async def test_uncovered_margin_is_fill_not_replicated(self, nodata: float | None):
+        """The single-tile shape of it: no neighbour to rob, just a column of
+        imagery invented past the tile's edge."""
+        o = self.OFF_GRID
+        result = await merge(
+            [_tile(o, 10 + o, 7, size=10, nodata=nodata)],
+            bbox=BBox(o, o, 10 + o, 10 + o),
+            bbox_crs=32632,
+            target_crs=32632,
+            target_resolution=1.0,
+            fill_value=9,
+        )
+        data: np.ndarray[Any, Any] = result.data  # type: ignore[reportUnknownMemberType]
+        assert data.shape == (1, 11, 11)
+        # The snapped grid rounds 0.3..10.3 outward to 0..11, so the north row
+        # and the east column land past the tile.
+        assert (data[0, 0, :] == 9).all()
+        assert (data[0, :, 10] == 9).all()
+        assert (data[0, 1:, :10] == 7).all()
+
+    async def test_order_invariant_across_a_rotated_crs_pair(self):
+        """Rotation widens the failure from a seam to a band: each tile's
+        contribution is cut from the *envelope* of its reprojected footprint,
+        which exceeds the footprint itself."""
+        west = _tile(722500.0, 6375000.0, 1, crs=3006, scale=10.0, size=250)
+        east = _tile(725000.0, 6375000.0, 2, crs=3006, scale=10.0, size=250)
+        aoi = transform_bbox(
+            BBox(722500.0, 6372500.0, 727500.0, 6375000.0), 3006, 32634
+        )
+        kwargs: dict[str, Any] = dict(
+            bbox=aoi,
+            bbox_crs=32634,
+            target_crs=32634,
+            target_resolution=10.0,
+            fill_value=0,
+        )
+        forward: np.ndarray[Any, Any] = (await merge([west, east], **kwargs)).data  # type: ignore[reportUnknownMemberType]
+        reverse: np.ndarray[Any, Any] = (await merge([east, west], **kwargs)).data  # type: ignore[reportUnknownMemberType]
+        np.testing.assert_array_equal(forward, reverse)
+
+    async def test_native_path_honours_an_internal_mask(self):
+        """``RasterArray.mask`` is how a file states validity without a
+        sentinel — an internal TIFF mask or an alpha band. The paste has to
+        respect it on the copy path too, not only behind the warp."""
+        # The bbox is the whole tile, so window columns are tile columns.
+        masked = _tile(0.0, 10.0, 1, size=10)
+        plain = _tile(0.0, 10.0, 2, size=10)
+        gt: Any = masked._geotiff  # a MagicMock header, mutable unlike the contract
+        real_read = gt.read
+
+        async def _read(window: Any) -> RasterArray:
+            arr: RasterArray = await real_read(window=window)
+            mask = np.ones((arr.height, arr.width), dtype=bool)
+            mask[:, 5:] = False  # right half of the tile declares itself empty
+            return dc_replace(arr, mask=mask)
+
+        gt.read = _read
+
+        result = await merge(
+            [masked, plain],
+            bbox=BBox(0, 0, 10, 10),
+            bbox_crs=32632,
+            target_crs=32632,
+            target_resolution=1.0,
+        )
+        data: np.ndarray[Any, Any] = result.data  # type: ignore[reportUnknownMemberType]
+        assert (data[0, :, :5] == 1).all()
+        assert (data[0, :, 5:] == 2).all()

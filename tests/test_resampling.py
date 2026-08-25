@@ -7,7 +7,7 @@ import pytest
 from affine import Affine
 from pyproj import Transformer
 
-from rastera.resampling import ResamplingMethod, resample
+from rastera.resampling import ResamplingMethod, _resample_impl, resample
 
 
 def _src_grid(n: int):
@@ -609,11 +609,14 @@ class TestTwoPassReproject:
         W: int = 200,
         dtype: np.typing.DTypeLike = np.float32,
         seed: int = 0,
+        shift_west: float = 0.0,
     ) -> tuple[np.ndarray[Any, Any], Affine, Affine, int, int, Transformer]:
         """A smooth EPSG:3006 raster + a target UTM33N grid at ``dst_res``.
 
         Returns ``(arr, src_t, dst_t, dw, dh, transformer)`` ready for
         ``resample(..., transformer=transformer)``.  ``scale ≈ dst_res/src_res``.
+        *shift_west* moves the destination grid off the source's west edge, so
+        the left of it is uncovered ground rather than imagery.
         """
         yy, xx = np.mgrid[0:H, 0:W]
         arr = (100 + 50 * np.sin(xx / 15.0) + 40 * np.cos(yy / 12.0)).astype(dtype)
@@ -627,7 +630,12 @@ class TestTwoPassReproject:
         dw = int((ux.max() - ux.min() - 2 * pad) // dst_res)
         dh = int((uy.max() - uy.min() - 2 * pad) // dst_res)
         dst_t = Affine(
-            dst_res, 0, ux.min() + pad, 0, -dst_res, uy.min() + pad + dh * dst_res
+            dst_res,
+            0,
+            ux.min() + pad - shift_west,
+            0,
+            -dst_res,
+            uy.min() + pad + dh * dst_res,
         )
         T = Transformer.from_crs(32633, 3006, always_xy=True)
         return arr, src_t, dst_t, dw, dh, T
@@ -724,6 +732,33 @@ class TestTwoPassReproject:
             rastera.set_warp_strategy(prev)
         with pytest.raises(ValueError):
             rastera.set_warp_strategy("nope")  # type: ignore[reportArgumentType]
+
+    def test_coverage_matches_single_pass(self):
+        """Pass B's source is the *halo'd* intermediate, which extends past the
+        real source — bounds-testing against that alone reports the halo's
+        ground as covered. Pass A's coverage has to carry through instead."""
+        arr, st, dt, dw, dh, T = self._cross_setup(0.16, 0.5, shift_west=10.0)
+        kw: dict[str, Any] = dict(transformer=T, method="cubic")
+        _, single = _resample_impl(
+            arr, st, dt, dw, dh, warp_strategy="single_pass", **kw
+        )
+        _, two = _resample_impl(arr, st, dt, dw, dh, warp_strategy="auto", **kw)
+        assert single is not None and two is not None
+        assert 0.1 < two.mean() < 0.9, "grid must straddle the source edge"
+        assert np.array_equal(two, single)
+
+    def test_matches_single_pass_up_to_the_covered_edge(self):
+        """``test_matches_single_pass_on_interior`` keeps clear of the edge, so
+        it says nothing about a grid that overhangs one. The strategies have to
+        agree everywhere the source does reach."""
+        arr, st, dt, dw, dh, T = self._cross_setup(0.16, 0.5, shift_west=10.0)
+        kw: dict[str, Any] = dict(transformer=T, method="cubic")
+        single, _ = _resample_impl(
+            arr, st, dt, dw, dh, warp_strategy="single_pass", **kw
+        )
+        two, coverage = _resample_impl(arr, st, dt, dw, dh, warp_strategy="auto", **kw)
+        assert coverage is not None
+        assert np.abs(two[0][coverage] - single[0][coverage]).max() < 1e-3
 
 
 # ── input validation ─────────────────────────────────────────────────────
@@ -903,3 +938,95 @@ class TestBoolMask:
             warp_strategy="auto",
         )
         assert out.dtype == np.bool_
+
+
+# ── coverage ─────────────────────────────────────────────────────────────
+
+
+class TestCoverage:
+    """Which destination pixels a source reaches is geometry, so it is reported
+    whether or not the source declares a sentinel. Every path clamps its source
+    indices before the gather, and the fill used to be gated on
+    ``nodata is not None`` — so a sentinel-less source edge-replicated instead.
+    """
+
+    def _grids(self):
+        """A 4x4 source @10m over (0,0)-(40,40), and its own transform reused
+        for the destination — a 6x6 grid on it hangs two rows/columns off."""
+        arr = np.arange(1, 17, dtype=np.float32).reshape(1, 4, 4)
+        t = Affine(10, 0, 0, 0, -10, 40)
+        return arr, t, t
+
+    @staticmethod
+    def _transformer(cross_crs: bool) -> Transformer | None:
+        # Identity reprojection: exercises the coarse-grid coordinate path
+        # without a second CRS muddying which pixels ought to be covered.
+        return Transformer.from_crs(32632, 32632, always_xy=True) if cross_crs else None
+
+    @pytest.mark.parametrize("method", ["nearest", "bilinear", "cubic"])
+    @pytest.mark.parametrize("cross_crs", [False, True], ids=["same_crs", "cross_crs"])
+    def test_marks_the_overhang(self, method: ResamplingMethod, cross_crs: bool):
+        arr, st, dt = self._grids()
+        _, coverage = _resample_impl(
+            arr, st, dt, 6, 6, transformer=self._transformer(cross_crs), method=method
+        )
+        assert coverage is not None
+        expected = np.zeros((6, 6), dtype=bool)
+        expected[:4, :4] = True
+        assert coverage.tolist() == expected.tolist()
+
+    @pytest.mark.parametrize("method", ["nearest", "bilinear", "cubic"])
+    @pytest.mark.parametrize("cross_crs", [False, True], ids=["same_crs", "cross_crs"])
+    def test_none_when_fully_covered(self, method: ResamplingMethod, cross_crs: bool):
+        arr, st, dt = self._grids()
+        _, coverage = _resample_impl(
+            arr, st, dt, 4, 4, transformer=self._transformer(cross_crs), method=method
+        )
+        assert coverage is None
+
+    @pytest.mark.parametrize("method", ["nearest", "bilinear", "cubic"])
+    def test_does_not_depend_on_the_sentinel(self, method: ResamplingMethod):
+        arr, st, dt = self._grids()
+        without = _resample_impl(arr, st, dt, 6, 6, method=method)[1]
+        declared = _resample_impl(arr, st, dt, 6, 6, nodata=-9999.0, method=method)[1]
+        assert without is not None and declared is not None
+        assert np.array_equal(without, declared)
+
+    @pytest.mark.parametrize("method", ["nearest", "bilinear", "cubic"])
+    def test_uncovered_pixels_are_blanked(self, method: ResamplingMethod):
+        arr, st, dt = self._grids()
+        # Source values are 1..16, so an edge-replicated pixel is non-zero.
+        out = resample(arr, st, dt, 6, 6, method=method)
+        assert (out[0, 4:, :] == 0).all()
+        assert (out[0, :, 4:] == 0).all()
+        assert (out[0, :4, :4] != 0).all()
+
+    @pytest.mark.parametrize("method", ["nearest", "bilinear", "cubic"])
+    @pytest.mark.parametrize("cross_crs", [False, True], ids=["same_crs", "cross_crs"])
+    def test_composes_with_source_coverage(
+        self, method: ResamplingMethod, cross_crs: bool
+    ):
+        """``src_coverage`` names source pixels that are not real either — how
+        the two-pass warp carries pass A's coverage into pass B."""
+        arr, st, dt = self._grids()
+        src_coverage = np.ones((4, 4), dtype=bool)
+        src_coverage[:, 3] = False  # the source's own last column is not real
+        _, coverage = _resample_impl(
+            arr,
+            st,
+            dt,
+            4,
+            4,
+            transformer=self._transformer(cross_crs),
+            method=method,
+            src_coverage=src_coverage,
+        )
+        assert coverage is not None
+        assert coverage.tolist() == src_coverage.tolist()
+
+    @pytest.mark.parametrize("method", ["nearest", "bilinear", "cubic"])
+    def test_declared_sentinel_still_wins_the_fill(self, method: ResamplingMethod):
+        arr, st, dt = self._grids()
+        out = resample(arr, st, dt, 6, 6, nodata=-9999.0, method=method)
+        assert (out[0, 4:, :] == -9999.0).all()
+        assert (out[0, :, 4:] == -9999.0).all()

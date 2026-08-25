@@ -42,6 +42,7 @@ import pytest
 from async_geotiff import Window
 
 import rastera
+from rastera.geo import BBox, transform_bbox
 from tests import vrt_catalog
 
 live = pytest.mark.live
@@ -210,6 +211,100 @@ async def test_merge_across_seam_matches_gdal_mosaic(tmp_path: Path):
     assert not (got == 0).all(axis=(0, 2)).any()
 
 
+async def test_merge_without_nodata_stops_at_the_scene_edge(tmp_path: Path):
+    """A window straddling the east edge of a scene that declares no nodata.
+
+    The warp clamps its source indices, so the half of the window past the edge
+    used to come back as a replicated copy of the scene's last column and merge
+    pasted it as data. GDAL writes nothing outside a source's footprint, so the
+    fill is what belongs there.
+    """
+    if not NODATA_ABSENT:
+        pytest.skip("no nodata-absent fixture in the local catalog")
+    fx = NODATA_ABSENT[0]
+    res = fx.resolution
+    half = (WIN // 2) * res
+    cy = (fx.bounds[1] + fx.bounds[3]) / 2
+    edge_x = fx.bounds[2]
+    # Offset by 3/4 of a pixel so the scene's edge lands in the *left* half of
+    # an output pixel: that pixel's centre is outside the scene, but the
+    # sub-grid rounds outward and claims it. An aligned grid has no such pixel.
+    minx = edge_x - half + 0.75 * res
+    bbox = (minx, cy - half, minx + 2 * half, cy + half)
+
+    src = await rastera.open(fx.s3_uri, skip_signature=False)
+    merged = await rastera.merge(
+        [src],
+        bbox=bbox,
+        bbox_crs=fx.crs_epsg,
+        target_crs=fx.crs_epsg,
+        target_resolution=res,
+        # Anchors the grid on the bbox, as -te does, and takes the warp rather
+        # than the native copy path.
+        snap_to_grid=False,
+        fill_value=0,
+    )
+    data: np.ndarray[Any, Any] = merged.data  # type: ignore[reportUnknownMemberType]
+    got = np.asarray(data)
+
+    truth = _gdal_warp(fx.vsis3_uri, bbox, res, tmp_path)
+    np.testing.assert_array_equal(got, truth)
+    # Precondition and consequence: the covered half is imagery, and nothing
+    # was invented in the half the scene does not reach. The columns either
+    # side of the edge are left to the comparison above.
+    assert (got[:, :, : WIN // 2 - 1] != 0).mean() > 0.5
+    assert (got[:, :, WIN // 2 + 1 :] == 0).all()
+
+
+async def test_merge_without_nodata_is_order_invariant():
+    """Two adjacent scenes that declare no nodata, reprojected as they merge.
+
+    Whichever was listed first used to win ground it does not cover, because
+    the warp's edge-clamped pixels pasted as data. Reprojection widens it: each
+    contribution is cut from the *envelope* of the reprojected footprint, which
+    for a rotated pair exceeds the footprint itself.
+    """
+    scenario = _scenario("edge_adjacent", nodata_absent=True)
+    a, b = scenario.fixtures[:2]
+
+    if a.bounds[3] == b.bounds[1]:
+        seam_y = a.bounds[3]
+    elif b.bounds[3] == a.bounds[1]:
+        seam_y = a.bounds[1]
+    else:
+        pytest.skip("edge_adjacent scenario is not stacked north-south")
+
+    half = (WIN // 2) * a.resolution
+    minx = max(a.bounds[0], b.bounds[0]) + 1000 * a.resolution
+    native = BBox(minx, seam_y - half, minx + WIN * a.resolution, seam_y + half)
+    # Geographic coordinates: any projected source CRS is rotated against them,
+    # and no zone has to be guessed from the fixture.
+    bbox = transform_bbox(native, a.crs_epsg, 4326)
+    res = (bbox.maxx - bbox.minx) / WIN
+
+    async def _merged(order: list[Any]) -> np.ndarray[Any, Any]:
+        sources = await rastera.open([f.s3_uri for f in order], skip_signature=False)
+        result = await rastera.merge(
+            cast(list[Any], sources),
+            bbox=bbox,
+            bbox_crs=4326,
+            target_crs=4326,
+            target_resolution=res,
+        )
+        return np.asarray(result.data)  # type: ignore[reportUnknownMemberType]
+
+    forward = await _merged([a, b])
+    reverse = await _merged([b, a])
+    np.testing.assert_array_equal(forward, reverse)
+
+    # Both preconditions, else the equality above compares two blanks or two
+    # copies of the same scene: the window has imagery, and each scene supplies
+    # ground the other cannot.
+    assert (forward != 0).mean() > 0.1
+    assert not np.array_equal(forward, await _merged([a]))
+    assert not np.array_equal(forward, await _merged([b]))
+
+
 async def test_merge_overlap_respects_declared_nodata(tmp_path: Path):
     """Regression guard for the VRT's ``<NoDataValue>`` being honoured.
 
@@ -253,13 +348,27 @@ async def test_merge_overlap_respects_declared_nodata(tmp_path: Path):
 # ── helpers ─────────────────────────────────────────────────────────────────
 
 
-def _scenario(relationship: str, *, n_fixtures: int | None = None) -> Any:
-    """The cheapest merge scenario with the given spatial relationship."""
+def _scenario(
+    relationship: str,
+    *,
+    n_fixtures: int | None = None,
+    nodata_absent: bool = False,
+) -> Any:
+    """The cheapest merge scenario with the given spatial relationship.
+
+    *nodata_absent* narrows to scenarios whose every member declares no nodata
+    at all, which is the case where a source's extent is the only thing saying
+    where its pixels stop.
+    """
     matches = [
         s
         for s in fixtures.MERGE_SCENARIOS
         if s.relationship == relationship
         and (n_fixtures is None or len(s.fixtures) == n_fixtures)
+        and (
+            not nodata_absent
+            or all(f in fixtures.NODATA_ABSENT_VRTS for f in s.fixtures)
+        )
     ]
     if not matches:
         pytest.skip(f"no {relationship} merge scenario in the local catalog")
@@ -393,6 +502,43 @@ def _gdal_projwin(
         ["-projwin", str(minx), str(maxy), str(maxx), str(miny)],
         tmp / "projwin.img",
     )
+
+
+def _gdal_warp(
+    uri: str, bbox: tuple[float, float, float, float], res: float, tmp: Path
+) -> np.ndarray:
+    """GDAL's pixels on a grid that need not line up with the source's own.
+
+    ``gdal_translate -projwin`` rounds its window onto source pixels, so it
+    cannot express the offset grid where a destination pixel straddles the
+    source edge; gdalwarp honours ``-te``/``-tr`` as given. ``-ovr NONE``
+    because the reads under test pass ``use_overviews=False``.
+    """
+    minx, miny, maxx, maxy = bbox
+    out = tmp / "warp.img"
+    _run(
+        [
+            "gdalwarp",
+            "-q",
+            "-of",
+            "ENVI",
+            "-r",
+            "near",
+            "-ovr",
+            "NONE",
+            "-te",
+            str(minx),
+            str(miny),
+            str(maxx),
+            str(maxy),
+            "-tr",
+            str(res),
+            str(res),
+            uri,
+            str(out),
+        ]
+    )
+    return _read_envi(out)
 
 
 def _gdal_translate(uri: str, args: list[str], out: Path) -> np.ndarray:

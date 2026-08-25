@@ -92,12 +92,19 @@ def resample(
     detected via ``np.isnan`` so the center gate and renormalization
     behave identically across sentinel types.
 
+    A destination pixel with no source pixel under its center is blanked
+    regardless of ``nodata`` — to the sentinel when one is declared, to zero
+    when none is, which is what GDAL leaves where its warper never writes.
+    ``AsyncGeoTIFF.read`` also reports which pixels those were, on
+    ``RasterArray.mask``.
+
     Args:
         src_array: ``(bands, h, w)``.
         src_transform: Pixel→world for the source; *dst_transform* likewise for
             the destination.
-        nodata: Fill for out-of-bounds pixels, and the sentinel the
-            bilinear/cubic renormalization keys off.
+        nodata: The sentinel for invalid pixels; the bilinear/cubic
+            renormalization keys off it, and it fills out-of-bounds pixels
+            (which are zeroed when no sentinel is declared).
         transformer: Target CRS → source CRS; ``None`` if same CRS.
         warp_strategy: How a cross-CRS bilinear/cubic warp is carried out.
             ``None`` (default) reads the process-wide setting from
@@ -105,28 +112,7 @@ def resample(
             override it for this call (useful in tests). No effect on nearest
             (any CRS/scale), same-CRS, or upsampling.
     """
-    validate_resampling(method)
-    if warp_strategy is None:
-        warp_strategy = config._warp_strategy
-
-    _validate_grids(src_transform, dst_transform, dst_width, dst_height)
-    _validate_dtype_nodata(src_array.dtype, nodata)
-    if dst_width == 0 or dst_height == 0:
-        return np.empty(
-            (src_array.shape[0], dst_height, dst_width), dtype=src_array.dtype
-        )
-
-    if method == "nearest":
-        return _resample_nearest(
-            src_array,
-            src_transform,
-            dst_transform,
-            dst_width,
-            dst_height,
-            nodata,
-            transformer,
-        )
-    return _resample_kernel(
+    out, coverage = _resample_impl(
         src_array,
         src_transform,
         dst_transform,
@@ -135,8 +121,9 @@ def resample(
         nodata,
         transformer,
         method,
-        warp_strategy,
+        warp_strategy=warp_strategy,
     )
+    return _fill_uncovered(out, coverage, nodata)
 
 
 def validate_resampling(method: str) -> None:
@@ -148,6 +135,69 @@ def validate_resampling(method: str) -> None:
         )
 
 
+def _resample_impl(
+    src_array: np.ndarray,
+    src_transform: Affine,
+    dst_transform: Affine,
+    dst_width: int,
+    dst_height: int,
+    nodata: int | float | None = None,
+    transformer: Transformer | None = None,
+    method: ResamplingMethod = "nearest",
+    *,
+    warp_strategy: WarpStrategy | None = None,
+    src_coverage: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray | None]:
+    """:func:`resample`, plus the coverage mask it computes along the way.
+
+    Coverage is ``(dst_height, dst_width)``, True where a source pixel lies
+    under the destination pixel's center, and ``None`` when every destination
+    pixel is covered — the common case then allocates nothing.  It is computed
+    whether or not the source declares a sentinel: every path below clamps its
+    source indices, so an uncovered destination pixel is indistinguishable from
+    a real one without it.
+
+    *src_coverage* is ``(h, w)`` over *src_array* and names which source pixels
+    are themselves real.  Only :func:`_resample_two_pass` passes it, to carry
+    pass A's coverage through pass B.
+    """
+    validate_resampling(method)
+    if warp_strategy is None:
+        warp_strategy = config._warp_strategy
+
+    _validate_grids(src_transform, dst_transform, dst_width, dst_height)
+    _validate_dtype_nodata(src_array.dtype, nodata)
+    if dst_width == 0 or dst_height == 0:
+        empty = np.empty(
+            (src_array.shape[0], dst_height, dst_width), dtype=src_array.dtype
+        )
+        return empty, None
+
+    if method == "nearest":
+        return _resample_nearest(
+            src_array,
+            src_transform,
+            dst_transform,
+            dst_width,
+            dst_height,
+            nodata,
+            transformer,
+            src_coverage,
+        )
+    return _resample_kernel(
+        src_array,
+        src_transform,
+        dst_transform,
+        dst_width,
+        dst_height,
+        nodata,
+        transformer,
+        method,
+        warp_strategy,
+        src_coverage,
+    )
+
+
 def _resample_nearest(
     src_array: np.ndarray,
     src_transform: Affine,
@@ -156,8 +206,10 @@ def _resample_nearest(
     dst_height: int,
     nodata: int | float | None,
     transformer: Transformer | None,
-) -> np.ndarray:
-    """Nearest-neighbor resampling.
+    src_coverage: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray | None]:
+    """Nearest-neighbor resampling, and the coverage mask (see
+    :func:`_resample_impl`).
 
     Memory-tight: same-CRS uses 1D index arrays, cross-CRS uses the
     coarse-grid transform with in-place ops.
@@ -183,10 +235,16 @@ def _resample_nearest(
         row_safe = np.clip(src_row_1d, 0, h - 1)
         out = src_array[:, row_safe[:, np.newaxis], col_safe[np.newaxis, :]]
 
-        if nodata is not None and not (np.all(valid_col) and np.all(valid_row)):
-            fill = np.array(nodata, dtype=src_array.dtype)
-            invalid = ~(valid_row[:, np.newaxis] & valid_col[np.newaxis, :])
-            out[:, invalid] = fill
+        if np.all(valid_col) and np.all(valid_row):
+            coverage = None
+        else:
+            coverage = valid_row[:, np.newaxis] & valid_col[np.newaxis, :]
+        if src_coverage is not None:
+            coverage = _and_coverage(
+                coverage, src_coverage[row_safe[:, np.newaxis], col_safe[np.newaxis, :]]
+            )
+        if nodata is not None and coverage is not None:
+            out[:, ~coverage] = np.array(nodata, dtype=src_array.dtype)
     else:
         # Coarse-grid + interpolation: transform sparse grid through pyproj,
         # bilinearly interpolate to full resolution.  In-place ops and eager
@@ -210,12 +268,16 @@ def _resample_nearest(
         np.clip(src_row, 0, h - 1, out=src_row)
 
         out = src_array[:, src_row, src_col]
+
+        coverage = None if np.all(valid) else valid
+        if src_coverage is not None:
+            coverage = _and_coverage(coverage, src_coverage[src_row, src_col])
         del src_col, src_row
 
-        if nodata is not None and not np.all(valid):
-            out[:, ~valid] = np.array(nodata, dtype=src_array.dtype)
+        if nodata is not None and coverage is not None:
+            out[:, ~coverage] = np.array(nodata, dtype=src_array.dtype)
 
-    return out
+    return out, coverage
 
 
 def _resample_kernel(
@@ -228,7 +290,8 @@ def _resample_kernel(
     transformer: Transformer | None,
     method: Literal["bilinear", "cubic"],
     warp_strategy: WarpStrategy,
-) -> np.ndarray:
+    src_coverage: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray | None]:
     """Bilinear or cubic resampling with GDAL-style nodata renormalization
     and anti-aliasing kernel expansion for downsampling.
 
@@ -252,7 +315,8 @@ def _resample_kernel(
     - Out-of-bounds taps (kernel reach beyond the source extent for
       output pixels near an edge) are treated as nodata for
       renormalization when ``nodata`` is set, and clamped (edge
-      replicated) otherwise.
+      replicated) otherwise.  Either way the returned coverage mask marks
+      the destination pixels whose *center* fell outside the source.
     - Accumulation is in float64; integer output dtypes are
       clip+round-cast at the end (cubic can overshoot the source range).
     """
@@ -323,12 +387,35 @@ def _resample_kernel(
                 method,
                 x_scale_local,
                 y_scale_local,
+                src_coverage,
             )
 
     # Source pixel containing the dst center (pixel-corner convention).
     # Used for the OOB gate and the GDAL-style center-pixel nodata gate.
     center_col = np.floor(src_col_f).astype(np.intp)
     center_row = np.floor(src_row_f).astype(np.intp)
+
+    # The same in-bounds-center test `_finalize_kernel` applies under nodata,
+    # hoisted out because coverage holds with or without a sentinel.
+    h, w = src_array.shape[1], src_array.shape[2]
+    if coords_2d:
+        in_bounds_center = (
+            (center_row >= 0) & (center_row < h) & (center_col >= 0) & (center_col < w)
+        )
+    else:
+        in_bounds_center = ((center_row >= 0) & (center_row < h))[:, np.newaxis] & (
+            (center_col >= 0) & (center_col < w)
+        )[np.newaxis, :]
+    coverage = None if in_bounds_center.all() else in_bounds_center
+    if src_coverage is not None:
+        safe_row = np.clip(center_row, 0, h - 1)
+        safe_col = np.clip(center_col, 0, w - 1)
+        coverage = _and_coverage(
+            coverage,
+            src_coverage[safe_row, safe_col]
+            if coords_2d
+            else src_coverage[safe_row[:, np.newaxis], safe_col[np.newaxis, :]],
+        )
 
     # Kernel base/frac: shift by -0.5 so the kernel interpolates between
     # source pixel CENTERS (at integer + 0.5 in src pixel-corner space).
@@ -372,7 +459,7 @@ def _resample_kernel(
         method,
     )
 
-    return _finalize_kernel(
+    out = _finalize_kernel(
         acc_val,
         acc_wt,
         per_dim_ok,
@@ -383,6 +470,7 @@ def _resample_kernel(
         nodata,
         nodata_is_nan,
     )
+    return out, coverage
 
 
 # ---- Private helpers ----
@@ -910,7 +998,8 @@ def _resample_two_pass(
     method: Literal["bilinear", "cubic"],
     x_scale: float,
     y_scale: float,
-) -> np.ndarray:
+    src_coverage: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray | None]:
     """Cross-CRS downsample as two cheap passes instead of one wide warp.
 
     Pass A downsamples ``src_array`` in its own CRS to an intermediate grid at
@@ -923,6 +1012,11 @@ def _resample_two_pass(
     widened kernel and (for cubic) the ≥2-valid gate erode the outermost
     intermediate pixels under nodata, so the halo keeps that erosion off the
     region Pass B samples — avoiding an edge fringe single-pass would not have.
+
+    Coverage composes across the passes: Pass A reports the halo ring as
+    uncovered and Pass B takes that as its ``src_coverage``.  Both go through
+    ``_resample_impl``, which does not fill — blanking the halo would leave
+    Pass B's kernel averaging real data against the fill value.
 
     See :func:`resample` / :func:`rastera.set_warp_strategy` for when this
     runs and how its output relates to the single-pass warp.
@@ -953,7 +1047,7 @@ def _resample_two_pass(
     work_dtype = _two_pass_work_dtype(orig_dtype)
     work = src_array.astype(work_dtype, copy=False)
 
-    inter = resample(
+    inter, inter_coverage = _resample_impl(
         work,
         src_transform=src_transform,
         dst_transform=inter_transform,
@@ -963,8 +1057,9 @@ def _resample_two_pass(
         transformer=None,
         method=method,
         warp_strategy="single_pass",
+        src_coverage=src_coverage,
     )
-    out = resample(
+    out, coverage = _resample_impl(
         inter,
         src_transform=inter_transform,
         dst_transform=dst_transform,
@@ -974,17 +1069,18 @@ def _resample_two_pass(
         transformer=transformer,
         method=method,
         warp_strategy="single_pass",
+        src_coverage=inter_coverage,
     )
 
     # Both passes ran in float; clip+round+cast back to the source dtype once.
     if orig_dtype.kind == "b":
-        return out >= 0.5
+        return out >= 0.5, coverage
     if np.issubdtype(orig_dtype, np.integer):
         info = np.iinfo(orig_dtype)
         out = out.astype(np.float64, copy=False)
         np.clip(out, info.min, info.max, out=out)
         np.round(out, out=out)
-    return out.astype(orig_dtype, copy=False)
+    return out.astype(orig_dtype, copy=False), coverage
 
 
 def _kernel_halo(method: ResamplingMethod, scale: float) -> int:
@@ -996,3 +1092,28 @@ def _kernel_halo(method: ResamplingMethod, scale: float) -> int:
     if method == "nearest":
         return 0
     return math.ceil(_BASE_RADIUS[method] * max(1.0, scale))
+
+
+def _and_coverage(
+    coverage: np.ndarray | None, covered: np.ndarray
+) -> np.ndarray | None:
+    """AND *covered* into *coverage*, collapsing an all-covered result to None."""
+    merged = covered if coverage is None else coverage & covered
+    return None if merged.all() else merged
+
+
+def _fill_uncovered(
+    out: np.ndarray, coverage: np.ndarray | None, nodata: int | float | None
+) -> np.ndarray:
+    """Blank the destination pixels no source pixel reaches.
+
+    Only for the no-sentinel case; with *nodata* set the resamplers already
+    wrote it there.  Without one nothing means "invalid", so zero — what GDAL
+    leaves outside the source footprint — is the honest stand-in.  The mask is
+    what actually distinguishes them; this keeps a caller that ignores it from
+    being handed a replicated border pixel instead.
+    """
+    if coverage is None or nodata is not None:
+        return out
+    out[:, ~coverage] = 0
+    return out

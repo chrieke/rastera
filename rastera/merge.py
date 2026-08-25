@@ -360,7 +360,13 @@ async def _gather_and_paste(
             dst_rows, dst_cols, src_rows, src_cols = slices
             src_data: np.ndarray[Any, Any] = arr.data[:, src_rows, src_cols]  # type: ignore[reportUnknownMemberType]
 
-            # Each contributor's own sentinel: using cogs[0]'s would paste
+            # Geometry first: which destination pixels this COG reaches. A
+            # source that declares no sentinel still has an edge, and without
+            # this the warp's edge-clamped pixels paste as data and mark the
+            # ground filled, locking out the neighbour that covers it.
+            src_valid = None if arr.mask is None else arr.mask[src_rows, src_cols]
+
+            # Then each contributor's own sentinel: using cogs[0]'s would paste
             # another COG's nodata as real data.
             cog_nodata = cog._nodata
             if cog_nodata is not None:
@@ -368,9 +374,10 @@ async def _gather_and_paste(
                     valid = ~np.isnan(src_data)
                 else:
                     valid = src_data != cog_nodata
-                src_valid = np.any(valid, axis=0)
-            else:
-                src_valid = None
+                sentinel_valid = np.any(valid, axis=0)
+                src_valid = (
+                    sentinel_valid if src_valid is None else src_valid & sentinel_valid
+                )
 
             if mosaic_method == "first":
                 assert filled is not None

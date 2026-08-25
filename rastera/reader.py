@@ -28,8 +28,9 @@ from .geo import (
 from .profile import RasterProfile, _build_profile
 from .resampling import (
     ResamplingMethod,
+    _fill_uncovered,
     _kernel_halo,
-    resample,
+    _resample_impl,
     validate_resampling,
 )
 from .store import (
@@ -515,7 +516,7 @@ class AsyncGeoTIFF:
             overview=overview,
         )
 
-        out_data = resample(
+        out_data, coverage = _resample_impl(
             native.data,  # type: ignore[reportUnknownMemberType]
             src_transform=native.transform,
             dst_transform=dst_transform,
@@ -525,6 +526,13 @@ class AsyncGeoTIFF:
             transformer=transformer,
             method=resampling,
         )
+        out_data = _fill_uncovered(out_data, coverage, self._nodata)
+
+        # Coverage stands in as the mask only when the dataset declares no
+        # sentinel. With one, the warp already wrote it outside the footprint
+        # and ``as_masked()`` finds it by value; handing over coverage instead
+        # would unmask every *interior* nodata pixel, which it knows nothing of.
+        mask = coverage if self._nodata is None else None
 
         return _make_output_array(
             out_data,
@@ -532,6 +540,7 @@ class AsyncGeoTIFF:
             dst_width,
             dst_height,
             self._output_geotiff_ref(out_crs),
+            mask=mask,
         )
 
     async def _read_native(
@@ -859,10 +868,11 @@ def _make_output_array(
     width: int,
     height: int,
     geotiff: _GeoTIFFLike | _CrsNodata,
+    mask: np.ndarray | None = None,
 ) -> RasterArray:
     return RasterArray(
         data=data,
-        mask=None,
+        mask=mask,
         width=width,
         height=height,
         count=data.shape[0],
