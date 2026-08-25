@@ -15,6 +15,7 @@ from pyproj import CRS, Transformer
 
 from .geo import (
     BBox,
+    WindowOutOfRangeError,
     _is_on_res_grid,
     _normalize_crs,
     bounds_from_transform,
@@ -221,23 +222,41 @@ class AsyncGeoTIFF:
         Args:
             bbox: Must be in *bbox_crs*, which must equal *target_crs* if set,
                 else the dataset CRS.
-            window: Combines with *target_resolution* but not with *target_crs*.
+            window: In full-resolution pixels. Combines with
+                *target_resolution* but not with *target_crs*. Naming pixels
+                the dataset does not have raises
+                :class:`rastera.WindowOutOfRangeError` rather than padding —
+                unlike *bbox*, which clips. A window is an exact pixel range,
+                so overhanging one is a mistake and not a partial request.
             band_indices: 1-based.
             snap_to_grid: When True (default) and *target_resolution* is
                 given with a bbox, the output grid is rounded outward onto
                 multiples of ``target_resolution`` — see
                 :func:`rastera.snapped_grid_for_bbox`. Transform and shape
                 are then a pure function of bbox and resolution; sources
-                already on that grid are copied 1:1 (clipped to the dataset
-                extent), anything else is resampled onto it, shifting
-                values by up to half a pixel. Without *target_resolution*
-                the window snaps outward on the source grid instead — a 1:1
-                copy of the stored pixels. When False, the transform is
-                anchored at ``bbox``. A native read then matches its extent
-                to within half a pixel —
+                already on that grid are copied 1:1, anything else is
+                resampled onto it, shifting values by up to half a pixel.
+                Without *target_resolution* the window snaps outward on the
+                source grid instead — a 1:1 copy of the stored pixels. When
+                False, the transform is anchored at ``bbox``. A native read
+                then matches its extent to within half a pixel —
                 ``rasterio.read(window=from_bounds(...))`` behaviour; a
                 resampled one is ceil-sized, so the max edges can overhang
                 ``bbox`` by up to a pixel.
+
+                Within one CRS the result is clipped to the dataset either
+                way, so a bbox reaching past the edge comes back smaller
+                rather than padded — ``rasterio.read``'s default, where
+                padding is ``boundless=True``. A reprojecting read is not
+                clipped, matching ``gdalwarp -te``: it returns the whole grid
+                the bbox names, and the pixels with no source behind them
+                carry the dataset's ``nodata``, or 0 where it declares none.
+                Reprojecting leaves some of those regardless, since the grid
+                is the envelope of a footprint that arrives rotated. Which
+                pixels they were is on ``RasterArray.mask`` when the dataset
+                declares no sentinel — 0 is real data in most rasters, so
+                comparing against it would blank them; when it does declare
+                one the value is in the pixels and ``as_masked()`` finds it.
             use_overviews: When True, reads from pre-computed COG overview
                 levels to save bandwidth, and only when the read actually
                 changes resolution — a native-resolution or purely
@@ -265,6 +284,8 @@ class AsyncGeoTIFF:
             raise ValueError("bbox_crs is required when bbox is provided")
         if window is not None and target_crs is not None:
             raise ValueError("Cannot combine window with target_crs")
+        if window is not None:
+            _validate_window(gt, window)
         # ``resampling`` is checked here rather than left to ``resample()``: the
         # native path never calls it, so an unknown method was silently ignored
         # on exactly the reads where it looked like it had been honoured.
@@ -432,6 +453,23 @@ class AsyncGeoTIFF:
             target_bbox = transform_bbox(BBox(*gt.bounds), src_crs, out_crs)
         else:
             target_bbox = BBox(*gt.bounds)
+
+        # Clip to the dataset, matching the native path (see read()'s docstring
+        # for the semantics). The *bbox* and not the grid, so the result stays an
+        # integer-pixel sub-window of the unclipped grid and
+        # ``snapped_grid_for_bbox``'s lattice still describes it.
+        #
+        # Same CRS only. The native path this agrees with is itself unreachable
+        # when reprojecting, so that is the whole of the disagreement — and
+        # clipping a warp would mean transforming the dataset's extent into
+        # *out_crs*, which ``transform_bounds`` under-reports badly for a wide
+        # source: a global EPSG:4326 extent comes back as x ∈ [500000, 1505647]
+        # in UTM32N, rejecting any AOI west of the central meridian.
+        if bbox is not None and not needs_reproject:
+            clipped = target_bbox.intersect(BBox(*gt.bounds))
+            if clipped is None:
+                raise WindowOutOfRangeError("BBox does not intersect image")
+            target_bbox = clipped
 
         if target_resolution is not None:
             res = target_resolution
@@ -1001,3 +1039,29 @@ def _resolve_meta_overrides(
     if "crs" in overrides:
         resolved["crs"] = _normalize_crs(overrides["crs"])
     return resolved
+
+
+def _validate_window(gt: _GeoTIFFLike, window: Window) -> None:
+    """Reject a window naming pixels the dataset does not have.
+
+    Checked in ``read`` ahead of the native/resampled split, because neither
+    branch sees it reliably on its own. The native path hands the window to
+    whatever backs ``_geotiff`` and inherits that backend's answer: a real file
+    raises async-geotiff's ``WindowError``, while a synthesized dataset pads
+    instead — DIMAP pre-fills nodata and ``_tile_decomposition`` simply omits
+    the tiles that do not exist. The resampled path converts the window to
+    world coordinates first, so nothing downstream ever sees it. One check here
+    means one answer for every dataset type.
+    """
+    if (
+        window.col_off < 0
+        or window.row_off < 0
+        or window.col_off + window.width > gt.width
+        or window.row_off + window.height > gt.height
+    ):
+        raise WindowOutOfRangeError(
+            f"Window extends outside image bounds. Window: "
+            f"cols={window.col_off}:{window.col_off + window.width}, "
+            f"rows={window.row_off}:{window.row_off + window.height}. "
+            f"Image: {gt.width}x{gt.height}."
+        )

@@ -142,10 +142,11 @@ def snapped_grid_for_bbox(
 
     Returns ``(transform, width, height)`` — exactly the grid
     :func:`rastera.merge` and :meth:`rastera.AsyncGeoTIFF.read` return for
-    *bbox* at ``target_resolution=res`` with ``snap_to_grid=True`` (reads clip
-    it to the dataset extent). Depends only on the arguments, so callers can
-    size buffers or key caches on it; each edge not already on the grid grows
-    outward by less than one pixel.
+    *bbox* at ``target_resolution=res`` with ``snap_to_grid=True`` (a same-CRS
+    read clips it to the dataset extent; a reprojecting one returns the whole
+    grid — see :meth:`rastera.AsyncGeoTIFF.read`). Depends only on the
+    arguments, so callers can size buffers or key caches on it; each edge not
+    already on the grid grows outward by less than one pixel.
     """
     bbox = ensure_bbox(bbox)
     validate_resolution(res)
@@ -164,7 +165,11 @@ def snapped_grid_for_bbox(
 
 
 class WindowOutOfRangeError(ValueError):
-    """A bbox rounds to a zero-sized pixel window."""
+    """A read names no readable pixels.
+
+    Either a bbox that misses the dataset or rounds to a zero-sized pixel
+    window, or a window reaching outside the dataset's own extent.
+    """
 
 
 def window_from_bbox(

@@ -21,7 +21,7 @@ from rastera.formats.dimap import (
     _resolve_tile_uri,
     _tile_decomposition,
 )
-from rastera.geo import BBox
+from rastera.geo import BBox, WindowOutOfRangeError
 from rastera.reader import AsyncGeoTIFF
 
 # Minimal but realistic PNEO-flavoured DIMAP: two band-groups (RGB + NED),
@@ -1258,6 +1258,19 @@ class TestReadDefaults:
         data: np.ndarray[Any, Any] = arr.data  # type: ignore[reportUnknownMemberType]
         np.testing.assert_array_equal(data[0, :, :50], 42)
         np.testing.assert_array_equal(data[0, :, 50:], 65535)
+
+    @pytest.mark.parametrize("res", [None, 0.6])
+    async def test_oversized_window_is_rejected(self, res: float | None):
+        """The padding above is an internal mechanism for the bbox path, not an
+        answer to give ``read(window=...)``. DIMAP overrides ``_read_native``,
+        so it never saw async-geotiff's own window check — an 850-wide window on
+        an 800-wide mosaic came back padded to 850 at native resolution while
+        the resampled path rejected it."""
+        layout = _two_group_layout()
+        ds = _DIMAPDataset("/fake/DIM.xml", layout)
+        window = Window(col_off=0, row_off=0, width=layout.width + 50, height=10)
+        with pytest.raises(WindowOutOfRangeError, match="outside image bounds"):
+            await ds.read(window=window, band_indices=[1], target_resolution=res)
 
 
 # ── concurrency: dimap ─────────────────────────────────────────────
