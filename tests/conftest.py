@@ -6,6 +6,7 @@ import numpy as np
 import pytest
 from affine import Affine
 from async_geotiff import RasterArray
+from async_geotiff.exceptions import WindowError
 
 # The attribute surface a real GeoTIFF offers rastera, plus ``read``. Spec'ing
 # the mock to it turns a read outside that contract into an AttributeError
@@ -127,9 +128,11 @@ def slicing_read(geotiff: Any, full: np.ndarray[Any, Any]):
     ``AsyncMock(return_value=...)`` ignores the window it was handed, which
     hides every bug about *which* pixels a read asked for.
 
-    A window reaching outside the array raises, as async-geotiff's own reader
-    does. NumPy would clip the slice instead and hand back a short array, which
-    hides an out-of-bounds read the same way.
+    A window reaching outside the array raises ``WindowError``, the same class
+    async-geotiff's own reader raises — which is *not* a ``ValueError``, so a
+    mock raising one would hide a caller that only catches async-geotiff's.
+    NumPy would clip the slice instead and hand back a short array, which hides
+    an out-of-bounds read the same way.
     """
 
     async def _read(window: Any) -> Any:
@@ -140,7 +143,7 @@ def slicing_read(geotiff: Any, full: np.ndarray[Any, Any]):
             or window.col_off + window.width > n_cols
             or window.row_off + window.height > n_rows
         ):
-            raise ValueError(
+            raise WindowError(
                 f"Window extends outside image bounds. Window: "
                 f"cols={window.col_off}:{window.col_off + window.width}, "
                 f"rows={window.row_off}:{window.row_off + window.height}. "

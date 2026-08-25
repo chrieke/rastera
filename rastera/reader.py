@@ -222,7 +222,12 @@ class AsyncGeoTIFF:
         Args:
             bbox: Must be in *bbox_crs*, which must equal *target_crs* if set,
                 else the dataset CRS.
-            window: Combines with *target_resolution* but not with *target_crs*.
+            window: In full-resolution pixels. Combines with
+                *target_resolution* but not with *target_crs*. Naming pixels
+                the dataset does not have raises
+                :class:`rastera.WindowOutOfRangeError` rather than padding —
+                unlike *bbox*, which clips. A window is an exact pixel range,
+                so overhanging one is a mistake and not a partial request.
             band_indices: 1-based.
             snap_to_grid: When True (default) and *target_resolution* is
                 given with a bbox, the output grid is rounded outward onto
@@ -275,6 +280,8 @@ class AsyncGeoTIFF:
             raise ValueError("bbox_crs is required when bbox is provided")
         if window is not None and target_crs is not None:
             raise ValueError("Cannot combine window with target_crs")
+        if window is not None:
+            _validate_window(gt, window)
         # ``resampling`` is checked here rather than left to ``resample()``: the
         # native path never calls it, so an unknown method was silently ignored
         # on exactly the reads where it looked like it had been honoured.
@@ -392,23 +399,6 @@ class AsyncGeoTIFF:
         region entirely.
         """
         gt = self._geotiff
-        # A window naming pixels the image does not have is a mistake, not a
-        # request to pad. The native path already says so — async-geotiff
-        # rejects the window it is handed — but this path converts the window to
-        # world coordinates first, so nothing downstream ever saw it and an
-        # oversized one came back silently resampled to the larger shape.
-        if (
-            window.col_off < 0
-            or window.row_off < 0
-            or window.col_off + window.width > gt.width
-            or window.row_off + window.height > gt.height
-        ):
-            raise ValueError(
-                f"Window extends outside image bounds. Window: "
-                f"cols={window.col_off}:{window.col_off + window.width}, "
-                f"rows={window.row_off}:{window.row_off + window.height}. "
-                f"Image: {gt.width}x{gt.height}."
-            )
         target_bbox = bounds_from_transform(
             gt.transform * Affine.translation(window.col_off, window.row_off),
             window.width,
@@ -1045,3 +1035,29 @@ def _resolve_meta_overrides(
     if "crs" in overrides:
         resolved["crs"] = _normalize_crs(overrides["crs"])
     return resolved
+
+
+def _validate_window(gt: _GeoTIFFLike, window: Window) -> None:
+    """Reject a window naming pixels the dataset does not have.
+
+    Checked in ``read`` ahead of the native/resampled split, because neither
+    branch sees it reliably on its own. The native path hands the window to
+    whatever backs ``_geotiff`` and inherits that backend's answer: a real file
+    raises async-geotiff's ``WindowError``, while a synthesized dataset pads
+    instead — DIMAP pre-fills nodata and ``_tile_decomposition`` simply omits
+    the tiles that do not exist. The resampled path converts the window to
+    world coordinates first, so nothing downstream ever sees it. One check here
+    means one answer for every dataset type.
+    """
+    if (
+        window.col_off < 0
+        or window.row_off < 0
+        or window.col_off + window.width > gt.width
+        or window.row_off + window.height > gt.height
+    ):
+        raise WindowOutOfRangeError(
+            f"Window extends outside image bounds. Window: "
+            f"cols={window.col_off}:{window.col_off + window.width}, "
+            f"rows={window.row_off}:{window.row_off + window.height}. "
+            f"Image: {gt.width}x{gt.height}."
+        )

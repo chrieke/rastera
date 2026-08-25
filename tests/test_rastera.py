@@ -359,6 +359,20 @@ class TestReadArgumentValidation:
         with pytest.raises(ValueError, match="Unknown resampling method"):
             await self._obj().read(resampling="lanczos")  # type: ignore[arg-type]
 
+    @pytest.mark.parametrize("res", [None, 1.0, 2.0])
+    async def test_oversized_window_rejected_before_any_read(self, res: float | None):
+        """Checked with the other arguments rather than inside a branch: the
+        native path used to inherit whichever error backed ``_geotiff`` (a real
+        file gives async-geotiff's ``WindowError``, which is not even a
+        ``ValueError``) and the resampled path resolved the window to world
+        coordinates before anything downstream could see it. ``_obj``'s read
+        raises if reached, so this also pins that no request is issued."""
+        with pytest.raises(WindowOutOfRangeError, match="outside image bounds"):
+            await self._obj().read(
+                window=Window(col_off=10, row_off=0, width=10, height=10),
+                target_resolution=res,
+            )
+
     @pytest.mark.parametrize("bad", [0.0, -1.0, float("nan"), float("inf")])
     async def test_bad_target_resolution_rejected(self, bad: float):
         with pytest.raises(ValueError, match="target_resolution"):
@@ -785,20 +799,6 @@ class TestReadGridInvariance:
             data: np.ndarray[Any, Any] = result.data  # type: ignore[reportUnknownMemberType]
             assert data.shape == (1, 40, 40), minx
             assert (data == 7).all(), minx
-
-    async def test_oversized_window_is_rejected_on_both_paths(self):
-        """The native path lets async-geotiff reject the window it is handed.
-        The resampled path resolves the window to world coordinates first, so
-        nothing downstream ever saw it and an oversized one came back silently
-        resampled to the larger shape.
-        """
-        obj = self._obj()  # 20x20
-        window = Window(col_off=0, row_off=0, width=30, height=30)
-        # res 1.0 is the native path (async-geotiff's own WindowError, whose
-        # class is not importable), 2.0 the resampled one.
-        for res in (1.0, 2.0):
-            with pytest.raises(Exception, match="outside image bounds"):
-                await obj.read(window=window, target_resolution=res)
 
     async def test_disjoint_bbox_raises_on_both_paths(self):
         obj = self._obj()

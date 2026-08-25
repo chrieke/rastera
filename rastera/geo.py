@@ -164,7 +164,11 @@ def snapped_grid_for_bbox(
 
 
 class WindowOutOfRangeError(ValueError):
-    """A bbox rounds to a zero-sized pixel window."""
+    """A read names no readable pixels.
+
+    Either a bbox that misses the dataset or rounds to a zero-sized pixel
+    window, or a window reaching outside the dataset's own extent.
+    """
 
 
 def window_from_bbox(
