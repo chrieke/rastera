@@ -69,6 +69,10 @@ raster_array = await rastera.merge(
     use_overviews=False,
 )
 
+# False wherever no input covered the pixel — it holds fill_value there,
+# whether that is ground past the tiles or a source's own nodata.
+coverage = raster_array.mask
+
 # The exact grid read/merge return for snap_to_grid=True, without any I/O —
 # use it to pre-size buffers, key caches, or align a bbox to the grid.
 transform, width, height = rastera.snapped_grid_for_bbox(bbox_shared, 10)

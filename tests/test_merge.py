@@ -980,6 +980,9 @@ class TestMixedInputs:
         out_data: np.ndarray[Any, Any] = out.data  # type: ignore[reportUnknownMemberType]
         assert np.all(out_data[0, :, :10] == 7)
         assert np.all(out_data[0, :, 10:] == 0)
+        assert out.mask is not None
+        assert out.mask[:, :10].all()
+        assert not out.mask[:, 10:].any()
 
     async def test_mixed_dtype_rejected(self):
         """A float32 contribution into a uint16 output raised an opaque
@@ -1199,29 +1202,36 @@ class TestMergeSharesTheWarpSeam:
 def _tile(
     origin_x: float,
     origin_y: float,
-    value: int,
+    value: int | np.ndarray[Any, Any],
     *,
     crs: int = 32632,
     scale: float = 1.0,
     size: int = 20,
     nodata: float | None = None,
 ) -> AsyncGeoTIFF:
-    """A uniform-*value* tile whose reads go through the real window arithmetic.
+    """A tile of *value* whose reads go through the real window arithmetic.
 
-    ``_make_windowed_cog`` cannot stand in: it pins nodata to 0, which is the
-    one thing these tests vary.
+    *value* is a fill, or a ``(bands, size, size)`` array for a tile that is
+    not uniform. ``_make_windowed_cog`` cannot stand in: it pins nodata to 0,
+    which is the one thing these tests vary.
     """
+    full = (
+        value
+        if isinstance(value, np.ndarray)
+        else np.full((1, size, size), value, np.uint16)
+    )
     cog = _make_cog(
         width=size,
         height=size,
         scale=scale,
+        bands=full.shape[0],
         origin_x=origin_x,
         origin_y=origin_y,
         crs=crs,
         nodata=nodata,
     )
     gt: Any = cog._geotiff
-    gt.read = slicing_read(gt, np.full((1, size, size), value, np.uint16))
+    gt.read = slicing_read(gt, full)
     return cog
 
 
@@ -1350,3 +1360,146 @@ class TestMergeCoverage:
         data: np.ndarray[Any, Any] = result.data  # type: ignore[reportUnknownMemberType]
         assert (data[0, :, :5] == 1).all()
         assert (data[0, :, 5:] == 2).all()
+
+
+class TestMergeOutputMask:
+    """merge fills gaps with fill_value; the mask is how a caller finds them.
+
+    Without it the only signal is ``as_masked()``'s ``masked_equal(data,
+    nodata)`` fallback, which fires only when *fill_value* happens to equal the
+    base's declared sentinel — and misfires across contributors declaring
+    different ones.
+    """
+
+    BBOX = BBox(0, 0, 20, 10)
+
+    async def _merge(
+        self, cogs: list[AsyncGeoTIFF], *, bbox: BBox | None = None, **kw: Any
+    ) -> RasterArray:
+        return await merge(
+            cogs,
+            bbox=self.BBOX if bbox is None else bbox,
+            bbox_crs=32632,
+            target_crs=32632,
+            target_resolution=1.0,
+            **kw,
+        )
+
+    @pytest.mark.parametrize("mosaic_method", ["first", "last"])
+    @pytest.mark.parametrize(
+        ("nodata", "fill_value"),
+        [(None, 0), (0.0, 0), (255.0, 0), (255.0, 255)],
+        ids=["no_nodata", "fill_is_nodata", "fill_differs", "fill_is_nodata_255"],
+    )
+    async def test_uncovered_ground_is_masked(
+        self,
+        nodata: float | None,
+        fill_value: int,
+        mosaic_method: Literal["first", "last"],
+    ):
+        """Only the two ``fill_value == nodata`` rows were findable before, and
+        only through the value fallback."""
+        # Off-grid origin: the snapped output grid overhangs the tile, so this
+        # is the reprojected path.
+        o = 0.3
+        result = await self._merge(
+            [_tile(o, 10 + o, 7, size=10, nodata=nodata)],
+            bbox=BBox(o, o, 10 + o, 10 + o),
+            fill_value=fill_value,
+            mosaic_method=mosaic_method,
+        )
+        mask = result.mask
+        assert mask is not None
+        assert mask.shape == (11, 11)
+        assert not mask[0, :].any()  # north row, past the tile
+        assert not mask[:, 10].any()  # east column, past the tile
+        assert mask[1:, :10].all()
+
+    async def test_native_path_reports_the_ground_no_tile_reaches(self):
+        """The copy path never runs the warp, so its coverage is the paste
+        geometry alone."""
+        cog = _tile(0.0, 10.0, 7, size=10)
+        to_grid_calls = spy_read_to_grid(cog)
+        result = await self._merge([cog])
+        assert not to_grid_calls
+        mask = result.mask
+        assert mask is not None
+        assert mask[:, :10].all()
+        assert not mask[:, 10:].any()
+
+    async def test_an_interior_nodata_hole_is_masked(self):
+        """The edge is not the only gap: a tile's own sentinel mid-footprint
+        leaves fill_value behind too."""
+        data = np.full((1, 10, 10), 7, np.uint16)
+        data[0, 4:6, 4:6] = 255
+        result = await self._merge(
+            [_tile(0.0, 10.0, data, size=10, nodata=255.0)],
+            bbox=BBox(0, 0, 10, 10),
+            fill_value=0,
+        )
+        hole = np.zeros((10, 10), dtype=bool)
+        hole[4:6, 4:6] = True
+        np.testing.assert_array_equal(result.mask, ~hole)
+        data: np.ndarray[Any, Any] = result.data  # type: ignore[reportUnknownMemberType]
+        assert (data[0][hole] == 0).all()
+
+    async def test_the_bases_sentinel_does_not_mask_another_tile(self):
+        """A declares 255, B declares none and is solid 255. merge reports A's
+        sentinel, so the fallback used to blank every pixel B contributed."""
+        a = _tile(0.0, 10.0, 7, size=10, nodata=255.0)
+        b = _tile(10.0, 10.0, 255, size=10)
+        result = await self._merge([a, b])
+        assert result.nodata == 255
+        assert result.mask is not None and result.mask.all()
+        assert not np.ma.getmaskarray(result.as_masked()).any()
+
+    @pytest.mark.parametrize("mosaic_method", ["first", "last"])
+    async def test_a_fully_covered_merge_still_reports_a_mask(
+        self, mosaic_method: Literal["first", "last"]
+    ):
+        """Deliberately unlike read(), which hands back ``mask=None`` once the
+        warp covered everything: here that would re-enable the value fallback,
+        which is the thing that misfires across mixed sentinels."""
+        result = await self._merge(
+            [_tile(0.0, 10.0, 7, size=10)],
+            bbox=BBox(0, 0, 10, 10),
+            mosaic_method=mosaic_method,
+        )
+        assert result.mask is not None
+        assert result.mask.all()
+
+    async def test_a_band_holding_the_sentinel_does_not_mask_the_pixel(self):
+        """Coverage is per pixel, like a GeoTIFF mask band, and it is what the
+        paste already keyed off; the fallback blanked the band on its own."""
+        data = np.full((3, 10, 10), 7, np.uint16)
+        data[0, 5, 5] = 0
+        result = await self._merge(
+            [_tile(0.0, 10.0, data, size=10, nodata=0.0)],
+            bbox=BBox(0, 0, 10, 10),
+            fill_value=0,
+        )
+        assert result.mask is not None
+        assert result.mask.all()
+        assert not np.ma.getmaskarray(result.as_masked()).any()
+
+    async def test_last_keeps_coverage_a_later_nodata_tile_writes_over(self):
+        """The accumulation ``"last"`` needs: it overwrites pixels by design,
+        but a later tile that is all sentinel over the overlap leaves the
+        earlier one's pixels in place, so they are still covered."""
+        a = _tile(0.0, 10.0, 7, size=10, nodata=255.0)
+        b = _tile(0.0, 10.0, 255, size=10, nodata=255.0)
+        result = await self._merge(
+            [a, b], bbox=BBox(0, 0, 10, 10), mosaic_method="last"
+        )
+        assert result.mask is not None
+        assert result.mask.all()
+        data: np.ndarray[Any, Any] = result.data  # type: ignore[reportUnknownMemberType]
+        assert (data[0] == 7).all()
+
+    async def test_a_merge_no_tile_reaches_is_all_gap(self):
+        """The no-contributor return path reports the whole grid as fill."""
+        result = await self._merge(
+            [_tile(0.0, 10.0, 7, size=10)], bbox=BBox(100, 100, 110, 110)
+        )
+        assert result.mask is not None
+        assert not result.mask.any()
