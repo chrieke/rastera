@@ -242,7 +242,7 @@ async def test_merge_without_nodata_stops_at_the_scene_edge(tmp_path: Path):
         # Anchors the grid on the bbox, as -te does, and takes the warp rather
         # than the native copy path.
         snap_to_grid=False,
-        fill_value=0,
+        nodata=0,
     )
     data: np.ndarray[Any, Any] = merged.data  # type: ignore[reportUnknownMemberType]
     got = np.asarray(data)

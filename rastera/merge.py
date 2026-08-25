@@ -40,7 +40,7 @@ async def merge(
     bbox: BBox | tuple[float, float, float, float],
     bbox_crs: int | CRS,
     band_indices: Sequence[int] | None = None,
-    fill_value: int | float = 0,
+    nodata: int | float | None = None,
     target_crs: int | CRS | None = None,
     target_resolution: float,
     mosaic_method: Literal["first", "last"] = "first",
@@ -54,12 +54,15 @@ async def merge(
     Args:
         bbox_crs: The bbox is transformed to the COGs' native CRS automatically.
         band_indices: 1-based.
-        fill_value: For output-grid pixels covered by no input (not always 0).
-            Those pixels are reported as invalid on the returned
-            ``RasterArray.mask``, which merge always populates. The result's
-            ``nodata`` is the first input's sentinel and the gaps do not use
-            it, so tag a written file from *fill_value* or from the mask, not
-            from ``arr.nodata``.
+        nodata: The value that means "no data" in the output: merge fills
+            every uncovered pixel with it and reports it as ``arr.nodata``,
+            so a file written from the result can be tagged with it.
+            Defaults to the first input's nodata, like
+            ``rasterio.merge.merge``; if that input has none, gaps get 0 and
+            ``arr.nodata`` stays ``None``, since 0 is usually real data.
+            The inputs are unaffected — each is still read through its own
+            nodata — and real pixels can hold this value too, so
+            ``RasterArray.mask`` is what actually marks the gaps.
         target_crs: Each COG is reprojected into this CRS before merging when
             it differs from the source. When ``None``, inferred from the
             inputs using *crs_method*.
@@ -104,7 +107,9 @@ async def merge(
         )
     validate_resampling(resampling)
     validate_resolution(target_resolution)
-    _validate_fill_value(fill_value, cogs[0]._geotiff.dtype)
+    # Before any read: an unusable sentinel should fail here rather than
+    # several frames deep in np.full.
+    fill_value, out_nodata = _resolve_output_nodata(nodata, cogs[0])
 
     bbox_crs = _normalize_crs(bbox_crs)
     if target_crs is not None:
@@ -170,6 +175,7 @@ async def merge(
             band_indices=band_indices,
             n_out_bands=n_out_bands,
             fill_value=fill_value,
+            out_nodata=out_nodata,
             target_crs=target_crs,
             target_resolution=target_resolution,
             mosaic_method=mosaic_method,
@@ -215,11 +221,7 @@ async def merge(
         read_fn=_read_native_bands,
         mosaic_method=mosaic_method,
     )
-    # ``base._nodata``, not ``base_gt.nodata``: the two differ for a VRT, whose
-    # declared <NoDataValue> overrides its source's. The compositing above
-    # already keys off the former, so reporting the latter would advertise a
-    # sentinel the pixels don't use.
-    geotiff_ref = _CrsNodata(CRS.from_epsg(native_crs), base._nodata)
+    geotiff_ref = _CrsNodata(CRS.from_epsg(native_crs), out_nodata)
     return _make_output_array(
         out_data, window_transform, win_width, win_height, geotiff_ref, mask=coverage
     )
@@ -233,6 +235,7 @@ async def _merge_reprojected(
     band_indices: Sequence[int] | None,
     n_out_bands: int,
     fill_value: int | float,
+    out_nodata: int | float | None,
     target_crs: int,
     target_resolution: float,
     mosaic_method: Literal["first", "last"] = "first",
@@ -300,7 +303,7 @@ async def _merge_reprojected(
         mosaic_method=mosaic_method,
     )
 
-    geotiff_ref = _CrsNodata(CRS.from_epsg(out_crs), base._nodata)
+    geotiff_ref = _CrsNodata(CRS.from_epsg(out_crs), out_nodata)
     return _make_output_array(
         out_data, out_transform, out_w, out_h, geotiff_ref, mask=coverage
     )
@@ -344,8 +347,8 @@ async def _gather_and_paste(
 
     # Allocated for both methods, and returned even when it ends up all True:
     # a caller handed mask=None falls back to masked_equal(data, nodata), which
-    # knows nothing of fill_value and masks a second contributor's real pixels
-    # that happen to equal the first one's sentinel.
+    # cannot tell a gap from a real pixel that happens to hold the same value —
+    # a contributor declaring no sentinel of its own is full of them.
     filled = np.zeros((dst_height, dst_width), dtype=bool)
 
     if not contributing:
@@ -457,8 +460,30 @@ def _output_subgrid(
     return sub_transform, sub_w, sub_h
 
 
-def _validate_fill_value(fill_value: int | float, dtype: np.dtype[Any] | None) -> None:
-    """Reject a fill value the output dtype cannot carry.
+def _resolve_output_nodata(
+    nodata: int | float | None, base: AsyncGeoTIFF
+) -> tuple[int | float, int | float | None]:
+    """The value the gaps hold, and the sentinel the output reports.
+
+    One value in two roles, so a file written from the result can be tagged
+    with what its own pixels use. Taken from *nodata*, else from the first
+    input's own declaration — ``base._nodata``, not ``base._geotiff.nodata``:
+    the two differ for a VRT, whose declared <NoDataValue> overrides its
+    source's, and the compositing already keys off the former. With neither,
+    the gaps hold 0 but the output reports nothing, because 0 is a real
+    measurement in most rasters and claiming it would blank them.
+
+    An inherited sentinel needs no validation: ``_coerce_nodata`` already
+    dropped it if this dtype could not carry it.
+    """
+    if nodata is None:
+        return (0, None) if base._nodata is None else (base._nodata, base._nodata)
+    _validate_nodata(nodata, base._geotiff.dtype)
+    return nodata, nodata
+
+
+def _validate_nodata(nodata: int | float, dtype: np.dtype[Any] | None) -> None:
+    """Reject a sentinel the output dtype cannot carry.
 
     ``np.full`` is inconsistent about these: out-of-range integers raise a bare
     ``OverflowError`` naming neither the argument nor the dtype, while a
@@ -467,28 +492,26 @@ def _validate_fill_value(fill_value: int | float, dtype: np.dtype[Any] | None) -
     """
     if dtype is None:
         return
-    if not isinstance(fill_value, int | float | np.number) or isinstance(
-        fill_value, bool
-    ):
-        raise ValueError(f"fill_value must be a number, got {fill_value!r}")
+    if not isinstance(nodata, int | float | np.number) or isinstance(nodata, bool):
+        raise ValueError(f"nodata must be a number, got {nodata!r}")
     if dtype.kind not in ("i", "u", "b"):
         return
-    if math.isnan(fill_value) or math.isinf(fill_value):
+    if math.isnan(nodata) or math.isinf(nodata):
         raise ValueError(
-            f"fill_value={fill_value!r} cannot be represented in {dtype}; "
-            f"pass a finite integer fill"
+            f"nodata={nodata!r} cannot be represented in {dtype}; "
+            f"pass a finite integer sentinel"
         )
-    if fill_value != int(fill_value):
+    if nodata != int(nodata):
         raise ValueError(
-            f"fill_value={fill_value!r} is not an integer and would be "
+            f"nodata={nodata!r} is not an integer and would be "
             f"truncated in a {dtype} mosaic"
         )
     if dtype.kind == "b":
         return  # np.iinfo has no bool entry, and there is no range to check
     info = np.iinfo(dtype)
-    if not info.min <= fill_value <= info.max:
+    if not info.min <= nodata <= info.max:
         raise ValueError(
-            f"fill_value={fill_value!r} is outside the range of {dtype} "
+            f"nodata={nodata!r} is outside the range of {dtype} "
             f"[{info.min}, {info.max}]"
         )
 

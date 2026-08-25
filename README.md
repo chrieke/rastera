@@ -59,7 +59,7 @@ raster_array = await rastera.merge(
     bbox=bbox_shared,
     bbox_crs=utm_crs,
     band_indices=[1],
-    fill_value=0,
+    nodata=0,  # what uncovered pixels get, and what arr.nodata reports
     target_crs=utm_crs,
     target_resolution=10,
     resampling="nearest",  # also: "bilinear", "cubic"
@@ -69,8 +69,8 @@ raster_array = await rastera.merge(
     use_overviews=False,
 )
 
-# False wherever no input covered the pixel — it holds fill_value there,
-# whether that is ground past the tiles or a source's own nodata.
+# True where an input covered the pixel, False where none did. Gaps hold the
+# nodata above — but real pixels can too, so the mask is what tells them apart.
 coverage = raster_array.mask
 
 # The exact grid read/merge return for snap_to_grid=True, without any I/O —

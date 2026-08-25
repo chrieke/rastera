@@ -209,24 +209,24 @@ class TestMergeArgumentValidation:
             await self._merge(target_resolution=bad)
 
     @pytest.mark.parametrize("bad", [-1, 70000])
-    async def test_fill_value_outside_dtype_range_rejected(self, bad: int):
+    async def test_nodata_outside_dtype_range_rejected(self, bad: int):
         """np.full raised a bare OverflowError naming neither uint16 nor the
-        fill_value argument."""
+        nodata argument."""
         with pytest.raises(ValueError, match="outside the range"):
-            await self._merge(fill_value=bad)
+            await self._merge(nodata=bad)
 
-    async def test_fractional_fill_value_rejected(self):
+    async def test_fractional_nodata_rejected(self):
         """0.5 was truncated to 0 in a uint16 mosaic — indistinguishable from
-        a deliberate fill_value=0."""
+        a deliberate nodata=0."""
         with pytest.raises(ValueError, match="not an integer"):
-            await self._merge(fill_value=0.5)
+            await self._merge(nodata=0.5)
 
-    async def test_nan_fill_value_on_integer_rejected(self):
+    async def test_nan_nodata_on_integer_rejected(self):
         """NaN also landed on 0, with only a RuntimeWarning."""
         with pytest.raises(ValueError, match="cannot be represented"):
-            await self._merge(fill_value=float("nan"))
+            await self._merge(nodata=float("nan"))
 
-    async def test_nan_fill_value_on_float_dtype_allowed(self):
+    async def test_nan_nodata_on_float_dtype_allowed(self):
         cog = _make_cog(width=10, height=10, scale=1.0, dtype=np.dtype("f4"))
         result = await merge(
             [cog],
@@ -234,7 +234,7 @@ class TestMergeArgumentValidation:
             bbox_crs=32632,
             target_crs=32632,
             target_resolution=1.0,
-            fill_value=float("nan"),
+            nodata=float("nan"),
         )
         assert np.all(np.isnan(result.data))  # type: ignore[reportUnknownMemberType]
 
@@ -262,7 +262,7 @@ class TestMergeArgumentValidation:
             bbox=BBox(0, 0, 10, 10),
             bbox_crs=32632,
             band_indices=[1],
-            fill_value=0,
+            nodata=0,
             target_crs=32632,
             target_resolution=1.0,
             mosaic_method="last",
@@ -309,8 +309,8 @@ class TestMergeCogs:
                 target_resolution=1.0,
             )
 
-    async def test_fill_value_used(self):
-        """When a COG doesn't intersect the bbox, the output should be fill_value."""
+    async def test_nodata_fills_a_bbox_no_cog_intersects(self):
+        """When a COG doesn't intersect the bbox, the output is all sentinel."""
         cog = _make_cog(width=10, height=10, scale=1.0, origin_x=100, origin_y=110)
         # bbox is at (0,0)-(10,10), cog is at (100,100)-(110,110) — no overlap
         result = await merge(
@@ -318,7 +318,7 @@ class TestMergeCogs:
             bbox=BBox(0, 0, 10, 10),
             bbox_crs=32632,
             band_indices=[1],
-            fill_value=9999,
+            nodata=9999,
             target_crs=32632,
             target_resolution=1.0,
         )
@@ -812,7 +812,7 @@ class TestMergeGridInvariance:
         assert self._grid(result) == self.GRID
         assert to_grid_calls
 
-    async def test_uncovered_margin_gets_fill_value(self):
+    async def test_uncovered_margin_gets_the_output_sentinel(self):
         cog = _make_windowed_cog(origin_x=0.0, width=10, value=7)
         result = await merge(
             [cog],
@@ -820,12 +820,12 @@ class TestMergeGridInvariance:
             bbox_crs=32632,
             target_crs=32632,
             target_resolution=1.0,
-            fill_value=9,
+            nodata=9,
         )
         data: np.ndarray[Any, Any] = result.data  # type: ignore[reportUnknownMemberType]
         assert data.shape == (1, 10, 11)
         # The tile ends at x=10; the snapped grid's last column (x 10..11) is
-        # covered by no input and must carry the fill.
+        # covered by no input and must carry the sentinel.
         assert (data[0, :, 10] == 9).all()
         assert (data[0, :, :10] == 7).all()
 
@@ -973,10 +973,10 @@ class TestMixedInputs:
             bbox=(0, 0, 200, 100),
             bbox_crs=32632,
             target_resolution=10.0,
-            fill_value=0,
+            nodata=0,
         )
         # A is fully valid; B is entirely its own nodata, so it contributes
-        # nothing and its half stays at fill_value.
+        # nothing and its half stays at the output sentinel.
         out_data: np.ndarray[Any, Any] = out.data  # type: ignore[reportUnknownMemberType]
         assert np.all(out_data[0, :, :10] == 7)
         assert np.all(out_data[0, :, 10:] == 0)
@@ -1225,6 +1225,7 @@ def _tile(
         height=size,
         scale=scale,
         bands=full.shape[0],
+        dtype=full.dtype,
         origin_x=origin_x,
         origin_y=origin_y,
         crs=crs,
@@ -1263,7 +1264,7 @@ class TestMergeCoverage:
             bbox_crs=32632,
             target_crs=32632,
             target_resolution=1.0,
-            fill_value=0,
+            nodata=0,
             **kw,
         )
         return result.data  # type: ignore[reportUnknownMemberType]
@@ -1302,7 +1303,7 @@ class TestMergeCoverage:
             bbox_crs=32632,
             target_crs=32632,
             target_resolution=1.0,
-            fill_value=9,
+            nodata=9,
         )
         data: np.ndarray[Any, Any] = result.data  # type: ignore[reportUnknownMemberType]
         assert data.shape == (1, 11, 11)
@@ -1326,7 +1327,7 @@ class TestMergeCoverage:
             bbox_crs=32634,
             target_crs=32634,
             target_resolution=10.0,
-            fill_value=0,
+            nodata=0,
         )
         forward: np.ndarray[Any, Any] = (await merge([west, east], **kwargs)).data  # type: ignore[reportUnknownMemberType]
         reverse: np.ndarray[Any, Any] = (await merge([east, west], **kwargs)).data  # type: ignore[reportUnknownMemberType]
@@ -1363,12 +1364,11 @@ class TestMergeCoverage:
 
 
 class TestMergeOutputMask:
-    """merge fills gaps with fill_value; the mask is how a caller finds them.
+    """merge fills gaps with its sentinel; the mask is how a caller finds them.
 
     Without it the only signal is ``as_masked()``'s ``masked_equal(data,
-    nodata)`` fallback, which fires only when *fill_value* happens to equal the
-    base's declared sentinel — and misfires across contributors declaring
-    different ones.
+    nodata)`` fallback, which cannot separate a gap from real data holding the
+    same value — and misfires across contributors declaring different ones.
     """
 
     BBOX = BBox(0, 0, 20, 10)
@@ -1387,25 +1387,39 @@ class TestMergeOutputMask:
 
     @pytest.mark.parametrize("mosaic_method", ["first", "last"])
     @pytest.mark.parametrize(
-        ("nodata", "fill_value"),
-        [(None, 0), (0.0, 0), (255.0, 0), (255.0, 255)],
-        ids=["no_nodata", "fill_is_nodata", "fill_differs", "fill_is_nodata_255"],
+        ("declared", "nodata"),
+        [
+            (None, None),
+            (None, 0),
+            (0.0, None),
+            (255.0, None),
+            (255.0, 0),
+            (255.0, 255),
+        ],
+        ids=[
+            "nothing_declared",
+            "explicit_zero",
+            "inherits_zero",
+            "inherits_255",
+            "explicit_zero_over_255",
+            "explicit_255",
+        ],
     )
     async def test_uncovered_ground_is_masked(
         self,
-        nodata: float | None,
-        fill_value: int,
+        declared: float | None,
+        nodata: int | None,
         mosaic_method: Literal["first", "last"],
     ):
-        """Only the two ``fill_value == nodata`` rows were findable before, and
-        only through the value fallback."""
+        """The mask reports the gap whatever the sentinel is, including when
+        the tile's real pixels could hold it."""
         # Off-grid origin: the snapped output grid overhangs the tile, so this
         # is the reprojected path.
         o = 0.3
         result = await self._merge(
-            [_tile(o, 10 + o, 7, size=10, nodata=nodata)],
+            [_tile(o, 10 + o, 7, size=10, nodata=declared)],
             bbox=BBox(o, o, 10 + o, 10 + o),
-            fill_value=fill_value,
+            nodata=nodata,
             mosaic_method=mosaic_method,
         )
         mask = result.mask
@@ -1429,13 +1443,13 @@ class TestMergeOutputMask:
 
     async def test_an_interior_nodata_hole_is_masked(self):
         """The edge is not the only gap: a tile's own sentinel mid-footprint
-        leaves fill_value behind too."""
+        is uncovered ground too."""
         data = np.full((1, 10, 10), 7, np.uint16)
         data[0, 4:6, 4:6] = 255
         result = await self._merge(
             [_tile(0.0, 10.0, data, size=10, nodata=255.0)],
             bbox=BBox(0, 0, 10, 10),
-            fill_value=0,
+            nodata=0,
         )
         hole = np.zeros((10, 10), dtype=bool)
         hole[4:6, 4:6] = True
@@ -1450,6 +1464,8 @@ class TestMergeOutputMask:
         b = _tile(10.0, 10.0, 255, size=10)
         result = await self._merge([a, b])
         assert result.nodata == 255
+        data: np.ndarray[Any, Any] = result.data  # type: ignore[reportUnknownMemberType]
+        assert (data[0, :, 10:] == 255).all()  # B's real pixels, kept
         assert result.mask is not None and result.mask.all()
         assert not np.ma.getmaskarray(result.as_masked()).any()
 
@@ -1476,7 +1492,7 @@ class TestMergeOutputMask:
         result = await self._merge(
             [_tile(0.0, 10.0, data, size=10, nodata=0.0)],
             bbox=BBox(0, 0, 10, 10),
-            fill_value=0,
+            nodata=0,
         )
         assert result.mask is not None
         assert result.mask.all()
@@ -1503,3 +1519,156 @@ class TestMergeOutputMask:
         )
         assert result.mask is not None
         assert not result.mask.any()
+
+
+class TestMergeNodata:
+    """One sentinel in two roles: what the gaps hold, and what the result
+    reports — so a file written from a merge can be tagged with the value its
+    own pixels use.
+
+    Split, they never agreed: gaps held ``fill_value`` (0 by default) while the
+    result reported the first input's declaration.
+    """
+
+    async def _merge(
+        self, cogs: list[AsyncGeoTIFF], *, bbox: BBox | None = None, **kw: Any
+    ) -> RasterArray:
+        return await merge(
+            cogs,
+            bbox=BBox(0, 0, 20, 10) if bbox is None else bbox,
+            bbox_crs=32632,
+            target_crs=32632,
+            target_resolution=1.0,
+            **kw,
+        )
+
+    # An on-grid origin takes the native copy path, an off-grid one the warp.
+    PATHS = pytest.mark.parametrize("origin", [0.0, 0.3], ids=["native", "warped"])
+
+    @PATHS
+    async def test_defaults_to_the_first_inputs_sentinel(self, origin: float):
+        """Was: gaps held 0 while the result reported 255."""
+        result = await self._merge(
+            [_tile(origin, 10 + origin, 7, size=10, nodata=255.0)],
+            bbox=BBox(origin, origin, 20 + origin, 10 + origin),
+        )
+        assert result.nodata == 255
+        data: np.ndarray[Any, Any] = result.data  # type: ignore[reportUnknownMemberType]
+        assert (data[0, :, 11:] == 255).all()
+
+    @PATHS
+    async def test_nothing_declared_fills_zero_and_reports_none(self, origin: float):
+        """0 is a real measurement in most rasters, so an unasked-for fill is
+        not claimed as a sentinel — ``rasterio.merge.merge`` fills the same
+        way. The mask is what marks the gap here."""
+        result = await self._merge(
+            [_tile(origin, 10 + origin, 7, size=10)],
+            bbox=BBox(origin, origin, 20 + origin, 10 + origin),
+        )
+        assert result.nodata is None
+        data: np.ndarray[Any, Any] = result.data  # type: ignore[reportUnknownMemberType]
+        assert (data[0, :, 11:] == 0).all()
+        assert result.mask is not None
+        assert not result.mask[:, 11:].any()
+
+    async def test_explicit_nodata_overrides_the_inputs(self):
+        result = await self._merge(
+            [_tile(0.0, 10.0, 7, size=10, nodata=255.0)], nodata=9
+        )
+        assert result.nodata == 9
+        data: np.ndarray[Any, Any] = result.data  # type: ignore[reportUnknownMemberType]
+        assert (data[0, :, 10:] == 9).all()
+        assert (data[0, :, :10] == 7).all()
+
+    @pytest.mark.parametrize("mosaic_method", ["first", "last"])
+    @pytest.mark.parametrize(
+        ("declared", "nodata", "expected"),
+        [
+            (None, None, None),
+            (None, 9, 9),
+            (255.0, None, 255),
+            (255.0, 9, 9),
+            (0.0, None, 0),
+        ],
+        ids=["nothing", "explicit", "inherited", "explicit_over_declared", "zero"],
+    )
+    async def test_every_gap_holds_the_reported_sentinel(
+        self,
+        declared: float | None,
+        nodata: int | None,
+        expected: int | None,
+        mosaic_method: Literal["first", "last"],
+    ):
+        """The invariant this buys: ``mask`` says which pixels are gaps, and
+        every one of them holds what ``nodata`` reports."""
+        result = await self._merge(
+            [_tile(0.0, 10.0, 7, size=10, nodata=declared)],
+            nodata=nodata,
+            mosaic_method=mosaic_method,
+        )
+        assert result.nodata == expected
+        assert result.mask is not None
+        data: np.ndarray[Any, Any] = result.data  # type: ignore[reportUnknownMemberType]
+        # 0 is the fill when no sentinel is named — reported as None precisely
+        # because it cannot be claimed.
+        assert (data[:, ~result.mask] == (0 if expected is None else expected)).all()
+
+    async def test_a_contributors_own_nodata_becomes_the_output_sentinel(self):
+        """Mixed declarations resolve to one value: B is entirely its own
+        sentinel, so it contributes nothing and its half reads as A's."""
+        a = _tile(0.0, 10.0, 7, size=10, nodata=255.0)
+        b = _tile(10.0, 10.0, 0, size=10, nodata=0.0)
+        result = await self._merge([a, b])
+        assert result.nodata == 255
+        data: np.ndarray[Any, Any] = result.data  # type: ignore[reportUnknownMemberType]
+        assert (data[0, :, 10:] == 255).all()
+        assert result.mask is not None
+        assert not result.mask[:, 10:].any()
+
+    async def test_an_unrepresentable_source_sentinel_is_not_inherited(self):
+        """A uint16 band declaring -9999 has no sentinel its dtype can carry,
+        so there is nothing to inherit and nothing to validate — inheriting it
+        anyway would raise out of np.full on a merge that used to work."""
+        cog = _tile(0.0, 10.0, 7, size=10, nodata=-9999.0)
+        assert cog._nodata is None
+        result = await self._merge([cog])
+        assert result.nodata is None
+        data: np.ndarray[Any, Any] = result.data  # type: ignore[reportUnknownMemberType]
+        assert (data[0, :, 10:] == 0).all()
+        result.as_masked()  # would raise on an unconvertible sentinel
+
+    async def test_a_nan_sentinel_is_inherited(self):
+        """NaN survives ``_coerce_nodata`` on a float band, so it fills."""
+        cog = _tile(
+            0.0, 10.0, np.full((1, 10, 10), 7, np.float32), size=10, nodata=float("nan")
+        )
+        result = await self._merge([cog])
+        assert result.nodata is not None and np.isnan(result.nodata)
+        data: np.ndarray[Any, Any] = result.data  # type: ignore[reportUnknownMemberType]
+        assert np.isnan(data[0, :, 10:]).all()
+        assert (data[0, :, :10] == 7).all()
+        assert result.mask is not None
+        assert not result.mask[:, 10:].any()
+
+    async def test_the_reported_sentinel_survives_reprojection(self):
+        """The two merge paths build their own output reference; only one of
+        them used to be exercised by anything that reads ``nodata``."""
+        cog = _tile(0.3, 10.3, 7, size=10, nodata=255.0)
+        to_grid_calls = spy_read_to_grid(cog)
+        result = await self._merge([cog], bbox=BBox(0.3, 0.3, 20.3, 10.3))
+        assert to_grid_calls
+        assert result.nodata == 255
+
+    async def test_nodata_labels_the_output_it_does_not_filter_the_inputs(self):
+        """*nodata* names the output's sentinel; every input is still read
+        through its own declaration. A tile of real 7s merged under
+        ``nodata=7`` keeps all of them, so value alone cannot say which 7 is
+        imagery and which is gap — that is the mask's job."""
+        cog = _tile(0.0, 10.0, 7, size=10)  # real 7s, declares no sentinel
+        result = await self._merge([cog], nodata=7)
+        assert result.nodata == 7
+        data: np.ndarray[Any, Any] = result.data  # type: ignore[reportUnknownMemberType]
+        assert (data[0] == 7).all()  # gap and imagery read alike
+        assert result.mask is not None
+        assert result.mask[:, :10].all()  # the tile's own 7s: covered
+        assert not result.mask[:, 10:].any()  # the gap's 7s: not
