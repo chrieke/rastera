@@ -1658,3 +1658,17 @@ class TestMergeNodata:
         result = await self._merge([cog], bbox=BBox(0.3, 0.3, 20.3, 10.3))
         assert to_grid_calls
         assert result.nodata == 255
+
+    async def test_nodata_labels_the_output_it_does_not_filter_the_inputs(self):
+        """*nodata* names the output's sentinel; every input is still read
+        through its own declaration. A tile of real 7s merged under
+        ``nodata=7`` keeps all of them, so value alone cannot say which 7 is
+        imagery and which is gap — that is the mask's job."""
+        cog = _tile(0.0, 10.0, 7, size=10)  # real 7s, declares no sentinel
+        result = await self._merge([cog], nodata=7)
+        assert result.nodata == 7
+        data: np.ndarray[Any, Any] = result.data  # type: ignore[reportUnknownMemberType]
+        assert (data[0] == 7).all()  # gap and imagery read alike
+        assert result.mask is not None
+        assert result.mask[:, :10].all()  # the tile's own 7s: covered
+        assert not result.mask[:, 10:].any()  # the gap's 7s: not
