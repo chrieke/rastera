@@ -252,7 +252,11 @@ class AsyncGeoTIFF:
                 the bbox names, and the pixels with no source behind them
                 carry the dataset's ``nodata``, or 0 where it declares none.
                 Reprojecting leaves some of those regardless, since the grid
-                is the envelope of a footprint that arrives rotated.
+                is the envelope of a footprint that arrives rotated. Which
+                pixels they were is on ``RasterArray.mask`` when the dataset
+                declares no sentinel — 0 is real data in most rasters, so
+                comparing against it would blank them; when it does declare
+                one the value is in the pixels and ``as_masked()`` finds it.
             use_overviews: When True, reads from pre-computed COG overview
                 levels to save bandwidth, and only when the read actually
                 changes resolution — a native-resolution or purely
