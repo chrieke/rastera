@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import math
+import os
 from collections import OrderedDict
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -16,8 +17,10 @@ from pyproj import CRS, Transformer
 from .geo import (
     BBox,
     WindowOutOfRangeError,
+    _grid_bounds,
     _is_on_res_grid,
     _normalize_crs,
+    _require_north_up,
     bounds_from_transform,
     ensure_bbox,
     normalize_band_indices,
@@ -317,6 +320,8 @@ class AsyncGeoTIFF:
             bbox_crs = _normalize_crs(bbox_crs)
         if target_crs is not None:
             target_crs = _normalize_crs(target_crs)
+        if bbox_crs is not None or target_crs is not None:
+            _require_epsg(self)
 
         needs_reproject = target_crs is not None and target_crs != self._crs_epsg
         # Both axes: a source with non-square pixels matching *target_resolution*
@@ -470,9 +475,9 @@ class AsyncGeoTIFF:
         elif needs_reproject:
             # needs_reproject implies target_crs was given, so out_crs is set.
             assert src_crs is not None and out_crs is not None
-            target_bbox = transform_bbox(BBox(*gt.bounds), src_crs, out_crs)
+            target_bbox = transform_bbox(_grid_bounds(gt), src_crs, out_crs)
         else:
-            target_bbox = BBox(*gt.bounds)
+            target_bbox = _grid_bounds(gt)
 
         # Clip to the dataset, matching the native path (see read()'s docstring
         # for the semantics). The *bbox* and not the grid, so the result stays an
@@ -486,7 +491,7 @@ class AsyncGeoTIFF:
         # source: a global EPSG:4326 extent comes back as x ∈ [500000, 1505647]
         # in UTM32N, rejecting any AOI west of the central meridian.
         if bbox is not None and not needs_reproject:
-            clipped = target_bbox.intersect(BBox(*gt.bounds))
+            clipped = target_bbox.intersect(_grid_bounds(gt))
             if clipped is None:
                 raise WindowOutOfRangeError("BBox does not intersect image")
             target_bbox = clipped
@@ -623,9 +628,11 @@ class AsyncGeoTIFF:
         # pull every pixel in the requested window at the chosen overview
         # level; any further downsampling happens post-fetch in `resample`.
         readable = overview if overview is not None else self._geotiff
+        if bbox is not None and not snap_to_grid:
+            _require_north_up(readable.transform)  # before any I/O
 
         if bbox is None and window is None:
-            bbox = BBox(*readable.bounds)
+            bbox = _grid_bounds(readable)
         if window is None:
             assert bbox is not None
             window = window_from_bbox(readable, bbox, snap_to_grid=snap_to_grid)
@@ -653,7 +660,7 @@ class AsyncGeoTIFF:
         if bbox is not None and not snap_to_grid:
             bbox = ensure_bbox(bbox)
             res_x, res_y = readable.res
-            img = BBox(*readable.bounds)
+            img = _grid_bounds(readable)
             result = dc_replace(
                 result,
                 transform=Affine(
@@ -708,7 +715,7 @@ class AsyncGeoTIFF:
 
 @overload
 async def open(
-    uri: str,
+    uri: str | os.PathLike[str],
     *,
     store: Any = None,
     prefetch: int = 32768,
@@ -720,7 +727,7 @@ async def open(
 
 @overload
 async def open(
-    uri: Sequence[str],
+    uri: Sequence[str | os.PathLike[str]],
     *,
     store: Any = None,
     prefetch: int = 32768,
@@ -731,7 +738,7 @@ async def open(
 
 
 async def open(
-    uri: str | Sequence[str],
+    uri: str | os.PathLike[str] | Sequence[str | os.PathLike[str]],
     *,
     store: Any = None,
     prefetch: int = 32768,
@@ -745,7 +752,8 @@ async def open(
     shared object store for connection reuse.
 
     Args:
-        uri: A single URI or a list of URIs.
+        uri: A single URI or a list of URIs. A local path may also be a
+            ``pathlib.Path``, as in ``rasterio.open``.
         store: Optional pre-constructed store for connection reuse.
         prefetch: Number of bytes to prefetch when opening the TIFF.
         cache: When True, cache parsed TIFF headers in memory so that
@@ -756,9 +764,9 @@ async def open(
         **store_kwargs: Extra kwargs forwarded to ``async_tiff.store.from_url``
             (e.g. ``skip_signature``, ``region``, ``request_payer``).
     """
-    if isinstance(uri, str):
+    if isinstance(uri, str | os.PathLike):
         return await AsyncGeoTIFF.open(
-            uri,
+            os.fspath(uri),
             store=store,
             prefetch=prefetch,
             cache=cache,
@@ -766,7 +774,7 @@ async def open(
             **store_kwargs,
         )
     return await _open_many(
-        uri,
+        [os.fspath(u) for u in uri],
         store=store,
         prefetch=prefetch,
         cache=cache,
@@ -875,6 +883,8 @@ class _OverviewLike(_Readable, Protocol):
     def res(self) -> tuple[float, float]: ...
     @property
     def bounds(self) -> tuple[float, float, float, float]: ...
+    @property
+    def transform(self) -> Affine: ...
 
 
 class _GeoTIFFLike(Protocol):
@@ -1007,19 +1017,21 @@ def _coerce_nodata(
 ) -> int | float | None:
     """Coerce nodata from async-geotiff (always float) to match the raster dtype.
 
-    Returns None when *dtype* cannot carry the value — NaN on an integer band,
-    or an integer outside the dtype's range. Both mean "this raster has no
-    representable sentinel": no pixel can ever equal it, and carrying it
-    anyway makes ``np.array(nodata, dtype=...)`` inside ``resample`` raise
-    ``OverflowError``. A VRT declaring ``<NoDataValue>-9999</NoDataValue>``
-    over a uint16 source is the case that reaches this (GDAL clamps the value
-    when it fills, so its masked copy is a no-op there too).
+    Returns None when *dtype* cannot carry the value — NaN or a fraction on an
+    integer band, or an integer outside the dtype's range. All mean "this
+    raster has no representable sentinel": no pixel can ever equal it, which
+    is also how GDAL reads it. Carrying it anyway makes ``np.array(nodata,
+    dtype=...)`` inside ``resample`` raise ``OverflowError``, and truncating
+    3.7 to 3 masked every real 3. A VRT declaring
+    ``<NoDataValue>-9999</NoDataValue>`` over a uint16 source is the usual case
+    (GDAL clamps the value when it fills, so its masked copy is a no-op there
+    too).
     """
     if nodata is None or dtype is None:
         return None
     dt = np.dtype(dtype)
     if dt.kind in ("i", "u"):
-        if math.isnan(nodata):
+        if math.isnan(nodata) or not float(nodata).is_integer():
             return None
         info = np.iinfo(dt)
         return None if not info.min <= nodata <= info.max else int(nodata)
@@ -1097,6 +1109,17 @@ def _validate_window(gt: _GeoTIFFLike, window: Window) -> None:
             f"cols={window.col_off}:{window.col_off + window.width}, "
             f"rows={window.row_off}:{window.row_off + window.height}. "
             f"Image: {gt.width}x{gt.height}."
+        )
+
+
+def _require_epsg(ds: AsyncGeoTIFF) -> None:
+    """Raise unless *ds* has an EPSG code, which every CRS argument and every
+    reprojection is matched against."""
+    if ds._crs_epsg is None:
+        raise ValueError(
+            f"{ds.uri} has a CRS with no EPSG code, and rastera takes CRSs as "
+            f"EPSG codes. If it is EPSG:N, open it with meta_overrides="
+            f"{{'crs': N}}."
         )
 
 

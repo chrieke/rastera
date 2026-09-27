@@ -1,6 +1,7 @@
 """Unit tests for pure geometry, parsing, and utility functions."""
 
 from types import SimpleNamespace
+from typing import Any
 
 import numpy as np
 import pytest
@@ -9,6 +10,7 @@ from affine import Affine
 from rastera.geo import (
     BBox,
     WindowOutOfRangeError,
+    _normalize_crs,
     bounds_from_transform,
     compute_paste_slices,
     ensure_bbox,
@@ -165,6 +167,24 @@ class TestValidateResolution:
             validate_resolution("10")  # type: ignore[arg-type]
 
 
+# ── _normalize_crs ────────────────────────────────────────────────────────
+
+
+class TestNormalizeCrs:
+    def test_numpy_integer_accepted(self):
+        """An EPSG code taken from a DataFrame, such as the index's crs_epsg
+        column, is a NumPy integer, and raised AttributeError."""
+        code = _normalize_crs(np.int64(32632))
+        assert code == 32632
+        assert type(code) is int
+
+    @pytest.mark.parametrize("bad", [True, "EPSG:32632", 32632.0])
+    def test_non_integer_rejected(self, bad: Any):
+        """True passed through as EPSG 1; the others raised AttributeError."""
+        with pytest.raises(ValueError, match="EPSG integer or a pyproj.CRS"):
+            _normalize_crs(bad)
+
+
 # ── Window ────────────────────────────────────────────────────────────────
 
 
@@ -198,6 +218,24 @@ class TestWindow:
         p = make_meta()
         w = window_from_bbox(p, BBox(999.9, 0, 1000.0, 1000))  # type: ignore[reportArgumentType]
         assert w.col_off == 99 and w.width == 1
+
+    def test_from_bbox_covers_every_corner_of_a_rotated_grid(self):
+        """Only two corners were inverted, which on a rotated grid misses the
+        other two: a 100 m bbox came back 4 rows tall instead of 14."""
+        t = Affine.translation(500000, 7000480) * Affine.rotation(-30)
+        meta = SimpleNamespace(transform=t * Affine.scale(10, -10), width=64, height=64)
+        cx, cy = meta.transform * (32, 32)
+        bbox = BBox(cx - 50, cy - 50, cx + 50, cy + 50)
+        w = window_from_bbox(meta, bbox)  # type: ignore[reportArgumentType]
+        for x, y in (
+            (bbox.minx, bbox.maxy),
+            (bbox.maxx, bbox.maxy),
+            (bbox.minx, bbox.miny),
+            (bbox.maxx, bbox.miny),
+        ):
+            col, row = ~meta.transform * (x, y)
+            assert w.col_off <= col <= w.col_off + w.width
+            assert w.row_off <= row <= w.row_off + w.height
 
     def test_from_bbox_clamps(self):
         p = make_meta()

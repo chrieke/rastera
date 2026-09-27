@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, TypedDict
 from affine import Affine
 from pyproj import CRS
 
-from .geo import BBox
+from .geo import BBox, _grid_bounds
 
 if TYPE_CHECKING:
     from .reader import AsyncGeoTIFF
@@ -65,7 +65,7 @@ def _build_profile(src: AsyncGeoTIFF) -> RasterProfile:
         "crs": src._resolved_crs,
         "crs_epsg": src._crs_epsg,
         "transform": gt.transform,
-        "bounds": BBox(*gt.bounds),
+        "bounds": _grid_bounds(gt),
         "res": (res[0], res[1]),
         "nodata": src._nodata,
         "overviews": list(src.overviews),

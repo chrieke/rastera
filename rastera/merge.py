@@ -16,6 +16,7 @@ from .geo import (
     WindowOutOfRangeError,
     _affine_apply,
     _denoise,
+    _grid_bounds,
     _is_on_res_grid,
     _normalize_crs,
     compute_paste_slices,
@@ -30,6 +31,7 @@ from .reader import (
     _CrsNodata,
     _grid_for_bbox,
     _make_output_array,
+    _require_epsg,
 )
 from .resampling import ResamplingMethod, validate_resampling
 
@@ -107,6 +109,8 @@ async def merge(
         )
     validate_resampling(resampling)
     validate_resolution(target_resolution)
+    for cog in cogs:
+        _require_epsg(cog)  # every input is placed by its EPSG code
     # Before any read: an unusable sentinel should fail here rather than
     # several frames deep in np.full.
     fill_value, out_nodata = _resolve_output_nodata(nodata, cogs[0])
@@ -143,14 +147,17 @@ async def merge(
     # The native path is a straight block copy onto the snapped output grid,
     # which sits on multiples of target_resolution — exact only when every
     # source grid is on those multiples too, north-up and square at that
-    # resolution (res_matches_target checks the x axis only; a negative -e
-    # can never isclose a positive resolution). Anything else is resampled.
-    srcs_on_res_grid = math.isclose(
-        target_resolution, -float(base_gt.transform.e)
-    ) and all(
-        _is_on_res_grid(float(cog._geotiff.transform.c), target_resolution)
-        and _is_on_res_grid(float(cog._geotiff.transform.f), target_resolution)
-        for cog in cogs
+    # resolution (a negative -e can never isclose a positive resolution).
+    # Every input, not just the first: a later one with taller pixels, or
+    # south-up or rotated, went down the native path, which then refused it.
+    # Anything else is resampled.
+    srcs_on_res_grid = all(
+        math.isclose(target_resolution, -float(t.e))
+        and float(t.b) == 0
+        and float(t.d) == 0
+        and _is_on_res_grid(float(t.c), target_resolution)
+        and _is_on_res_grid(float(t.f), target_resolution)
+        for t in (cog._geotiff.transform for cog in cogs)
     )
 
     # Note: use_overviews is intentionally NOT included here.  The native
@@ -199,7 +206,7 @@ async def merge(
 
     sub_bboxes: list[tuple[AsyncGeoTIFF, BBox]] = []
     for cog in cogs:
-        sub_bbox = native_bbox.intersect(BBox(*cog._geotiff.bounds))
+        sub_bbox = native_bbox.intersect(_grid_bounds(cog._geotiff))
         if sub_bbox is not None:
             sub_bboxes.append((cog, sub_bbox))
 
@@ -262,7 +269,7 @@ async def _merge_reprojected(
     for cog in cogs:
         assert cog._crs_epsg is not None
         sub_bbox = target_bbox.intersect(
-            transform_bbox(BBox(*cog._geotiff.bounds), cog._crs_epsg, out_crs)
+            transform_bbox(_grid_bounds(cog._geotiff), cog._crs_epsg, out_crs)
         )
         if sub_bbox is not None:
             contributing.append((cog, sub_bbox))

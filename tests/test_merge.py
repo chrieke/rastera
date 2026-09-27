@@ -184,6 +184,20 @@ class TestMergeArgumentValidation:
         )
         return merge([cog], **{**defaults, **kwargs})  # type: ignore[arg-type]
 
+    async def test_an_input_without_an_epsg_code_names_the_way_out(self):
+        """merge reprojects by each input's EPSG code. Without one it said to
+        pass target_crs, and doing so died on a bare AssertionError."""
+        codeless = _make_cog(width=10, height=10, scale=1.0, bands=1, crs=None)
+        codeless.uri = "s3://bucket/codeless.tif"
+        with pytest.raises(ValueError, match=r"codeless\.tif.*no EPSG code"):
+            await merge(
+                [_make_cog(width=10, height=10, scale=1.0, bands=1), codeless],
+                bbox=BBox(0, 0, 10, 10),
+                bbox_crs=32632,
+                target_crs=32632,
+                target_resolution=1.0,
+            )
+
     @pytest.mark.parametrize("bad", ["fisrt", "min", "MAX", "First"])
     async def test_unknown_mosaic_method_rejected(self, bad: str):
         """Anything that wasn't exactly "first" fell through to last-wins."""
@@ -983,6 +997,33 @@ class TestMixedInputs:
         assert out.mask is not None
         assert out.mask[:, :10].all()
         assert not out.mask[:, 10:].any()
+
+    @pytest.mark.parametrize("tall_first", [False, True])
+    async def test_a_tile_with_taller_pixels_merges_in_either_order(
+        self, tall_first: bool
+    ):
+        """Only the first input's pixel height was checked, so a later input
+        with taller pixels went down the native path, which refused it."""
+        square = make_mock_geotiff(width=20, height=20, scale=10.0, count=1)
+        square.read = slicing_read(square, np.full((1, 20, 20), 50, np.uint16))
+        tall = make_mock_geotiff(
+            width=10, height=10, scale=10.0, y_scale=20.0, count=1, origin_x=200
+        )
+        tall.read = slicing_read(tall, np.full((1, 10, 10), 200, np.uint16))
+        cogs = [
+            AsyncGeoTIFF("s3://b/a.tif", square),
+            AsyncGeoTIFF("s3://b/b.tif", tall),
+        ]
+        if tall_first:
+            cogs.reverse()
+
+        out = await merge(
+            cogs, bbox=(0, 0, 300, 200), bbox_crs=32632, target_resolution=10.0
+        )
+
+        data: np.ndarray[Any, Any] = out.data  # type: ignore[reportUnknownMemberType]
+        assert (data[0, :, :20] == 50).all()
+        assert (data[0, :, 20:] == 200).all()
 
     async def test_mixed_dtype_rejected(self):
         """A float32 contribution into a uint16 output raised an opaque

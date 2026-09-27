@@ -48,3 +48,9 @@ class TestCoerceNodata:
         OverflowError. A VRT declaring <NoDataValue>-9999</NoDataValue> over a
         uint16 source is how this arises."""
         assert _coerce_nodata(nodata, np.dtype(dtype)) is None
+
+    @pytest.mark.parametrize(("nodata", "dtype"), [(3.7, "u1"), (-0.5, "i2")])
+    def test_fraction_returns_none_for_int_dtype(self, nodata: float, dtype: str):
+        """No integer pixel can equal it, which is how GDAL reads it. Truncated
+        to 3, a 3.7 sentinel masked every real 3."""
+        assert _coerce_nodata(nodata, np.dtype(dtype)) is None

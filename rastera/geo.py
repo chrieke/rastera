@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
+from typing import Any, Protocol
 
 import numpy as np
 from affine import Affine
@@ -187,20 +188,25 @@ def window_from_bbox(
     """
     bbox = ensure_bbox(bbox)
     inv = ~meta.transform
-    minx, miny, maxx, maxy = bbox.minx, bbox.miny, bbox.maxx, bbox.maxy
-
-    col_min_f, row_max_f = _affine_apply(inv, minx, maxy)
-    col_max_f, row_min_f = _affine_apply(inv, maxx, miny)
+    # All four corners, as rasterio's from_bounds takes them: on a rotated grid
+    # each one can set an edge of the pixel envelope.
+    corners = [
+        _affine_apply(inv, x, y)
+        for x in (bbox.minx, bbox.maxx)
+        for y in (bbox.miny, bbox.maxy)
+    ]
+    cols = [c for c, _ in corners]
+    rows = [r for _, r in corners]
 
     # The interval is clipped to the image first.  Clamping only the offset
     # (`max(0, floor(lo))`) leaves the span positive for a bbox lying entirely
     # left of or above the image, which yields a plausible window over the wrong
     # pixels.  For a bbox inside the image the clip is a no-op, so the sizing
     # rules below are unaffected.
-    col_lo = max(0.0, min(col_min_f, col_max_f))
-    col_hi = min(float(meta.width), max(col_min_f, col_max_f))
-    row_lo = max(0.0, min(row_min_f, row_max_f))
-    row_hi = min(float(meta.height), max(row_min_f, row_max_f))
+    col_lo = max(0.0, min(cols))
+    col_hi = min(float(meta.width), max(cols))
+    row_lo = max(0.0, min(rows))
+    row_hi = min(float(meta.height), max(rows))
 
     if col_hi <= col_lo or row_hi <= row_lo:
         raise WindowOutOfRangeError("BBox does not intersect image")
@@ -355,13 +361,54 @@ def _is_on_res_grid(coord: float, res: float, tol: float = 1e-6) -> bool:
     return abs(q - round(q)) < tol
 
 
-def _normalize_crs(crs: int | CRS) -> int:
-    """Convert an EPSG integer or ``pyproj.CRS`` to an EPSG integer."""
-    if isinstance(crs, int):
-        return crs
-    epsg = crs.to_epsg()
-    if epsg is None:
-        raise ValueError(
-            f"CRS {crs.name!r} has no EPSG code; pass an integer EPSG code instead."
+def _normalize_crs(crs: int | np.integer[Any] | CRS) -> int:
+    """Convert an EPSG integer or ``pyproj.CRS`` to an EPSG integer.
+
+    A NumPy integer counts, as it does for band indices: an EPSG code taken
+    from a DataFrame, such as the index's ``crs_epsg`` column, is one.
+    """
+    if isinstance(crs, CRS):
+        epsg = crs.to_epsg()
+        if epsg is None:
+            raise ValueError(
+                f"CRS {crs.name!r} has no EPSG code; pass an integer EPSG code instead."
+            )
+        return epsg
+    if isinstance(crs, int | np.integer) and not isinstance(crs, bool):
+        return int(crs)
+    raise ValueError(f"CRS must be an EPSG integer or a pyproj.CRS, got {crs!r}")
+
+
+class _Grid(Protocol):
+    @property
+    def transform(self) -> Affine: ...
+    @property
+    def width(self) -> int: ...
+    @property
+    def height(self) -> int: ...
+
+
+def _grid_bounds(grid: _Grid) -> BBox:
+    """The extent of a header's pixel grid.
+
+    Not ``BBox(*grid.bounds)``: async-geotiff gives an unrotated grid's bounds
+    as its first and last corner, so a south-up one comes back with
+    ``miny > maxy`` and every intersect and clip built on it goes wrong.
+    """
+    return bounds_from_transform(grid.transform, grid.width, grid.height)
+
+
+def _require_north_up(t: Affine) -> None:
+    """Raise unless *t* is north-up, as a ``snap_to_grid=False`` read's anchor
+    assumes; it labelled a south-up or rotated source's pixels somewhere else.
+
+    Rotation terms within float noise of zero count as none: real north-up
+    files carry 1e-16 there.
+    """
+    tol = max(abs(float(t.a)), abs(float(t.e))) * 1e-6
+    if abs(float(t.b)) > tol or abs(float(t.d)) > tol or t.a <= 0 or t.e >= 0:
+        raise NotImplementedError(
+            f"snap_to_grid=False needs a north-up source; this one's "
+            f"geotransform is {t.to_gdal()}. Pass snap_to_grid=True, which "
+            f"keeps the source's own orientation."
         )
-    return epsg

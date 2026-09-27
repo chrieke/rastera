@@ -1,6 +1,7 @@
 """Unit tests for DIMAP parser."""
 
 import asyncio
+import dataclasses
 from collections.abc import Callable
 from types import SimpleNamespace
 from typing import Any
@@ -1032,6 +1033,23 @@ def _patch_sniff(nodata: int | float | None = 0, **tile_kwargs: Any) -> Any:
         return (0, 1, 1), _fake_first_tile(nodata=nodata, **tile_kwargs)
 
     return patch("rastera.formats.dimap._sniff_first_tile", new=_fake)
+
+
+class TestUnsnappedOrientation:
+    async def test_a_south_up_layout_raises_before_any_tile_read(self):
+        """A negative YDIM parses to a south-up layout, and the unsnapped
+        anchor labelled its pixels a bbox height away from where they are."""
+        layout = _grid_layout(
+            width=100, height=100, tile_w=100, tile_h=100, tile_rows=1, tile_cols=1
+        )
+        south_up = dataclasses.replace(layout, transform=Affine(1, 0, 1000, 0, 1, 5000))
+        ds = _DIMAPDataset("s3://bucket/DIM.XML", south_up)
+        with (
+            patch.object(_DIMAPDataset, "_open_tile") as opened,
+            pytest.raises(NotImplementedError, match="north-up"),
+        ):
+            await ds._read_native(bbox=(1010, 5010, 1020, 5020), snap_to_grid=False)
+        opened.assert_not_called()
 
 
 class TestTileStores:
