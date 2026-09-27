@@ -26,7 +26,6 @@ jobs:
       # `fix = true` in pyproject.toml, so CI has to opt out of rewriting files.
       - run: uv run ruff check --no-fix .
       - run: uv run ruff format --check .
-      - run: uv run pyright
 
   test:
     runs-on: ubuntu-latest
@@ -41,5 +40,7 @@ jobs:
           enable-cache: true
           python-version: ${{ matrix.python-version }}
       - run: uv sync
+      # Per Python, since 3.11 locks numpy 2.4 and 3.12+ lock numpy 2.5.
+      - run: uv run pyright
       # `live` tests are deselected by addopts; they need real remote storage.
       - run: uv run pytest -q
