@@ -4,9 +4,11 @@ Two flavours are supported:
 
 - *Band-stack* VRTs: each ``<VRTRasterBand>`` is driven by a single
   ``<SimpleSource>`` or ``<ComplexSource>`` naming a source file and band. All
-  sources are assumed to describe the same spatial image, so the VRT's own
-  geotransform, SRS, and raster size are ignored in favour of the first
-  source's metadata.
+  sources are assumed to describe the same spatial image, so pixels are read
+  on the first source's grid and labelled with its SRS. The VRT's own raster
+  size, geotransform and band ``dataType`` must agree with the sources; its
+  SRS is not compared. An omitted ``<GeoTransform>`` or ``<SRS>`` is taken
+  from the first source, where GDAL would leave the VRT ungeoreferenced.
 
   That "same spatial image" assumption is load-bearing, so anything in the XML
   contradicting it is *rejected* rather than ignored — a silently wrong pixel
@@ -36,7 +38,7 @@ from async_geotiff import RasterArray, Window
 from pyproj import CRS
 
 from . import config
-from .geo import BBox, normalize_band_indices
+from .geo import BBox
 from .reader import (
     AsyncGeoTIFF,
     MetaOverrides,
@@ -52,10 +54,11 @@ from .store import _check_source_uri, _fetch_descriptor_bytes, _join_relative_ur
 class _VRTBand:
     """One output band of a band-stack VRT.
 
-    The rect sizes and ``vrt_declared_size`` exist only to be re-checked
-    against the real source dimensions once the sources are open (see
-    ``_validate_source_windows``); they are never used to transform pixels.
-    ``vrt_declared_size`` is stamped identically on every band.
+    The rect sizes, ``vrt_declared_size``, ``vrt_geotransform`` and
+    ``data_type`` exist only to be re-checked against the real sources once
+    they are open (see ``_validate_source_windows``); they are never used to
+    transform pixels. The two ``vrt_`` fields are stamped identically on every
+    band.
     """
 
     source_uri: str
@@ -68,6 +71,10 @@ class _VRTBand:
     dst_rect_size: tuple[float, float] | None = None
     # The VRT root's declared (rasterXSize, rasterYSize), or None if omitted.
     vrt_declared_size: tuple[float, float] | None = None
+    # The VRT root's <GeoTransform>, or None if omitted.
+    vrt_geotransform: Affine | None = None
+    # The band's dataType attribute; GDAL reads an omitted one as Byte.
+    data_type: str = "Byte"
     # The band's own <NoDataValue>, or None when it declares none. Unlike the
     # rest of the VRT's metadata this is *honoured* — see _declared_nodata.
     nodata: float | None = None
@@ -189,8 +196,8 @@ async def _open_vrt_checked(
 class _VRTDataset(AsyncGeoTIFF):
     """Band-stack VRT dataset presenting as an ``AsyncGeoTIFF``.
 
-    Reads are dispatched to the underlying sources, grouping bands that share
-    a source into a single ``read()`` call.
+    ``_read_native`` is dispatched to the underlying sources, grouping bands
+    that share a source into a single call. ``read()`` resamples that stack.
     """
 
     def __init__(
@@ -219,15 +226,11 @@ class _VRTDataset(AsyncGeoTIFF):
             self._nodata = None
 
     def _override_nodata(self, nodata: float) -> None:
-        """Adopt *nodata* and push it onto the sources, which do the resampling.
+        """Adopt *nodata* and push it onto the sources.
 
-        Reporting it on the VRT alone is not enough: ``read()`` forwards
-        ``target_crs`` / ``target_resolution`` to each source, and
-        ``resample``'s bilinear/cubic kernels renormalize around whatever
-        nodata *that source* carries. A source declaring none — the shape this
-        whole feature exists for — would otherwise average the VRT's nodata
-        pixels in as if they were real values. (``nearest`` is unaffected;
-        there nodata is only a fill value.)
+        The kernels do not need the push: ``read()`` resamples the stack with
+        the VRT's own nodata. A source that fills pixels itself still reads its
+        own value, as DIMAP does for a tile that returns no data.
 
         Mutating a source is safe because these wrappers are ours:
         ``AsyncGeoTIFF.open`` caches only the inner ``GeoTIFF``, so a wrapper
@@ -238,7 +241,7 @@ class _VRTDataset(AsyncGeoTIFF):
         Dispatch handles the source flavours: a nested VRT source recurses
         through this same method, while a ``_VRTProcessedDataset`` source
         inherits the base method and stops here on purpose — its nodata is
-        post-LUT Byte while its own child resamples pre-LUT reflectance, so
+        post-LUT Byte while its own child holds pre-LUT reflectance, so
         pushing this value further down would corrupt pixels.
         """
         super()._override_nodata(nodata)
@@ -252,6 +255,14 @@ class _VRTDataset(AsyncGeoTIFF):
     @property
     def count(self) -> int:
         return len(self._band_sources)
+
+    def _internal_mask_uri(self) -> str | None:
+        # ``_geotiff`` is band 1's source only; a mask on any source counts.
+        for src, _ in self._band_sources:
+            uri = src._internal_mask_uri()
+            if uri is not None:
+                return uri
+        return None
 
     async def read(
         self,
@@ -269,26 +280,18 @@ class _VRTDataset(AsyncGeoTIFF):
             # Each source would pick its own overview level independently,
             # which can yield mismatched output shapes across sources.
             raise NotImplementedError("use_overviews is not supported on VRT datasets")
-        # Public entry: band_indices are 1-based (or None).
-        vrt_indices = normalize_band_indices(band_indices, len(self._band_sources))
-        return await _dispatch_source_reads(
-            self._band_sources,
-            vrt_indices,
-            "read",
-            # offset 0: src.read is public and takes 1-based band indices;
-            # source_band values are already stored 1-based.
-            source_band_offset=0,
-            read_kwargs=dict(
-                bbox=bbox,
-                bbox_crs=bbox_crs,
-                window=window,
-                target_crs=target_crs,
-                target_resolution=target_resolution,
-                snap_to_grid=snap_to_grid,
-                use_overviews=False,
-                resampling=resampling,
-            ),
-            output_nodata=self._nodata,
+        # Not forwarded to each source: GDAL resamples the VRT's pixels with
+        # the VRT's nodata, which is what the base read does with our stack.
+        return await super().read(
+            bbox=bbox,
+            bbox_crs=bbox_crs,
+            window=window,
+            band_indices=band_indices,
+            target_crs=target_crs,
+            target_resolution=target_resolution,
+            snap_to_grid=snap_to_grid,
+            use_overviews=False,
+            resampling=resampling,
         )
 
     async def _read_native(
@@ -314,10 +317,6 @@ class _VRTDataset(AsyncGeoTIFF):
         return await _dispatch_source_reads(
             self._band_sources,
             vrt_indices,
-            "_read_native",
-            # offset -1: _read_native is internal and expects 0-based band
-            # indices; stored source_band values are 1-based.
-            source_band_offset=-1,
             read_kwargs=dict(bbox=bbox, window=window, snap_to_grid=snap_to_grid),
             output_nodata=self._nodata,
         )
@@ -335,8 +334,8 @@ class _VRTProcessedDataset(AsyncGeoTIFF):
 
     The LUT step is index-to-index — ``lut_N`` is applied to source band N
     and yields output band N. Band selection (``band_indices`` on
-    ``read``/``_read_native``) is forwarded to the source unchanged; we
-    apply only the LUTs matching the selected bands.
+    ``_read_native``) is forwarded to the source unchanged; we apply only the
+    LUTs matching the selected bands. ``read()`` resamples the LUT's output.
     """
 
     def __init__(
@@ -363,6 +362,10 @@ class _VRTProcessedDataset(AsyncGeoTIFF):
     def count(self) -> int:
         return self._spec.output_count
 
+    def _internal_mask_uri(self) -> str | None:
+        # ``_geotiff`` is synthesized; the source's header is the real one.
+        return self._source._internal_mask_uri()
+
     async def read(
         self,
         bbox: BBox | tuple[float, float, float, float] | None = None,
@@ -381,22 +384,19 @@ class _VRTProcessedDataset(AsyncGeoTIFF):
             raise NotImplementedError(
                 "use_overviews is not supported on processed VRT datasets"
             )
-        # normalize_band_indices returns 0-based output band positions.
-        # Forward to ``source.read`` (public API, 1-based) and apply the
-        # matching LUT row per output band.
-        out_indices_0 = normalize_band_indices(band_indices, self._spec.output_count)
-        src_result = await self._source.read(
+        # Not forwarded to the source: GDAL applies the LUT, then resamples its
+        # output with ``dst_nodata``, which is what the base read does here.
+        return await super().read(
             bbox=bbox,
             bbox_crs=bbox_crs,
             window=window,
-            band_indices=[b + 1 for b in out_indices_0],
+            band_indices=band_indices,
             target_crs=target_crs,
             target_resolution=target_resolution,
             snap_to_grid=snap_to_grid,
             use_overviews=False,
             resampling=resampling,
         )
-        return self._apply_luts(src_result, out_indices_0)
 
     async def _read_native(
         self,
@@ -450,10 +450,8 @@ class _VRTProcessedDataset(AsyncGeoTIFF):
         )
         for i, b0 in enumerate(band_indices_0):
             out[i] = self._spec.luts[b0][in_data[i]]
-        # Take the CRS from the sub-read, not from ``self._geotiff``: a read
-        # with ``target_crs`` reprojects inside the source, and reporting our
-        # own (source) CRS would label the returned pixels with the wrong one.
-        # The nodata is ours, since the LUT writes ``dst_nodata``.
+        # The CRS is the sub-read's. The nodata is ours, since the LUT writes
+        # ``dst_nodata``.
         return _make_output_array(
             out,
             src_result.transform,
@@ -500,18 +498,15 @@ def _parse_vrt_xml(
         )
 
     declared_size = _declared_raster_size(root)
+    declared_transform = _declared_geotransform(root)
 
-    source_tags = {
-        "SimpleSource",
-        "ComplexSource",
-        "AveragedSource",
-        "KernelFilteredSource",
-    }
     bands: list[_VRTBand] = []
     for vrt_band in root.findall("VRTRasterBand"):
         band_no = vrt_band.attrib.get("band", "?")
         _reject_derived_band(vrt_band, band_no)
-        sources = [child for child in vrt_band if child.tag in source_tags]
+        # Every kind of source counts, so the guards below also turn away one
+        # this list would not name, such as <NoDataFromMaskSource>.
+        sources = [child for child in vrt_band if child.tag.endswith("Source")]
         if not sources:
             raise ValueError(f"Malformed VRT band {band_no}: no source element")
         if len(sources) > 1:
@@ -540,6 +535,8 @@ def _parse_vrt_xml(
                 src_rect_size=src_rect_size,
                 dst_rect_size=dst_rect_size,
                 vrt_declared_size=declared_size,
+                vrt_geotransform=declared_transform,
+                data_type=vrt_band.attrib.get("dataType", "Byte"),
                 nodata=band_nodata,
                 hide_nodata=_hides_nodata(vrt_band),
             )
@@ -616,6 +613,22 @@ def _declared_raster_size(root: ET.Element) -> tuple[float, float] | None:
         return float(x), float(y)
     except ValueError as e:
         raise ValueError(f"VRT has malformed rasterXSize/rasterYSize: {e}") from e
+
+
+def _declared_geotransform(root: ET.Element) -> Affine | None:
+    """The VRT's declared ``<GeoTransform>``, or None if absent."""
+    el = root.find("GeoTransform")
+    if el is None or not (el.text or "").strip():
+        return None
+    try:
+        coeffs = [float(v) for v in (el.text or "").split(",")]
+    except ValueError as e:
+        raise ValueError(f"VRT has a malformed <GeoTransform>: {e}") from e
+    if len(coeffs) != 6:
+        raise ValueError(
+            f"VRT <GeoTransform> has {len(coeffs)} coefficients; expected 6"
+        )
+    return Affine.from_gdal(*coeffs)
 
 
 def _rect(parent: ET.Element, tag: str) -> tuple[float, float, float, float] | None:
@@ -773,8 +786,9 @@ def _hides_nodata(vrt_band: ET.Element) -> bool:
     el = vrt_band.find("HideNoDataValue")
     if el is None or not el.text or not el.text.strip():
         return False
-    # GDAL writes 1; treat anything it would read as true the same way.
-    return el.text.strip() not in ("0", "false", "FALSE")
+    # GDAL writes 1 and reads the flag with CPLTestBool, to which these are the
+    # false values, in any case.
+    return el.text.strip().lower() not in ("0", "false", "no", "off")
 
 
 def _reject_remapping_nodata(
@@ -865,9 +879,8 @@ def _declared_nodata(bands: Sequence[_VRTBand]) -> float | None:
     *reporting*, so it is skipped here — see ``_hides_declared_nodata``, which
     is what stops the source's value being inherited in its place.
 
-    The value is used for compositing (``merge``), for reporting, and — via
-    ``_VRTDataset._override_nodata`` — for the resampling the sources perform
-    on the VRT's behalf.
+    The value is used for compositing (``merge``), for reporting, and for
+    resampling.
     """
     declared = {b.nodata for b in bands if b.nodata is not None and not b.hide_nodata}
     # NaN is never equal to itself, so a NaN-nodata VRT would look like a
@@ -966,6 +979,16 @@ def _validate_source_windows(
                 f"{reference._geotiff.transform!r}; band-stack VRTs must "
                 f"reference sources covering the same extent."
             )
+        # GDAL looks the name up case-insensitively.
+        declared_dtype = _GDAL_DTYPES.get(band.data_type.casefold())
+        if declared_dtype != src._geotiff.dtype:
+            # GDAL converts to the declared type, clamping or rounding: a Byte
+            # VRT over UInt16 reads 999 as 255. An omitted dataType is Byte.
+            raise NotImplementedError(
+                f"VRT band {i} declares dataType={band.data_type!r} but its "
+                f"source {band.source_uri!r} is {src._geotiff.dtype}; converting "
+                f"a source to another type is not supported. {_GDAL_HINT}"
+            )
         if band.src_rect_size is not None and band.src_rect_size != src_dims:
             raise NotImplementedError(
                 f"VRT band {i} has a <SrcRect> of "
@@ -986,6 +1009,18 @@ def _validate_source_windows(
                 f"supported. Pass target_resolution to read() instead."
             )
 
+    # A VRT that places its source elsewhere — gdal_translate -of VRT -a_ullr or
+    # -a_gt — would otherwise be read at the source's location.
+    declared_gt = bands[0].vrt_geotransform
+    if declared_gt is not None and not _transforms_match(
+        declared_gt, reference._geotiff.transform
+    ):
+        raise NotImplementedError(
+            f"VRT declares geotransform {declared_gt.to_gdal()} but its source "
+            f"{ref_uri!r} has {reference._geotiff.transform.to_gdal()}; a VRT "
+            f"that georeferences its source anew is not supported. {_GDAL_HINT}"
+        )
+
     declared = bands[0].vrt_declared_size
     if declared is not None and declared != ref_dims:
         raise NotImplementedError(
@@ -996,6 +1031,24 @@ def _validate_source_windows(
             f"GDAL/rasterio for this VRT."
         )
 
+
+# GDAL band type names, as a VRT's dataType attribute spells them, casefolded
+# for the lookup.
+_GDAL_DTYPES = {
+    "byte": np.dtype("uint8"),
+    "int8": np.dtype("int8"),
+    "uint16": np.dtype("uint16"),
+    "int16": np.dtype("int16"),
+    "uint32": np.dtype("uint32"),
+    "int32": np.dtype("int32"),
+    "uint64": np.dtype("uint64"),
+    "int64": np.dtype("int64"),
+    "float16": np.dtype("float16"),
+    "float32": np.dtype("float32"),
+    "float64": np.dtype("float64"),
+    "cfloat32": np.dtype("complex64"),
+    "cfloat64": np.dtype("complex128"),
+}
 
 _VSI_SCHEMES = {"vsis3": "s3", "vsigs": "gs", "vsiaz": "az"}
 
@@ -1072,19 +1125,15 @@ async def _open_vrt_source(
 async def _dispatch_source_reads(
     band_sources: Sequence[tuple[AsyncGeoTIFF, int]],
     vrt_indices: Sequence[int],
-    method_name: str,
     *,
-    source_band_offset: int,
     read_kwargs: dict[str, Any],
     output_nodata: int | float | None,
 ) -> RasterArray:
-    """Group output bands by source, invoke *method_name* on each source with
+    """Group output bands by source, call ``_read_native`` on each source with
     the bundled source-band list, and reassemble into VRT output order.
 
-    *vrt_indices* are 0-based indices into ``band_sources``.
-    *source_band_offset* is added to each source's stored (1-based) source band
-    before it is forwarded — 0 for public ``read`` (keeps 1-based), -1 for
-    internal ``_read_native`` (converts to 0-based).
+    *vrt_indices* are 0-based indices into ``band_sources``, and so are the
+    source bands forwarded; the stored ones are 1-based.
     *output_nodata* is the VRT's own nodata; when it differs from what the
     sources report, the result carries the VRT's value instead of theirs. It has
     no default on purpose — defaulting to ``None`` would make a caller that
@@ -1094,7 +1143,7 @@ async def _dispatch_source_reads(
     for out_idx, vrt_idx in enumerate(vrt_indices):
         src, src_band = band_sources[vrt_idx]
         entry = groups.setdefault(id(src), (src, []))
-        entry[1].append((out_idx, src_band + source_band_offset))
+        entry[1].append((out_idx, src_band - 1))
 
     group_list = list(groups.values())
     # Sequential by default: each source read already fans out internally
@@ -1103,7 +1152,7 @@ async def _dispatch_source_reads(
     # saturated links. Set ``rastera.set_concurrency(vrt=N>1)`` to opt
     # into outer fan-out across distinct sources.
     coros: list[Awaitable[RasterArray]] = [
-        getattr(src, method_name)(band_indices=[b for _, b in entries], **read_kwargs)
+        src._read_native(band_indices=[b for _, b in entries], **read_kwargs)
         for src, entries in group_list
     ]
     results: list[RasterArray] = await config._gather_bounded(

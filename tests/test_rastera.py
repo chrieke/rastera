@@ -1,5 +1,6 @@
 """Unit tests for AsyncGeoTIFF."""
 
+from dataclasses import replace as dc_replace
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
@@ -25,7 +26,7 @@ from rastera.reader import (
     clear_cache,
     set_cache_size,
 )
-from rastera.resampling import resample
+from rastera.resampling import ResamplingMethod, resample
 from tests.conftest import (
     make_mock_geotiff,
     make_raster_array,
@@ -1071,6 +1072,86 @@ class TestReadCoverage:
             bbox=BBox(2.0, 2.0, 18.0, 18.0), bbox_crs=32632, target_resolution=1.0
         )
         assert arr.mask is None
+
+
+class TestPerBandNodata:
+    """A band reads the same whichever other bands the read asks for.
+
+    40x40 @1m, three bands, nodata=0, and a block of zeros in band 2 only —
+    a real zero reflectance, say, where bands 1 and 3 hold data.
+    """
+
+    @staticmethod
+    def _dataset() -> AsyncGeoTIFF:
+        gt = make_mock_geotiff(
+            width=40, height=40, scale=1.0, count=3, dtype=np.dtype("u2"), nodata=0
+        )
+        yy, xx = np.mgrid[0:40, 0:40]
+        base = 1000 + 300 * np.sin(xx / 5.0) + 200 * np.cos(yy / 4.0)
+        full = np.stack([base, base + 500, base + 1000]).astype(np.uint16)
+        full[1, 15:25, 15:25] = 0
+        gt.read = slicing_read(gt, full)
+        return AsyncGeoTIFF("s3://b/k.tif", gt)
+
+    @pytest.mark.parametrize("resampling", ["bilinear", "cubic"])
+    @pytest.mark.parametrize(
+        "kw",
+        [{"target_resolution": 1.7}, {"target_resolution": 1.7, "target_crs": 32633}],
+        ids=["resample", "reproject"],
+    )
+    async def test_a_band_reads_the_same_alone(
+        self, resampling: ResamplingMethod, kw: dict[str, Any]
+    ):
+        ds = self._dataset()
+        crs = kw.get("target_crs", 32632)
+        bbox = transform_bbox(BBox(0, 0, 40, 40), 32632, crs)
+
+        async def data(band_indices: list[int] | None) -> np.ndarray[Any, Any]:
+            arr = await ds.read(
+                bbox=bbox,
+                bbox_crs=crs,
+                band_indices=band_indices,
+                resampling=resampling,
+                **kw,
+            )
+            return arr.data  # type: ignore[reportUnknownMemberType]
+
+        full = await data(None)
+        np.testing.assert_array_equal((await data([1]))[0], full[0])
+        np.testing.assert_array_equal(await data([3, 1]), full[[2, 0]])
+
+
+class TestAlphaBand:
+    """A band tagged alpha is read as a plain band: GDAL tags band 4 of any
+    4-band Byte file it creates, so the tagged band is often NIR."""
+
+    @pytest.mark.parametrize("band_indices", [None, [1, 2, 3]])
+    async def test_as_masked_ignores_it(self, band_indices: list[int] | None):
+        gt = make_mock_geotiff(width=4, height=4, count=4, dtype=np.dtype("u1"))
+        full = np.full((4, 4, 4), 100, dtype=np.uint8)
+        full[3, :, :2] = 0  # NIR with real zeros
+        read = slicing_read(gt, full)
+
+        async def _tagged_read(window: Any) -> RasterArray:
+            return dc_replace(await read(window=window), _alpha_band_idx=3)
+
+        gt.read = _tagged_read
+        arr = await AsyncGeoTIFF("s3://b/k.tif", gt).read(band_indices=band_indices)
+        assert not arr.as_masked().mask.any()
+
+
+class TestInternalMask:
+    @pytest.mark.parametrize(
+        "kw",
+        [{"target_resolution": 0.5}, {"target_crs": 32633}],
+        ids=["resample", "reproject"],
+    )
+    async def test_a_warp_refuses_the_file(self, kw: dict[str, Any]):
+        """The warp would read the pixels the mask hides as data."""
+        gt = make_mock_geotiff(width=4, height=4, scale=1.0, count=1)
+        gt.mask_ifd = object()
+        with pytest.raises(NotImplementedError, match="internal mask"):
+            await AsyncGeoTIFF("s3://b/k.tif", gt).read(**kw)
 
 
 # ── LRU cache behaviour ────────────────────────────────────────────────

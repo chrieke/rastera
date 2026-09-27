@@ -16,7 +16,8 @@ boundary rather than silently ignoring it.
 Bilinear and cubic use GDAL-style nodata handling: kernel weights are
 renormalized over valid samples, with a center-pixel nodata gate and (for
 cubic) a per-dimension ≥2-valid safety gate to avoid overshoot from negative
-cubic weights at data/nodata boundaries.
+cubic weights at data/nodata boundaries.  As in gdalwarp, each band is judged
+on its own: a sentinel in one band leaves the others' kernels alone.
 """
 
 from __future__ import annotations
@@ -86,11 +87,15 @@ def resample(
     center is nodata, when every kernel sample is nodata, or — for
     cubic only — when fewer than 2 valid samples exist along each axis
     of the kernel window (negative cubic weights cause severe overshoot
-    when valid/invalid samples alternate).
+    when valid/invalid samples alternate).  All of this is per band, as
+    in gdalwarp: a band comes out the same whether or not it is resampled
+    together with others.
 
     ``nodata`` may be a finite sentinel (e.g. -9999, 0) or NaN; NaN is
     detected via ``np.isnan`` so the center gate and renormalization
-    behave identically across sentinel types.
+    behave identically across sentinel types.  A real value the kernel
+    rounds or clips onto the sentinel is moved one step off it, as
+    gdalwarp does, so it does not read as missing.
 
     A destination pixel with no source pixel under its center is blanked
     regardless of ``nodata`` — to the sentinel when one is declared, to zero
@@ -444,32 +449,43 @@ def _resample_kernel(
     wx = weights_fn(frac_col, x_offsets, x_filter)
     wy = weights_fn(frac_row, y_offsets, y_filter)
 
-    # --- Accumulate kernel contributions.
+    # --- Accumulate kernel contributions.  The kernels drop a pixel from every
+    # band they are handed when any of those bands holds the sentinel.  gdalwarp
+    # judges each band on its own, so bands whose sentinel footprints differ
+    # are handed over one at a time.
+    if _sentinel_differs_across_bands(src_array, nodata, nodata_is_nan):
+        band_groups = [src_array[b : b + 1] for b in range(src_array.shape[0])]
+    else:
+        band_groups = [src_array]
     accumulate = _accumulate_2d if coords_2d else _accumulate_separable
-    acc_val, acc_wt, per_dim_ok = accumulate(
-        src_array,
-        base_col,
-        base_row,
-        wx,
-        wy,
-        x_offsets,
-        y_offsets,
-        nodata,
-        nodata_is_nan,
-        method,
-    )
-
-    out = _finalize_kernel(
-        acc_val,
-        acc_wt,
-        per_dim_ok,
-        src_array,
-        center_row,
-        center_col,
-        coords_2d,
-        nodata,
-        nodata_is_nan,
-    )
+    outs: list[np.ndarray] = []
+    for bands in band_groups:
+        acc_val, acc_wt, per_dim_ok = accumulate(
+            bands,
+            base_col,
+            base_row,
+            wx,
+            wy,
+            x_offsets,
+            y_offsets,
+            nodata,
+            nodata_is_nan,
+            method,
+        )
+        outs.append(
+            _finalize_kernel(
+                acc_val,
+                acc_wt,
+                per_dim_ok,
+                bands,
+                center_row,
+                center_col,
+                coords_2d,
+                nodata,
+                nodata_is_nan,
+            )
+        )
+    out = outs[0] if len(outs) == 1 else np.concatenate(outs)
     return out, coverage
 
 
@@ -720,8 +736,9 @@ def _accumulate_2d(
 
             if nodata is not None:
                 # Pixel is valid only if all bands are non-nodata AND the
-                # tap is in-bounds.  NaN-sentinel: use `np.isnan` and
-                # zero-out NaN samples before the multiply.
+                # tap is in-bounds; the bands here share one sentinel
+                # footprint (see `_resample_kernel`).  NaN-sentinel: use
+                # `np.isnan` and zero-out NaN samples before the multiply.
                 if nodata_is_nan:
                     is_nodata = np.isnan(sample)
                     sample = np.where(is_nodata, 0.0, sample)
@@ -943,6 +960,7 @@ def _finalize_kernel(
         if invalid.any():
             out_f[:, invalid] = float(nodata)
     else:
+        invalid = None
         out_f = acc_val
 
     src_dtype = src_array.dtype
@@ -954,7 +972,10 @@ def _finalize_kernel(
         info = np.iinfo(src_dtype)
         np.clip(out_f, info.min, info.max, out=out_f)
         np.round(out_f, out=out_f)
-    return out_f.astype(src_dtype)
+    out = out_f.astype(src_dtype)
+    if nodata is not None and invalid is not None:
+        _avoid_nodata(out, nodata, ~invalid)
+    return out
 
 
 def _two_pass_threshold(strategy: WarpStrategy) -> float | None:
@@ -1078,8 +1099,15 @@ def _resample_two_pass(
     if np.issubdtype(orig_dtype, np.integer):
         info = np.iinfo(orig_dtype)
         out = out.astype(np.float64, copy=False)
+        # Before the round: Pass B wrote the sentinel exactly into the pixels it
+        # gated, and moved any real value off it.
+        gated = None if nodata is None else out == nodata
         np.clip(out, info.min, info.max, out=out)
         np.round(out, out=out)
+        out = out.astype(orig_dtype)
+        if nodata is not None and gated is not None:
+            _avoid_nodata(out, nodata, ~gated)
+        return out, coverage
     return out.astype(orig_dtype, copy=False), coverage
 
 
@@ -1092,6 +1120,39 @@ def _kernel_halo(method: ResamplingMethod, scale: float) -> int:
     if method == "nearest":
         return 0
     return math.ceil(_BASE_RADIUS[method] * max(1.0, scale))
+
+
+def _sentinel_differs_across_bands(
+    src_array: np.ndarray, nodata: int | float | None, nodata_is_nan: bool
+) -> bool:
+    """Whether the sentinel sits on different pixels in different bands."""
+    if nodata is None or src_array.shape[0] == 1:
+        return False
+    is_nodata = np.isnan(src_array) if nodata_is_nan else src_array == nodata
+    return not np.array_equal(is_nodata.any(axis=0), is_nodata.all(axis=0))
+
+
+def _avoid_nodata(out: np.ndarray, nodata: int | float, valid: np.ndarray) -> None:
+    """Move real pixels of *out* that landed on *nodata* one step off it.
+
+    A kernel can round or clip a real value onto the sentinel — cubic undershoot
+    next to a bright edge clips to a nodata of 0 — and everything downstream
+    then reads it as missing. gdalwarp moves it the same way, warning "changed
+    to ... to avoid being treated as NoData": an integer steps down, or up from
+    the dtype minimum; a float moves to the next value up, or down from the
+    dtype maximum or +inf. *valid* is ``(h, w)``: the pixels not deliberately
+    nodata.
+    """
+    hit = (out == nodata) & valid
+    if not hit.any():
+        return
+    if np.issubdtype(out.dtype, np.integer):
+        step = 1 if nodata == np.iinfo(out.dtype).min else -1
+        out[hit] = int(nodata) + step
+    else:
+        # From +inf, which a value overflowing the dtype lands on, too.
+        toward = -np.inf if nodata >= np.finfo(out.dtype).max else np.inf
+        out[hit] = np.nextafter(out.dtype.type(nodata), out.dtype.type(toward))
 
 
 def _and_coverage(

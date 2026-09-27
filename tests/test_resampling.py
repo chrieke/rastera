@@ -7,6 +7,7 @@ import pytest
 from affine import Affine
 from pyproj import Transformer
 
+from rastera.config import WarpStrategy
 from rastera.resampling import ResamplingMethod, _resample_impl, resample
 
 
@@ -503,6 +504,7 @@ def _bruteforce_kernel(
             else:
                 acc += sample * wxy
 
+    real: np.ndarray[Any, Any] | None = None
     if nodata is not None:
         out = np.zeros_like(acc)
         hw = wt > 0
@@ -514,13 +516,19 @@ def _bruteforce_kernel(
         if method == "cubic":
             invalid |= ~((rvc >= 2).any(0) & (cvc >= 2).any(0))
         out[:, invalid] = float(nodata)
+        real = ~invalid
     else:
         out = acc
     if np.issubdtype(src.dtype, np.integer):
         info = np.iinfo(src.dtype)
         np.clip(out, info.min, info.max, out=out)
         np.round(out, out=out)
-    return out.astype(src.dtype)
+    result = out.astype(src.dtype)
+    if nodata is not None and real is not None and src.dtype.kind in "iu":
+        # gdalwarp moves a real value that rounds onto the sentinel one step off.
+        step = 1 if nodata == np.iinfo(src.dtype).min else -1
+        result[(result == nodata) & real] = int(nodata) + step
+    return result
 
 
 class TestSeparableEquivalence:
@@ -1111,3 +1119,143 @@ class TestCoverage:
         out = resample(arr, st, dt, 6, 6, nodata=-9999.0, method=method)
         assert (out[0, 4:, :] == -9999.0).all()
         assert (out[0, :, 4:] == -9999.0).all()
+
+
+# ── nodata per band ──────────────────────────────────────────────────────
+
+
+class TestPerBandNodata:
+    """gdalwarp judges nodata per band, so a sentinel in one band must not blank
+    or reweight the others: each band comes out as if resampled alone.
+
+    80x80 @10m in UTM 32N, three smooth bands, and a block of the sentinel in
+    band 1 only.
+    """
+
+    SRC_T = Affine(10, 0, 700000, 0, -10, 6000000)
+
+    @staticmethod
+    def _source(dtype: np.typing.DTypeLike, nodata: float) -> np.ndarray[Any, Any]:
+        yy, xx = np.mgrid[0:80, 0:80]
+        base = 1000 + 400 * np.sin(xx / 7.0) + 300 * np.cos(yy / 5.0)
+        arr = np.stack([base, base + 500, base + 1000]).astype(dtype)
+        arr[1, 30:42, 30:42] = nodata
+        return arr
+
+    def _grid(self, path: str) -> tuple[Affine, int, int, Transformer | None, str]:
+        """``(dst_t, dw, dh, transformer, warp_strategy)`` for *path*."""
+        src_t = self.SRC_T
+        if path in ("downsample", "upsample"):
+            res = 17.0 if path == "downsample" else 4.0
+            n = int(800 // res)
+            return Affine(res, 0, src_t.c, 0, -res, src_t.f), n, n, None, "single_pass"
+        # A 560m UTM 33N square on the source's centre: ~5° rotated against
+        # it, and clear of its edges. 25m is past the "auto" two-pass
+        # threshold, 12m is not.
+        res = 25.0 if path == "two_pass" else 12.0
+        fwd = Transformer.from_crs(32632, 32633, always_xy=True)
+        cx, cy = fwd.transform(src_t.c + 400, src_t.f - 400)
+        n = int(560 // res)
+        dst_t = Affine(res, 0, cx - n * res / 2, 0, -res, cy + n * res / 2)
+        strategy = "auto" if path == "two_pass" else "single_pass"
+        return dst_t, n, n, Transformer.from_crs(32633, 32632, always_xy=True), strategy
+
+    @pytest.mark.parametrize("method", ["bilinear", "cubic"])
+    @pytest.mark.parametrize(
+        "path", ["downsample", "upsample", "reproject", "two_pass"]
+    )
+    @pytest.mark.parametrize(
+        "dtype, nodata", [(np.uint16, 0), (np.float32, np.nan)], ids=["uint16", "nan"]
+    )
+    def test_each_band_comes_out_as_if_resampled_alone(
+        self,
+        method: ResamplingMethod,
+        path: str,
+        dtype: np.typing.DTypeLike,
+        nodata: float,
+    ):
+        arr = self._source(dtype, nodata)
+        dst_t, dw, dh, transformer, strategy = self._grid(path)
+        kw: dict[str, Any] = dict(
+            nodata=nodata,
+            transformer=transformer,
+            method=method,
+            warp_strategy=strategy,
+        )
+        together = resample(arr, self.SRC_T, dst_t, dw, dh, **kw)
+        for b in range(3):
+            alone = resample(arr[b : b + 1], self.SRC_T, dst_t, dw, dh, **kw)
+            np.testing.assert_array_equal(together[b], alone[0])
+        is_nodata = np.isnan(together) if nodata != nodata else together == nodata
+        assert is_nodata[1].any(), "the block must reach band 1's output"
+        assert not is_nodata[[0, 2]].any(), "bands 0 and 2 hold data everywhere"
+
+
+class TestRealValueOnTheSentinel:
+    """A kernel can round or clip a real value onto the nodata sentinel, and
+    everything downstream then reads it as missing. gdalwarp moves it one step
+    off instead ("changed to ... to avoid being treated as NoData"); the
+    expected values are gdalwarp's output for the same grids.
+    """
+
+    @pytest.mark.parametrize(
+        ("row", "dtype", "nodata", "moved_to"),
+        [
+            # Undershoot next to a bright edge clips to the dtype minimum.
+            ([5] * 4 + [250] * 4, np.uint8, 0, 1),
+            ([-32760] * 4 + [30000] * 4, np.int16, -32768, -32767),
+            # Overshoot clips to the maximum, which steps down.
+            ([250] * 4 + [5] * 4, np.uint8, 255, 254),
+        ],
+    )
+    def test_cubic_clipped_onto_the_sentinel(
+        self, row: list[int], dtype: Any, nodata: int, moved_to: int
+    ):
+        src = np.asarray([row] * 6, dtype=dtype)[None]
+        st = Affine(10, 0, 0, 0, -10, 60)
+        dt = Affine(2.5, 0, 0, 0, -2.5, 60)
+        out = resample(src, st, dt, 32, 24, nodata=nodata, method="cubic")
+        assert out[0, 12, 11:14].tolist() == [moved_to] * 3
+        assert not (out == nodata).any()
+
+    @pytest.mark.parametrize(
+        ("dtype", "moved_to"),
+        [(np.int16, 99), (np.float32, np.nextafter(np.float32(100), np.inf))],
+    )
+    def test_bilinear_averaged_onto_the_sentinel(self, dtype: Any, moved_to: Any):
+        # Every output centre sits halfway between a 99 and a 101.
+        src = np.asarray([[99, 101, 99, 101]] * 4, dtype=dtype)[None]
+        st = Affine(10, 0, 0, 0, -10, 40)
+        dt = Affine(10, 0, 5, 0, -10, 40)
+        out = resample(src, st, dt, 3, 4, nodata=100, method="bilinear")
+        assert (out == moved_to).all()
+
+    def test_an_overflow_onto_an_infinite_sentinel_moves_to_the_maximum(self):
+        # Cubic overshoot past float32's maximum lands on +inf.
+        src = np.asarray([[0.0] * 4 + [3.3e38] * 4] * 6, dtype=np.float32)[None]
+        st = Affine(10, 0, 0, 0, -10, 60)
+        dt = Affine(2.5, 0, 0, 0, -2.5, 60)
+        out = resample(src, st, dt, 32, 24, nodata=np.inf, method="cubic")
+        assert not np.isinf(out).any()
+        assert (out == np.finfo(np.float32).max).any()
+
+    @pytest.mark.parametrize("strategy", ["auto", "single_pass"])
+    def test_a_cross_crs_downsample_moves_it_too(self, strategy: WarpStrategy):
+        """2.5x cross-CRS is past the two-pass threshold, whose final cast is a
+        second place the value can land on the sentinel."""
+        src = np.full((1, 60, 60), 5, np.uint8)
+        for c0 in range(0, 60, 12):
+            src[:, :, c0 + 6 : c0 + 12] = 250
+        out = resample(
+            src,
+            Affine(10, 0, 0, 0, -10, 600),
+            Affine(25, 0, 0, 0, -25, 600),
+            24,
+            24,
+            nodata=0,
+            transformer=Transformer.from_crs(32632, 32632, always_xy=True),
+            method="cubic",
+            warp_strategy=strategy,
+        )
+        assert not (out == 0).any()
+        assert (out == 1).sum() == 144

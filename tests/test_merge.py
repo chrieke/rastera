@@ -1335,8 +1335,8 @@ class TestMergeCoverage:
 
     async def test_native_path_honours_an_internal_mask(self):
         """``RasterArray.mask`` is how a file states validity without a
-        sentinel — an internal TIFF mask or an alpha band. The paste has to
-        respect it on the copy path too, not only behind the warp."""
+        sentinel — an internal TIFF mask. The copy path pastes around it; the
+        warp refuses such a file."""
         # The bbox is the whole tile, so window columns are tile columns.
         masked = _tile(0.0, 10.0, 1, size=10)
         plain = _tile(0.0, 10.0, 2, size=10)

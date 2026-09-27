@@ -1,15 +1,15 @@
 """Unit tests for ``VRTProcessedDataset`` (LUT-based DISPLAY VRTs)."""
 
-from typing import Any
+from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import numpy as np
 import pytest
 from affine import Affine
 from async_geotiff import RasterArray
-from pyproj import CRS
 
-from rastera.reader import AsyncGeoTIFF, _CrsNodata
+from rastera.reader import AsyncGeoTIFF
+from rastera.resampling import ResamplingMethod
 from rastera.vrt import (
     _LUT_SIZE,
     _compile_lut,
@@ -309,13 +309,13 @@ class TestProcessedRead:
 
     async def test_read_applies_per_band_lut(self):
         ds, source = _make_processed_ds(n_bands=2)
-        source.read = AsyncMock(return_value=_src_array((2, 3, 3)))
+        source._read_native = AsyncMock(return_value=_src_array((2, 3, 3)))
 
         arr = await ds.read()
-        assert source.read.await_count == 1
-        # All output bands → forward 1-based [1, 2]
-        assert source.read.await_args is not None
-        assert source.read.await_args.kwargs["band_indices"] == [1, 2]
+        assert source._read_native.await_count == 1
+        # All output bands → forward 0-based [0, 1]
+        assert source._read_native.await_args is not None
+        assert source._read_native.await_args.kwargs["band_indices"] == [0, 1]
 
         data: np.ndarray[Any, Any] = arr.data  # type: ignore[reportUnknownMemberType]
         assert data.dtype == np.uint8
@@ -346,20 +346,48 @@ class TestProcessedRead:
         np.testing.assert_array_equal(data[1], ds._spec.luts[0][200])
 
     async def test_reprojected_read_reports_the_target_crs(self):
-        """The LUT does not move pixels, but ``target_crs`` reprojection happens
-        inside the source read — so the result's CRS is whatever the sub-read
-        produced, not this dataset's own (source) CRS."""
+        """The LUT does not move pixels; the reprojection that follows it does,
+        so the result carries the target CRS, not this dataset's own."""
         ds, source = _make_processed_ds(n_bands=2)
-        reprojected = _src_array((2, 3, 3))
-        # What reader.py hands back from a reprojecting read: a stub carrying
-        # the *target* CRS.
-        object.__setattr__(reprojected, "_geotiff", _CrsNodata(CRS.from_epsg(4326), 0))
-        source.read = AsyncMock(return_value=reprojected)
+        gt = source._geotiff
+        pixels = np.full((2, gt.height, gt.width), 100, dtype=np.uint16)
+        source._read_native = AsyncMock(
+            return_value=make_raster_array(pixels, gt.transform, gt)
+        )
 
         arr = await ds.read(target_crs=4326)
         assert arr.crs.to_epsg() == 4326
         # nodata still comes from the LUT step, which is what writes it.
         assert arr.nodata == ds._spec.dst_nodata
+
+    @pytest.mark.parametrize("method", ["bilinear", "cubic"])
+    async def test_resampled_read_applies_the_lut_first(self, method: ResamplingMethod):
+        """GDAL resamples the LUT's output, where src_nodata is already
+        dst_nodata. Resampling the reflectance first, under a source declaring
+        no nodata, blended the zero half into the edge, and the LUT turned
+        those blends into valid bytes GDAL does not have."""
+        spec = _parse_vrt_xml(_processed_vrt(n_bands=1), "s3://b/x.vrt")
+        assert isinstance(spec, _VRTProcessedSpec)
+        gt = make_mock_geotiff(width=8, height=8, scale=1.0, count=1)
+        source = AsyncGeoTIFF("s3://b/tile.xml", gt)
+        pixels = np.zeros((1, 8, 8), dtype=np.uint16)
+        pixels[:, :, 4:] = 500
+        source._read_native = AsyncMock(
+            return_value=make_raster_array(pixels, gt.transform, gt)
+        )
+        ds = _VRTProcessedDataset("s3://b/x.vrt", spec, source)
+
+        arr = await ds.read(target_resolution=2.0, resampling=method)
+        data: np.ndarray[Any, Any] = arr.data  # type: ignore[reportUnknownMemberType]
+        # A renormalized kernel over a two-valued input emits only those two.
+        assert set(np.unique(data).tolist()) == {0, int(spec.luts[0][500])}
+
+    async def test_resampled_read_refuses_a_masked_source(self):
+        """The mask is on the source's header, not on this dataset's."""
+        ds, source = _make_processed_ds()
+        cast(Any, source._geotiff).mask_ifd = object()
+        with pytest.raises(NotImplementedError, match="tile.xml has an internal mask"):
+            await ds.read(target_resolution=20.0)
 
     async def test_use_overviews_rejected(self):
         ds, _ = _make_processed_ds()
