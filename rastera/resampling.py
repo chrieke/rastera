@@ -18,8 +18,12 @@ renormalized over valid samples, with a center-pixel nodata gate.  Cubic adds
 a per-dimension ≥2-valid gate of rastera's own against overshoot from
 negative weights at data/nodata boundaries; where gdalwarp samples cubic 4x4,
 it instead falls back to bilinear for any pixel whose taps touch nodata or
-the source edge, so the two differ there.  As in gdalwarp, each band is judged
-on its own: a sentinel in one band leaves the others' kernels alone.
+the source edge, so the two differ there.  As in gdalwarp, each band's kernel
+is judged on its own: a sentinel in one band leaves the others' kernels alone.
+The center gate is per band as well.  gdalwarp gates a pixel only where the
+center is nodata in every band, and fills a band that is nodata there on its
+own from the valid neighbours.  So a multi-band read differs from gdalwarp at
+those pixels; a single-band read does not.
 """
 
 from __future__ import annotations
@@ -92,8 +96,9 @@ def resample(
     cubic only, and rastera's own rule — when fewer than 2 valid samples
     exist along each axis of the kernel window (negative cubic weights
     cause severe overshoot when valid/invalid samples alternate).  All of
-    this is per band, as in gdalwarp: a band comes out the same whether or
-    not it is resampled together with others.
+    this is per band: a band comes out the same whether or not it is
+    resampled together with others.  gdalwarp renormalizes per band too,
+    but its center gate is not per band (see the module docstring).
 
     ``nodata`` may be a finite sentinel (e.g. -9999, 0) or NaN; NaN is
     detected via ``np.isnan`` so the center gate and renormalization
@@ -417,8 +422,9 @@ def _resample_kernel(
     weights_fn = _bilinear_weights if method == "bilinear" else _cubic_weights
 
     # The kernels drop a pixel from every band they are handed when any of
-    # those bands holds the sentinel.  gdalwarp judges each band on its own,
-    # so bands whose sentinel footprints differ are handed over one at a time.
+    # those bands holds the sentinel.  gdalwarp weights each band's kernel on
+    # its own, so bands whose sentinel footprints differ are handed over one at
+    # a time.
     if _sentinel_differs_across_bands(src_array, nodata, nodata_is_nan):
         band_groups = [src_array[b : b + 1] for b in range(src_array.shape[0])]
     else:
