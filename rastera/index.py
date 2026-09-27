@@ -94,7 +94,10 @@ async def build_index(
         async with sem:
             try:
                 src = await AsyncGeoTIFF.open(
-                    uri, store=cached_store, prefetch=prefetch
+                    uri,
+                    store=cached_store,
+                    prefetch=prefetch,
+                    cache=_resolve_local_path(uri) is None,
                 )
                 return src, hdr
             except Exception as exc:
@@ -192,7 +195,15 @@ async def open_from_index(
             cached_gt = get_cached_geotiff(uri)
             if cached_gt is not None:
                 return AsyncGeoTIFF(uri, cached_gt)
-            return await AsyncGeoTIFF.open(uri, store=cached_store, prefetch=prefetch)
+            # Not cached for a local file: the header comes from the index, and
+            # the file may have been rewritten since, so it would land under
+            # the new version's cache key.
+            return await AsyncGeoTIFF.open(
+                uri,
+                store=cached_store,
+                prefetch=prefetch,
+                cache=_resolve_local_path(uri) is None,
+            )
 
     return list(await asyncio.gather(*(_open_one(u) for u in uris)))
 

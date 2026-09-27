@@ -292,6 +292,26 @@ class TestOpenFromIndex:
         assert len(result) == 2
         assert mock_open.await_count == 2
 
+    @pytest.mark.parametrize("local", [True, False], ids=["local", "remote"])
+    @patch("rastera.index._build_obstore")
+    @patch("rastera.index.AsyncGeoTIFF.open", new_callable=AsyncMock)
+    async def test_an_index_header_is_cached_for_remote_files_only(
+        self, mock_open: Any, mock_build_obs: Any, local: bool, tmp_path: Any
+    ) -> None:
+        """The header comes from the index. A local file rewritten since would
+        have it cached under the new version's key, and a later open() read
+        the new file through the old header."""
+        mock_build_obs.return_value = MagicMock()
+        mock_open.return_value = MagicMock(spec=AsyncGeoTIFF)
+        uri = str(tmp_path / "a.tif") if local else "s3://b/a.tif"
+        gdf = _make_index_gdf(
+            [{"uri": uri, "minx": 0, "miny": 0, "maxx": 1, "maxy": 1}]
+        )
+
+        await open_from_index(gdf)
+
+        assert mock_open.call_args.kwargs["cache"] is not local
+
     async def test_cross_bucket_raises(self) -> None:
         """Mirrored buckets sharing a key path would collapse in the header
         cache, serving one file's header for the other's URI."""
