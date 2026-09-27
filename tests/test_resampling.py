@@ -8,7 +8,12 @@ from affine import Affine
 from pyproj import Transformer
 
 from rastera.config import WarpStrategy
-from rastera.resampling import ResamplingMethod, _resample_impl, resample
+from rastera.resampling import (
+    ResamplingMethod,
+    _kernel_scale,
+    _resample_impl,
+    resample,
+)
 
 
 def _src_grid(n: int):
@@ -299,6 +304,31 @@ class TestResampleBilinear:
         dst_t = Affine(1, 0, 14.5, 0, -1, 15.5)  # center → src pixel (1, 1)
         out = resample(arr, src_t, dst_t, 1, 1, nodata=float("nan"), method="bilinear")
         assert np.isnan(out[0, 0, 0]), f"expected NaN output, got {out}"
+
+    def test_a_scale_just_above_one_interpolates_plainly(self):
+        """gdalwarp rounds a downsample factor within 0.05 of a whole one. At
+        1.02 that leaves plain 2x2 interpolation, where widening the kernel by
+        1.02 blurred slightly and sampled 4x4."""
+        src = np.random.default_rng(0).uniform(0, 200, (1, 40, 40))
+        st = Affine(10, 0, 0, 0, -10, 400)
+        dt = Affine(10.2, 0, 50, 0, -10.2, 350)
+        out = resample(src, st, dt, 30, 30, method="bilinear")
+
+        # Both axes sample at 1.02 * (i + 0.5) + 5; interpolate between the
+        # source pixel centers, which sit at j + 0.5.
+        pos = 1.02 * (np.arange(30) + 0.5) + 5 - 0.5
+        lo = np.floor(pos).astype(int)
+        w = np.zeros((30, 40))
+        w[np.arange(30), lo] = 1 - (pos - lo)
+        w[np.arange(30), lo + 1] = pos - lo
+        np.testing.assert_allclose(out[0], w @ src[0] @ w.T, rtol=0, atol=1e-9)
+
+    @pytest.mark.parametrize(
+        ("scale", "used"),
+        [(1.02, 1.0), (1.06, 1.06), (2.03, 2.0), (9.96, 10.0), (0.98, 0.98)],
+    )
+    def test_kernel_scale_rounds_like_gdalwarp(self, scale: float, used: float):
+        assert _kernel_scale(scale) == used
 
 
 # ── resample (cubic) ─────────────────────────────────────────────────────

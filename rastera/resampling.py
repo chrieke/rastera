@@ -73,7 +73,8 @@ def resample(
     - ``"bilinear"``: separable linear kernel. 2×2 at upsampling and
       identity; expanded to ``2·⌈scale⌉ × 2·⌈scale⌉`` when downsampling
       so the kernel acts as a low-pass anti-aliasing filter (where
-      ``scale = max(1, dst_res / src_res)``).  Matches
+      ``scale = max(1, dst_res / src_res)``, rounded to a whole factor
+      within 0.05 of one, as gdalwarp does).  Matches
       ``Resampling.bilinear`` / ``gdalwarp -r bilinear``. No overshoot.
     - ``"cubic"``: Keys cubic convolution (a = -0.5). 4×4 at
       upsampling/identity; expanded to ``4·⌈scale⌉ × 4·⌈scale⌉`` when
@@ -313,9 +314,10 @@ def _resample_kernel(
       the ULP level, so integer output may differ by at most 1 LSB at
       rounding boundaries.
     - Kernel half-width per axis is
-      ``base_radius · max(1, |dst_res / src_res|)`` (rounded up), where
-      ``base_radius`` is 1 for bilinear and 2 for cubic.  Upsampling
-      and identity reads use the default radii; downsampling expands.
+      ``base_radius · max(1, _kernel_scale(|dst_res / src_res|))`` (rounded
+      up), where ``base_radius`` is 1 for bilinear and 2 for cubic.
+      Upsampling and identity reads use the default radii; downsampling
+      expands.
     - Weights are separable and computed once outside the loop, then
       pre-normalized along the tap axis so the kernel sums to 1.
     - Out-of-bounds taps (kernel reach beyond the source extent for
@@ -357,8 +359,8 @@ def _resample_kernel(
         coords_2d = False
         # Local pixel scale = src pixels per dst pixel (= dst_res / src_res
         # along the axis-aligned same-CRS case).
-        x_scale_local = abs(float(combined.a))
-        y_scale_local = abs(float(combined.e))
+        x_scale_local = _kernel_scale(abs(float(combined.a)))
+        y_scale_local = _kernel_scale(abs(float(combined.e)))
     else:
         src_col_f, src_row_f = _coarse_grid_transform(
             dst_width, dst_height, dst_transform, src_transform, transformer
@@ -369,11 +371,15 @@ def _resample_kernel(
         # outliers near the source extent boundary.  A global (not
         # per-pixel) scale matches GDAL's warp behaviour.
         if dst_width >= 2:
-            x_scale_local = float(np.median(np.abs(np.diff(src_col_f, axis=1))))
+            x_scale_local = _kernel_scale(
+                float(np.median(np.abs(np.diff(src_col_f, axis=1))))
+            )
         else:
             x_scale_local = 1.0
         if dst_height >= 2:
-            y_scale_local = float(np.median(np.abs(np.diff(src_row_f, axis=0))))
+            y_scale_local = _kernel_scale(
+                float(np.median(np.abs(np.diff(src_row_f, axis=0))))
+            )
         else:
             y_scale_local = 1.0
 
@@ -1110,6 +1116,24 @@ def _resample_two_pass(
             _avoid_nodata(out, nodata, ~gated)
         return out, coverage
     return out.astype(orig_dtype, copy=False), coverage
+
+
+def _kernel_scale(scale: float) -> float:
+    """The downsample factor a kernel is widened by: *scale*, rounded to a whole
+    factor when within 0.05 of one, as gdalwarp does.
+
+    Unrounded, a factor just above 1 doubled the taps for next to no weight: at
+    1.005 a cross-CRS bilinear read sampled 4x4 where GDAL samples 2x2, and ran
+    3.5x slower.
+
+    ``_kernel_halo`` keeps the unrounded factor. Its ceiling is never below the
+    rounded kernel's reach, and the halo sizes its factor separately (see
+    ``reader._halo_bbox``), so rounding it too could cut the kernel short.
+    """
+    whole = round(scale)
+    if scale > 1 and abs(scale - whole) < 0.05:
+        return float(whole)
+    return scale
 
 
 def _pixel_index(coord: np.ndarray) -> np.ndarray:
