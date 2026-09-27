@@ -9,9 +9,9 @@ description = "Async raster reader with bounds/window/merge read functionality, 
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 dependencies = [
-    "affine>=2.4.0",
+    "affine>=3.0.1",
     "async-geotiff>=0.5.1",
     "numpy>=2.2.6",
     "obstore>=0.9.0",
@@ -30,7 +30,7 @@ markers = [
 
 [dependency-groups]
 dev = [
-    "ruff==0.16.0",
+    "ruff==0.16.9",
     "pyright>=1.1.408,<2.0.0",
     "pytest>=8.0.0",
     "pytest-asyncio>=1.0.0",
@@ -41,13 +41,6 @@ dev = [
     "shapely>=2.0.4",
     "pre-commit>=4.6.1",
 ]
-
-[tool.uv]
-# numpy 2.5 ships stubs that make np.unique/np.array_equal partially unknown,
-# which trips reportUnknownMemberType in ~70 places. Runtime is unaffected, so
-# this caps our lock only — `numpy>=2.2.6` above is what consumers resolve
-# against. Drop once numpy's stubs type those again.
-constraint-dependencies = ["numpy<2.5"]
 
 [tool.ruff]
 src = ["rastera"]
@@ -84,12 +77,10 @@ known-first-party = ["rastera"]
 
 [tool.pyright]
 include = ["rastera", "tests"]
-# Lowest supported interpreter, so 3.12+ syntax and stdlib use get caught.
-pythonVersion = "3.11"
+# Lowest supported interpreter, so 3.13+ syntax and stdlib use get caught.
+pythonVersion = "3.12"
 venvPath = "."
 venv = ".venv"
-# Hand-written stubs for dependencies that ship no annotations.
-stubPath = "typings"
 strictListInference = true
 strictSetInference = true
 strictDictionaryInference = true

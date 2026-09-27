@@ -251,7 +251,7 @@ class _DIMAPDataset(AsyncGeoTIFF):
             for i, pos in enumerate(out_positions):
                 out[pos, tr.dst_rows, tr.dst_cols] = data[i]
 
-        out_transform = layout.transform * Affine.translation(
+        out_transform = layout.transform @ Affine.translation(
             window.col_off, window.row_off
         )
         if bbox is not None and not snap_to_grid:

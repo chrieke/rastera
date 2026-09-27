@@ -2,9 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Coroutine
-from typing import Literal, TypeVar
-
-T = TypeVar("T")
+from typing import Literal
 
 _merge_concurrency: int = 1
 _vrt_concurrency: int = 1
@@ -98,7 +96,7 @@ def set_warp_strategy(strategy: WarpStrategy) -> None:
     _warp_strategy = strategy
 
 
-async def _gather_bounded(n: int, coros: list[Awaitable[T]]) -> list[T]:
+async def _gather_bounded[T](n: int, coros: list[Awaitable[T]]) -> list[T]:
     """Run *coros* with at most n in flight. Returns results in input order."""
     if n <= 1 or len(coros) <= 1:
         results: list[T] = []

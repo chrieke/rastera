@@ -504,7 +504,7 @@ def _bruteforce_kernel(
 
     nb, h, w = src.shape
     nan = nodata is not None and nodata != nodata
-    c = ~src_t * dst_t
+    c = ~src_t @ dst_t
     col_f = float(c.a) * (np.arange(dw) + 0.5) + float(c.c)
     row_f = float(c.e) * (np.arange(dh) + 0.5) + float(c.f)
     ccol = np.floor(col_f).astype(np.intp)
@@ -1038,13 +1038,13 @@ class TestResampleValidation:
     def test_rotated_dst_rejected(self, method: ResamplingMethod):
         """Only the a/c/e/f terms are read, so a rotated grid used to be
         resampled as if it were north-up."""
-        rotated = self.SRC_T * Affine.rotation(30)
+        rotated = self.SRC_T @ Affine.rotation(30)
         with pytest.raises(NotImplementedError, match="north-up"):
             resample(self.SRC, self.SRC_T, rotated, 8, 8, method=method)
 
     @pytest.mark.parametrize("method", ["nearest", "bilinear", "cubic"])
     def test_rotated_src_rejected(self, method: ResamplingMethod):
-        rotated = self.SRC_T * Affine.rotation(30)
+        rotated = self.SRC_T @ Affine.rotation(30)
         with pytest.raises(NotImplementedError, match="north-up"):
             resample(self.SRC, rotated, self.DST_T, 8, 8, method=method)
 
