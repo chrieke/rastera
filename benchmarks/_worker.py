@@ -76,6 +76,7 @@ def _run_rastera(
     *,
     snap_to_grid: bool,
     use_overviews: bool,
+    resampling: str,
 ) -> tuple[np.ndarray, list]:
     """Read one URI, or merge a list of them; both take the same arguments.
 
@@ -94,6 +95,7 @@ def _run_rastera(
             target_resolution=target_resolution,
             snap_to_grid=snap_to_grid,
             use_overviews=use_overviews,
+            resampling=resampling,
         )
         opened = await rastera.open(uri)
         if isinstance(uri, list):
@@ -122,6 +124,7 @@ def read_rasterio(
     *,
     snap_to_grid: bool,
     use_overviews: bool,
+    resampling: str,
 ) -> tuple[np.ndarray, list]:
     """*snap_to_grid* has no effect on the same-CRS/same-resolution branch below:
     a plain window read already lands on the source's own pixels, so a grid there
@@ -156,7 +159,7 @@ def read_rasterio(
         if target_crs or target_resolution:
             vrt_kwargs = {
                 "crs": out_crs,
-                "resampling": Resampling.nearest,
+                "resampling": Resampling[resampling],
             }
             if target_resolution and snap_to_grid:
                 dst_transform, width, height = _tap_grid(
@@ -176,13 +179,13 @@ def read_rasterio(
                 vrt_kwargs["height"] = height
 
             with WarpedVRT(src, **vrt_kwargs) as vrt:
-                data = vrt.read(resampling=Resampling.nearest)
+                data = vrt.read(resampling=Resampling[resampling])
                 t = vrt.transform
                 transform = _affine_list(t)
         else:
             # Same CRS, same resolution — just read the bbox window
             win = from_bounds(minx, miny, maxx, maxy, transform=src.transform)
-            data = src.read(window=win, resampling=Resampling.nearest)
+            data = src.read(window=win, resampling=Resampling[resampling])
             t = src.window_transform(win)
             transform = _affine_list(t)
 
@@ -198,11 +201,13 @@ def merge_rasterio(
     *,
     snap_to_grid: bool,
     use_overviews: bool,
+    resampling: str,
 ) -> tuple[np.ndarray, list]:
     import os
 
     import rasterio
     from rasterio.crs import CRS
+    from rasterio.enums import Resampling
     from rasterio.merge import merge
 
     os.environ["AWS_NO_SIGN_REQUEST"] = "YES"
@@ -224,13 +229,12 @@ def merge_rasterio(
         if needs_vrt:
             from rasterio.vrt import WarpedVRT
             from rasterio.warp import (
-                Resampling,
                 aligned_target,
                 calculate_default_transform,
             )
 
             for ds in datasets:
-                vrt_kwargs = {"crs": out_crs, "resampling": Resampling.nearest}
+                vrt_kwargs = {"crs": out_crs, "resampling": Resampling[resampling]}
                 if target_resolution is not None:
                     # Each VRT has to carry the *final* resolution and phase.
                     # Left on its own default warp grid, merge() resamples a
@@ -251,7 +255,7 @@ def merge_rasterio(
         else:
             sources = datasets
 
-        merge_kwargs = {"bounds": merge_bounds}
+        merge_kwargs = {"bounds": merge_bounds, "resampling": Resampling[resampling]}
         if target_resolution is not None:
             merge_kwargs["res"] = target_resolution
         if snap_to_grid:
@@ -296,6 +300,9 @@ def main():
         required=True,
         help="Allow reading from COG overviews",
     )
+    parser.add_argument(
+        "--resampling", default="nearest", choices=["nearest", "bilinear", "cubic"]
+    )
     args = parser.parse_args()
 
     bbox = tuple(float(x) for x in args.bbox.split(","))
@@ -314,6 +321,7 @@ def main():
                 args.target_resolution,
                 snap_to_grid=args.snap_to_grid,
                 use_overviews=args.overviews,
+                resampling=args.resampling,
             )
         else:
             data, transform = merge_rasterio(
@@ -324,6 +332,7 @@ def main():
                 args.target_resolution,
                 snap_to_grid=args.snap_to_grid,
                 use_overviews=args.overviews,
+                resampling=args.resampling,
             )
     else:
         if args.library == "rastera":
@@ -335,6 +344,7 @@ def main():
                 args.target_resolution,
                 snap_to_grid=args.snap_to_grid,
                 use_overviews=args.overviews,
+                resampling=args.resampling,
             )
         else:
             data, transform = read_rasterio(
@@ -345,6 +355,7 @@ def main():
                 args.target_resolution,
                 snap_to_grid=args.snap_to_grid,
                 use_overviews=args.overviews,
+                resampling=args.resampling,
             )
     elapsed = time.perf_counter() - t0
 
