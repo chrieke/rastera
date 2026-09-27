@@ -32,6 +32,7 @@ from pyproj import Transformer
 
 from . import config
 from .config import WarpStrategy
+from .geo import _DENOISE_TOL
 
 ResamplingMethod = Literal["nearest", "bilinear", "cubic"]
 _RESAMPLING_METHODS = ("nearest", "bilinear", "cubic")
@@ -224,14 +225,14 @@ def _resample_nearest(
     if transformer is None:
         # Same CRS: compose affines and use 1D index arrays (no meshgrid).
         combined = cast(Affine, ~src_transform * dst_transform)
-        src_col_1d = np.floor(
+        src_col_1d = _pixel_index(
             float(combined.a) * (np.arange(dst_width, dtype=np.float64) + 0.5)
             + float(combined.c)
-        ).astype(np.intp)
-        src_row_1d = np.floor(
+        )
+        src_row_1d = _pixel_index(
             float(combined.e) * (np.arange(dst_height, dtype=np.float64) + 0.5)
             + float(combined.f)
-        ).astype(np.intp)
+        )
 
         valid_col = (src_col_1d >= 0) & (src_col_1d < w)
         valid_row = (src_row_1d >= 0) & (src_row_1d < h)
@@ -397,8 +398,8 @@ def _resample_kernel(
 
     # Source pixel containing the dst center (pixel-corner convention).
     # Used for the OOB gate and the GDAL-style center-pixel nodata gate.
-    center_col = np.floor(src_col_f).astype(np.intp)
-    center_row = np.floor(src_row_f).astype(np.intp)
+    center_col = _pixel_index(src_col_f)
+    center_row = _pixel_index(src_row_f)
 
     # The same in-bounds-center test `_finalize_kernel` applies under nodata,
     # hoisted out because coverage holds with or without a sentinel.
@@ -1109,6 +1110,20 @@ def _resample_two_pass(
             _avoid_nodata(out, nodata, ~gated)
         return out, coverage
     return out.astype(orig_dtype, copy=False), coverage
+
+
+def _pixel_index(coord: np.ndarray) -> np.ndarray:
+    """The source pixel each source pixel coordinate falls in.
+
+    ``floor``, except that a coordinate within ``_DENOISE_TOL`` of a pixel edge
+    counts as on it and takes the pixel past it, as GDAL's nearest does. A
+    same-CRS read of a half-pixel-phase source puts every destination center
+    on an edge, and ``~transform``'s float noise broke those ties differently
+    for each bbox origin: overlapping reads disagreed by a whole column.
+    """
+    nearest = np.rint(coord)
+    on_edge = np.abs(coord - nearest) < _DENOISE_TOL
+    return np.floor(np.where(on_edge, nearest, coord)).astype(np.intp)
 
 
 def _kernel_halo(method: ResamplingMethod, scale: float) -> int:

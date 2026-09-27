@@ -122,6 +122,20 @@ class TestResampleNearest:
         out = resample(src_arr, src_t, dst_t, 1, 1, nodata=0, transformer=transformer)
         assert out.shape == (1, 1, 1)
 
+    def test_a_center_on_a_source_edge_takes_the_pixel_past_it(self):
+        """A half-pixel-phase source read on the lattice of its own resolution
+        puts every destination center on a source edge. Float noise broke that
+        tie differently per bbox origin, so overlapping reads disagreed by a
+        whole column; GDAL takes the pixel past the edge."""
+        res = 1e-4
+        src_t = Affine(res, 0, 10.00005, 0, -res, 50.00005)
+        grid = np.indices((32, 32))  # band 0 holds the row, band 1 the column
+        for k in range(12):
+            dst_t = Affine(res, 0, (100000 + k) * res, 0, -res, (500000 - k) * res)
+            out = resample(grid, src_t, dst_t, 8, 8)
+            assert out[1, 0].tolist() == list(range(k, k + 8))
+            assert out[0, :, 0].tolist() == list(range(k + 1, k + 9))
+
 
 # ── resample (bilinear) ──────────────────────────────────────────────────
 
