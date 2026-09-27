@@ -1,5 +1,6 @@
 """Unit tests for the resample() function and its kernel/coord helpers."""
 
+import math
 from typing import Any
 
 import numpy as np
@@ -10,6 +11,7 @@ from pyproj import Transformer
 from rastera.config import WarpStrategy
 from rastera.resampling import (
     ResamplingMethod,
+    _footprint,
     _kernel_scale,
     _resample_impl,
     resample,
@@ -811,6 +813,67 @@ class TestTwoPassReproject:
         two, coverage = _resample_impl(arr, st, dt, dw, dh, warp_strategy="auto", **kw)
         assert coverage is not None
         assert np.abs(two[0][coverage] - single[0][coverage]).max() < 1e-3
+
+
+# ── cross-CRS kernel width ───────────────────────────────────────────────
+
+
+class TestCrossCrsKernelScale:
+    """A cross-CRS kernel is widened by how far a destination pixel reaches
+    along each source axis, which is what gdalwarp sizes it by."""
+
+    SRC = np.random.default_rng(0).uniform(0, 200, (1, 60, 60))
+    SRC_T = Affine(10, 0, 0, 0, -10, 600)
+    # Destination (x, y) -> source (-y, x): an exact quarter turn.
+    QUARTER_TURN = Transformer.from_pipeline(
+        "+proj=pipeline +step +proj=affine +s11=0 +s12=-1 +s21=1 +s22=0"
+    )
+
+    @pytest.mark.parametrize("method", ["bilinear", "cubic"])
+    def test_a_rotated_downsample_is_filtered_like_an_unrotated_one(
+        self, method: ResamplingMethod
+    ):
+        """Only the step along the matching axis used to count. A quarter turn
+        has none there, so a 3x downsample was sampled unfiltered."""
+        rotated = resample(
+            self.SRC,
+            self.SRC_T,
+            Affine(30, 0, 0, 0, -30, 0),
+            20,
+            20,
+            transformer=self.QUARTER_TURN,
+            method=method,
+            warp_strategy="single_pass",
+        )
+        same_crs = resample(
+            self.SRC, self.SRC_T, Affine(30, 0, 0, 0, -30, 600), 20, 20, method=method
+        )
+        np.testing.assert_allclose(rotated[0], np.rot90(same_crs[0], -1), atol=1e-9)
+
+    @pytest.mark.parametrize("shape", [(1, 20), (20, 1)])
+    def test_a_one_pixel_axis_is_filtered_like_a_wider_one(
+        self, shape: tuple[int, int]
+    ):
+        """A 1-pixel axis has no step to measure, and its factor defaulted to 1:
+        a 3x downsample there was sampled unfiltered."""
+        h, w = shape
+        kw: dict[str, Any] = dict(
+            transformer=Transformer.from_crs(32632, 32632, always_xy=True),
+            method="bilinear",
+            warp_strategy="single_pass",
+        )
+        dt = Affine(30, 0, 0, 0, -30, 600)
+        thin = resample(self.SRC, self.SRC_T, dt, w, h, **kw)
+        wide = resample(self.SRC, self.SRC_T, dt, 20, 20, **kw)
+        np.testing.assert_allclose(thin[0], wide[0, :h, :w], atol=1e-9)
+
+    def test_both_steps_count_as_gdalwarp_counts_them(self):
+        """cos + sin of the rotation: 1.366 source pixels at 30 degrees."""
+        t = math.radians(30)
+        j, i = np.mgrid[0:8, 0:8].astype(float)
+        assert _footprint(math.cos(t) * i - math.sin(t) * j) == pytest.approx(
+            math.cos(t) + math.sin(t)
+        )
 
 
 # ── pixels outside the source extent ─────────────────────────────────────

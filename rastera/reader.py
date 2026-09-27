@@ -974,7 +974,12 @@ def _make_output_array(
 def _src_units_per_pixel(
     transformer: Transformer, bbox: BBox, dst_res: tuple[float, float]
 ) -> tuple[float, float]:
-    """*dst_res* re-expressed in source-CRS units, per axis.
+    """How far one destination pixel of *dst_res* reaches along each source
+    axis, in source-CRS units.
+
+    Both destination steps count along each source axis, since the CRSs may be
+    rotated against each other. The kernel is widened by the same measure
+    (``resampling._footprint``), so the halo covers it.
 
     A one-pixel finite difference at *bbox*'s centre, not a ratio of the bbox
     extents: ``transform_bbox`` returns a densified *envelope*, so for a thin
@@ -990,10 +995,8 @@ def _src_units_per_pixel(
     xs, ys = transformer.transform([cx, cx + rx, cx], [cy, cy, cy + ry])
     if not all(math.isfinite(v) for v in (*xs, *ys)):
         return dst_res
-    # Hypotenuse, not the x/y component: the two CRSs may be rotated relative to
-    # each other, so a step along dst x moves in both source axes.
-    step_x = math.hypot(xs[1] - xs[0], ys[1] - ys[0])
-    step_y = math.hypot(xs[2] - xs[0], ys[2] - ys[0])
+    step_x = abs(xs[1] - xs[0]) + abs(xs[2] - xs[0])
+    step_y = abs(ys[1] - ys[0]) + abs(ys[2] - ys[0])
     return (step_x or rx, step_y or ry)
 
 

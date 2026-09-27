@@ -366,22 +366,20 @@ def _resample_kernel(
             dst_width, dst_height, dst_transform, src_transform, transformer
         )
         coords_2d = True
-        # Approximate local pixel scale from the median absolute gradient
-        # of src coords along each dst axis.  Median is robust against
-        # outliers near the source extent boundary.  A global (not
-        # per-pixel) scale matches GDAL's warp behaviour.
-        if dst_width >= 2:
-            x_scale_local = _kernel_scale(
-                float(np.median(np.abs(np.diff(src_col_f, axis=1))))
+        # A global (not per-pixel) scale matches GDAL's warp behaviour.
+        probe_col, probe_row = src_col_f, src_row_f
+        if dst_width < 2 or dst_height < 2:
+            # A 1-pixel axis has no step to measure; one pixel past the output
+            # gives it one.
+            probe_col, probe_row = _coarse_grid_transform(
+                max(2, dst_width),
+                max(2, dst_height),
+                dst_transform,
+                src_transform,
+                transformer,
             )
-        else:
-            x_scale_local = 1.0
-        if dst_height >= 2:
-            y_scale_local = _kernel_scale(
-                float(np.median(np.abs(np.diff(src_row_f, axis=0))))
-            )
-        else:
-            y_scale_local = 1.0
+        x_scale_local = _kernel_scale(_footprint(probe_col))
+        y_scale_local = _kernel_scale(_footprint(probe_row))
 
         # Cross-CRS downsample: optionally split into a same-CRS downsample
         # (fast separable path) + a near-unit-scale reproject.  Gated on the
@@ -1116,6 +1114,21 @@ def _resample_two_pass(
             _avoid_nodata(out, nodata, ~gated)
         return out, coverage
     return out.astype(orig_dtype, copy=False), coverage
+
+
+def _footprint(coord: np.ndarray) -> float:
+    """How many source pixels a destination pixel spans along the source axis
+    *coord* holds (source columns or rows), as the median over the grid.
+
+    Once the CRSs are rotated against each other, a step along either
+    destination axis moves along this source axis, so both count, as gdalwarp
+    counts them. Counting only the matching one, a quarter turn read as no
+    downsample at all. The median is robust against outliers near the source
+    extent boundary.
+    """
+    extent = np.abs(np.diff(coord, axis=1))[:-1]
+    extent += np.abs(np.diff(coord, axis=0))[:, :-1]
+    return float(np.median(extent, overwrite_input=True))
 
 
 def _kernel_scale(scale: float) -> float:
