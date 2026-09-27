@@ -1017,19 +1017,21 @@ def _coerce_nodata(
 ) -> int | float | None:
     """Coerce nodata from async-geotiff (always float) to match the raster dtype.
 
-    Returns None when *dtype* cannot carry the value — NaN on an integer band,
-    or an integer outside the dtype's range. Both mean "this raster has no
-    representable sentinel": no pixel can ever equal it, and carrying it
-    anyway makes ``np.array(nodata, dtype=...)`` inside ``resample`` raise
-    ``OverflowError``. A VRT declaring ``<NoDataValue>-9999</NoDataValue>``
-    over a uint16 source is the case that reaches this (GDAL clamps the value
-    when it fills, so its masked copy is a no-op there too).
+    Returns None when *dtype* cannot carry the value — NaN or a fraction on an
+    integer band, or an integer outside the dtype's range. All mean "this
+    raster has no representable sentinel": no pixel can ever equal it, which
+    is also how GDAL reads it. Carrying it anyway makes ``np.array(nodata,
+    dtype=...)`` inside ``resample`` raise ``OverflowError``, and truncating
+    3.7 to 3 masked every real 3. A VRT declaring
+    ``<NoDataValue>-9999</NoDataValue>`` over a uint16 source is the usual case
+    (GDAL clamps the value when it fills, so its masked copy is a no-op there
+    too).
     """
     if nodata is None or dtype is None:
         return None
     dt = np.dtype(dtype)
     if dt.kind in ("i", "u"):
-        if math.isnan(nodata):
+        if math.isnan(nodata) or not float(nodata).is_integer():
             return None
         info = np.iinfo(dt)
         return None if not info.min <= nodata <= info.max else int(nodata)
