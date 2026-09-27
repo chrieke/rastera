@@ -268,6 +268,24 @@ class TestOpen:
                 ]
             )
 
+    @pytest.mark.parametrize("as_list", [False, True])
+    @patch("rastera.reader.GeoTIFF")
+    @patch("rastera.store.from_url")
+    async def test_open_takes_a_path(
+        self, mock_from_url: Any, mock_geotiff_cls: Any, as_list: bool, tmp_path: Path
+    ):
+        """As rasterio.open does. A Path raised "'PosixPath' object is not
+        iterable", and a list of them AttributeError 'decode'."""
+        f = tmp_path / "a.tif"
+        f.write_bytes(b"")
+        mock_from_url.return_value = MagicMock()
+        mock_geotiff_cls.open = AsyncMock(return_value=make_mock_geotiff())
+
+        opened = await rastera.open([f] if as_list else f, cache=False)
+
+        src = opened[0] if isinstance(opened, list) else opened
+        assert src.uri == str(f)
+
     @patch("rastera.reader.GeoTIFF")
     @patch("rastera.store.from_url")
     async def test_open_many_accepts_local_paths_in_different_folders(

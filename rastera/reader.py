@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import math
+import os
 from collections import OrderedDict
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -714,7 +715,7 @@ class AsyncGeoTIFF:
 
 @overload
 async def open(
-    uri: str,
+    uri: str | os.PathLike[str],
     *,
     store: Any = None,
     prefetch: int = 32768,
@@ -726,7 +727,7 @@ async def open(
 
 @overload
 async def open(
-    uri: Sequence[str],
+    uri: Sequence[str | os.PathLike[str]],
     *,
     store: Any = None,
     prefetch: int = 32768,
@@ -737,7 +738,7 @@ async def open(
 
 
 async def open(
-    uri: str | Sequence[str],
+    uri: str | os.PathLike[str] | Sequence[str | os.PathLike[str]],
     *,
     store: Any = None,
     prefetch: int = 32768,
@@ -751,7 +752,8 @@ async def open(
     shared object store for connection reuse.
 
     Args:
-        uri: A single URI or a list of URIs.
+        uri: A single URI or a list of URIs. A local path may also be a
+            ``pathlib.Path``, as in ``rasterio.open``.
         store: Optional pre-constructed store for connection reuse.
         prefetch: Number of bytes to prefetch when opening the TIFF.
         cache: When True, cache parsed TIFF headers in memory so that
@@ -762,9 +764,9 @@ async def open(
         **store_kwargs: Extra kwargs forwarded to ``async_tiff.store.from_url``
             (e.g. ``skip_signature``, ``region``, ``request_payer``).
     """
-    if isinstance(uri, str):
+    if isinstance(uri, str | os.PathLike):
         return await AsyncGeoTIFF.open(
-            uri,
+            os.fspath(uri),
             store=store,
             prefetch=prefetch,
             cache=cache,
@@ -772,7 +774,7 @@ async def open(
             **store_kwargs,
         )
     return await _open_many(
-        uri,
+        [os.fspath(u) for u in uri],
         store=store,
         prefetch=prefetch,
         cache=cache,
