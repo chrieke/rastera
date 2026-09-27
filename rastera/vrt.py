@@ -500,17 +500,13 @@ def _parse_vrt_xml(
     declared_size = _declared_raster_size(root)
     declared_transform = _declared_geotransform(root)
 
-    source_tags = {
-        "SimpleSource",
-        "ComplexSource",
-        "AveragedSource",
-        "KernelFilteredSource",
-    }
     bands: list[_VRTBand] = []
     for vrt_band in root.findall("VRTRasterBand"):
         band_no = vrt_band.attrib.get("band", "?")
         _reject_derived_band(vrt_band, band_no)
-        sources = [child for child in vrt_band if child.tag in source_tags]
+        # Every kind of source counts, so the guards below also turn away one
+        # this list would not name, such as <NoDataFromMaskSource>.
+        sources = [child for child in vrt_band if child.tag.endswith("Source")]
         if not sources:
             raise ValueError(f"Malformed VRT band {band_no}: no source element")
         if len(sources) > 1:
@@ -790,8 +786,9 @@ def _hides_nodata(vrt_band: ET.Element) -> bool:
     el = vrt_band.find("HideNoDataValue")
     if el is None or not el.text or not el.text.strip():
         return False
-    # GDAL writes 1; treat anything it would read as true the same way.
-    return el.text.strip() not in ("0", "false", "FALSE")
+    # GDAL writes 1 and reads the flag with CPLTestBool, to which these are the
+    # false values, in any case.
+    return el.text.strip().lower() not in ("0", "false", "no", "off")
 
 
 def _reject_remapping_nodata(

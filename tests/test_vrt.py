@@ -380,6 +380,25 @@ class TestComplexSourceAndNodata:
         with pytest.raises(NotImplementedError, match="<AveragedSource>"):
             _parse_vrt_xml(_one_band_vrt(source_tag="AveragedSource"), "s3://b/x.vrt")
 
+    def test_a_second_source_of_any_kind_counts(self):
+        """Only four source tags were counted, so a <NoDataFromMaskSource> next
+        to a SimpleSource passed as one source and its overlay was dropped."""
+        xml = _one_band_vrt(
+            source_tag="SimpleSource",
+        ).replace(
+            b"</SimpleSource>",
+            b"</SimpleSource><NoDataFromMaskSource>"
+            b"<SourceFilename>/vsis3/b/m.tif</SourceFilename>"
+            b"</NoDataFromMaskSource>",
+        )
+        with pytest.raises(NotImplementedError, match="2 sources"):
+            _parse_vrt_xml(xml, "s3://b/x.vrt")
+
+    def test_a_lone_source_of_another_kind_is_named(self):
+        """It raised "no source element", as if the band had none."""
+        with pytest.raises(NotImplementedError, match="<ArraySource>"):
+            _parse_vrt_xml(_one_band_vrt(source_tag="ArraySource"), "s3://b/x.vrt")
+
     def test_malformed_nodata_raises_value_error(self):
         with pytest.raises(ValueError, match="malformed <NODATA>"):
             _parse_vrt_xml(_complex_source_vrt("<NODATA>abc</NODATA>"), "s3://b/x.vrt")
@@ -550,7 +569,9 @@ class TestDeclaredNodata:
         assert isinstance(bands, list)
         assert _declared_nodata(bands) == 0
 
-    @pytest.mark.parametrize("text", ["0", "false"])
+    # "False", "no" and "off" are false to GDAL too, which reads the flag with
+    # CPLTestBool; rastera read them as true and dropped the reported value.
+    @pytest.mark.parametrize("text", ["0", "false", "False", "no", "OFF"])
     def test_hide_nodata_switched_off_still_reports(self, text: str):
         bands = _parse_vrt_xml(
             _one_band_vrt(
