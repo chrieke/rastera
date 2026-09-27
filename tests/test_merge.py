@@ -984,6 +984,33 @@ class TestMixedInputs:
         assert out.mask[:, :10].all()
         assert not out.mask[:, 10:].any()
 
+    @pytest.mark.parametrize("tall_first", [False, True])
+    async def test_a_tile_with_taller_pixels_merges_in_either_order(
+        self, tall_first: bool
+    ):
+        """Only the first input's pixel height was checked, so a later input
+        with taller pixels went down the native path, which refused it."""
+        square = make_mock_geotiff(width=20, height=20, scale=10.0, count=1)
+        square.read = slicing_read(square, np.full((1, 20, 20), 50, np.uint16))
+        tall = make_mock_geotiff(
+            width=10, height=10, scale=10.0, y_scale=20.0, count=1, origin_x=200
+        )
+        tall.read = slicing_read(tall, np.full((1, 10, 10), 200, np.uint16))
+        cogs = [
+            AsyncGeoTIFF("s3://b/a.tif", square),
+            AsyncGeoTIFF("s3://b/b.tif", tall),
+        ]
+        if tall_first:
+            cogs.reverse()
+
+        out = await merge(
+            cogs, bbox=(0, 0, 300, 200), bbox_crs=32632, target_resolution=10.0
+        )
+
+        data: np.ndarray[Any, Any] = out.data  # type: ignore[reportUnknownMemberType]
+        assert (data[0, :, :20] == 50).all()
+        assert (data[0, :, 20:] == 200).all()
+
     async def test_mixed_dtype_rejected(self):
         """A float32 contribution into a uint16 output raised an opaque
         TypeError from np.copyto; a narrowing cast truncated silently."""

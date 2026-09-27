@@ -144,14 +144,17 @@ async def merge(
     # The native path is a straight block copy onto the snapped output grid,
     # which sits on multiples of target_resolution — exact only when every
     # source grid is on those multiples too, north-up and square at that
-    # resolution (res_matches_target checks the x axis only; a negative -e
-    # can never isclose a positive resolution). Anything else is resampled.
-    srcs_on_res_grid = math.isclose(
-        target_resolution, -float(base_gt.transform.e)
-    ) and all(
-        _is_on_res_grid(float(cog._geotiff.transform.c), target_resolution)
-        and _is_on_res_grid(float(cog._geotiff.transform.f), target_resolution)
-        for cog in cogs
+    # resolution (a negative -e can never isclose a positive resolution).
+    # Every input, not just the first: a later one with taller pixels, or
+    # south-up or rotated, went down the native path, which then refused it.
+    # Anything else is resampled.
+    srcs_on_res_grid = all(
+        math.isclose(target_resolution, -float(t.e))
+        and float(t.b) == 0
+        and float(t.d) == 0
+        and _is_on_res_grid(float(t.c), target_resolution)
+        and _is_on_res_grid(float(t.f), target_resolution)
+        for t in (cog._geotiff.transform for cog in cogs)
     )
 
     # Note: use_overviews is intentionally NOT included here.  The native
