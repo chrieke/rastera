@@ -24,7 +24,7 @@ from pyproj import CRS
 
 from .. import config
 from ..geo import BBox, ensure_bbox, window_from_bbox
-from ..reader import AsyncGeoTIFF, MetaOverrides, _make_output_array
+from ..reader import AsyncGeoTIFF, MetaOverrides, _make_output_array, _source_store
 from ..resampling import ResamplingMethod
 from ..store import _check_source_uri, _fetch_descriptor_bytes, _join_relative_uri
 
@@ -98,6 +98,7 @@ class _DIMAPDataset(AsyncGeoTIFF):
         meta_overrides: MetaOverrides | None = None,
         first_tile: AsyncGeoTIFF | None = None,
         first_tile_key: tuple[int, int, int] | None = None,
+        stores: dict[tuple[str, str | None], Any] | None = None,
     ):
         # DIMAP XML has no canonical nodata value. When the caller hands
         # us a pre-opened tile (the normal path from ``_maybe_open_dimap``),
@@ -110,6 +111,8 @@ class _DIMAPDataset(AsyncGeoTIFF):
         self._layout = layout
         self._tile_open_kwargs: dict[str, Any] = {
             "store": store,
+            # Shared with the open that sniffed the first tile.
+            "stores": {} if stores is None else stores,
             "prefetch": prefetch,
             "cache": cache,
             **(store_kwargs or {}),
@@ -280,11 +283,15 @@ class _DIMAPDataset(AsyncGeoTIFF):
             task = asyncio.ensure_future(self._open_tile(group_idx, tile_row, tile_col))
             self._tile_tasks[key] = task
         try:
-            tile = await task
+            # Shielded: a reader being cancelled must not cancel the open for the
+            # others awaiting it.
+            tile = await asyncio.shield(task)
         finally:
-            # Drop the in-flight entry either way: on success the tile moves to
-            # `_tiles`, on failure the next read gets a fresh attempt.
-            self._tile_tasks.pop(key, None)
+            # Drop the in-flight entry once the open is over: on success the
+            # tile moves to `_tiles`, on failure the next read gets a fresh
+            # attempt. A cancelled reader leaves a running open to the others.
+            if task.done():
+                self._tile_tasks.pop(key, None)
         self._tiles[key] = tile
         return tile
 
@@ -293,7 +300,9 @@ class _DIMAPDataset(AsyncGeoTIFF):
     ) -> AsyncGeoTIFF:
         href = self._layout.groups[group_idx].tile_paths[(tile_row, tile_col)]
         tile_uri = _resolve_tile_uri(href, self.uri)
-        return await AsyncGeoTIFF.open(tile_uri, **self._tile_open_kwargs)
+        tile = await _open_tile_uri(tile_uri, **self._tile_open_kwargs)
+        _validate_tile(self._layout, tile, (group_idx, tile_row, tile_col))
+        return tile
 
     def __repr__(self) -> str:
         return (
@@ -332,14 +341,16 @@ async def _maybe_open_dimap(
     if b"Dimap_Document" not in xml_bytes[:2048]:
         return None
     layout = _parse_dimap_xml(xml_bytes)
+    stores: dict[tuple[str, str | None], Any] = {}
     tile_open_kwargs: dict[str, Any] = {
         "store": store,
+        "stores": stores,
         "prefetch": prefetch,
         "cache": cache,
         **store_kwargs,
     }
     first_key, first_tile = await _sniff_first_tile(layout, uri, tile_open_kwargs)
-    _validate_first_tile(layout, first_tile, first_key)
+    _validate_tile(layout, first_tile, first_key)
     return _DIMAPDataset(
         uri,
         layout,
@@ -350,6 +361,7 @@ async def _maybe_open_dimap(
         meta_overrides=meta_overrides,
         first_tile=first_tile,
         first_tile_key=first_key,
+        stores=stores,
     )
 
 
@@ -364,7 +376,7 @@ async def _sniff_first_tile(
     (r, c) = min(layout.groups[0].tile_paths)
     href = layout.groups[0].tile_paths[(r, c)]
     tile_uri = _resolve_tile_uri(href, uri)
-    tile = await AsyncGeoTIFF.open(tile_uri, **tile_open_kwargs)
+    tile = await _open_tile_uri(tile_uri, **tile_open_kwargs)
     return (0, r, c), tile
 
 
@@ -478,11 +490,11 @@ def _require_positive_attr(el: ET.Element, attr: str) -> int:
 
 def _parse_regular_tiling(dims: ET.Element) -> tuple[int, int, int, int]:
     tile_set = dims.find("Tile_Set")
-    if tile_set is None:
-        # Untiled DIMAP: the whole raster is one tile per band-group. The
-        # Data_File entries still carry tile_R="1" tile_C="1", so the
-        # mosaic stitcher works unchanged with a 1x1 grid sized to the
-        # full raster.
+    if tile_set is None or len(tile_set) == 0:
+        # Untiled DIMAP, with <Tile_Set> left out or left empty: the whole
+        # raster is one tile per band-group. The Data_File entries still carry
+        # tile_R="1" tile_C="1", so the mosaic stitcher works unchanged with a
+        # 1x1 grid sized to the full raster.
         nrows = _require_positive_int(dims, "NROWS")
         ncols = _require_positive_int(dims, "NCOLS")
         return 1, 1, nrows, ncols
@@ -614,9 +626,13 @@ def _parse_dtype(encoding: ET.Element) -> np.dtype:
                 f"expected 'UNSIGNED' or 'SIGNED'"
             )
         prefix = "uint" if sign == "UNSIGNED" else "int"
-        if nbits not in (8, 16, 32, 64):
-            raise NotImplementedError(f"DIMAP unsupported integer NBITS={nbits}")
-        return np.dtype(f"{prefix}{nbits}")
+        if not 1 <= nbits <= 64:
+            raise ValueError(f"DIMAP: <NBITS> is {nbits}; expected 1 to 64")
+        # NBITS is the sensor's bit depth, 12 for Pleiades, which the tiles
+        # store in the next integer size up; GDAL reads that size too. The
+        # tile check still rejects a tile that does not fit it.
+        size = next(b for b in (8, 16, 32, 64) if nbits <= b)
+        return np.dtype(f"{prefix}{size}")
     if dt == "FLOAT":
         if nbits not in (32, 64):
             raise NotImplementedError(f"DIMAP unsupported float NBITS={nbits}")
@@ -625,11 +641,10 @@ def _parse_dtype(encoding: ET.Element) -> np.dtype:
 
 
 def _parse_crs_epsg(crs_root: ET.Element) -> int:
-    projected = crs_root.find("Projected_CRS")
-    geographic = crs_root.find("Geographic_CRS")
+    # The two elements GDAL reads, in its order.
     for el, code_tag in (
-        (projected, "PROJECTED_CRS_CODE"),
-        (geographic, "GEOGRAPHIC_CRS_CODE"),
+        (crs_root.find("Projected_CRS"), "PROJECTED_CRS_CODE"),
+        (crs_root.find("Geodetic_CRS"), "GEODETIC_CRS_CODE"),
     ):
         if el is None:
             continue
@@ -644,7 +659,7 @@ def _parse_crs_epsg(crs_root: ET.Element) -> int:
             raise ValueError(f"DIMAP: could not extract EPSG code from {code!r}") from e
     raise NotImplementedError(
         "DIMAP Coordinate_Reference_System has neither Projected_CRS nor "
-        "Geographic_CRS with an EPSG code"
+        "Geodetic_CRS with an EPSG code"
     )
 
 
@@ -777,22 +792,17 @@ def _tile_decomposition(layout: _DIMAPLayout, window: Window) -> list[_TileRead]
     return reads
 
 
-def _validate_first_tile(
+def _validate_tile(
     layout: _DIMAPLayout, tile: AsyncGeoTIFF, key: tuple[int, int, int]
 ) -> None:
-    """Check the descriptor against the one tile that is already open.
+    """Check the descriptor against a tile as it is opened.
 
     The XML declares what the tiles hold and nothing verifies it, so a
     descriptor that disagrees with its own imagery used to surface as corrupt
     pixels or an error naming neither the tile nor the descriptor. This is
-    ``vrt.py``'s ``_validate_source_windows`` for DIMAP; only the tile
-    ``_sniff_first_tile`` already fetched is checked, so it costs no request.
-
-    Tiles disagreeing *among themselves* is out of scope — catching that means
-    opening all of them at open time, which is what the lazy tile cache exists
-    to avoid. For the same reason the band-count check only ever covers the
-    group that tile belongs to (group 0); a later group declaring more bands
-    than its own tiles carry still fails at read time.
+    ``vrt.py``'s ``_validate_source_windows`` for DIMAP. It runs on the tile
+    ``_sniff_first_tile`` fetches at open time, and on each other tile when a
+    read first reaches it, so it costs no request of its own.
     """
     group_idx, tile_row, tile_col = key
 
@@ -859,3 +869,21 @@ def _resolve_tile_uri(href: str, dimap_uri: str) -> str:
         tile_uri = _join_relative_uri(dimap_uri, href)
     _check_source_uri(tile_uri, dimap_uri)
     return tile_uri
+
+
+async def _open_tile_uri(
+    tile_uri: str,
+    *,
+    store: Any,
+    stores: dict[tuple[str, str | None], Any],
+    prefetch: int,
+    cache: bool,
+    **store_kwargs: Any,
+) -> AsyncGeoTIFF:
+    """Open a tile, with the caller's store or else one per bucket shared by
+    the product's tiles (see ``_source_store``)."""
+    if store is None:
+        store = _source_store(tile_uri, stores, cache, **store_kwargs)
+    return await AsyncGeoTIFF.open(
+        tile_uri, store=store, prefetch=prefetch, cache=cache, **store_kwargs
+    )

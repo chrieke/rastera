@@ -38,11 +38,14 @@ from .store import (
     _build_store,
     _extract_key,
     _require_same_bucket,
+    _resolve_local_path,
+    _shared_store,
 )
 
-# LRU cache for parsed GeoTIFF objects, keyed by URI.
+# LRU cache for parsed GeoTIFF objects, keyed by URI (see ``_cache_key``).
 # Avoids re-fetching headers on repeated opens of the same file.
-_geotiff_cache: OrderedDict[str, GeoTIFF] = OrderedDict()
+_CacheKey = str | tuple[str, int, int]
+_geotiff_cache: OrderedDict[_CacheKey, GeoTIFF] = OrderedDict()
 _cache_max_size: int = 128
 
 
@@ -163,7 +166,9 @@ class AsyncGeoTIFF:
                 is auto-constructed via ``async_tiff.store.from_url``.
             prefetch: Number of bytes to prefetch when opening the TIFF.
             cache: When True, cache the parsed GeoTIFF object in memory so that
-                subsequent opens of the same URI skip the header fetch.
+                subsequent opens of the same URI skip the header fetch. A
+                local file rewritten since is read afresh; a remote object is
+                assumed unchanged until :func:`rastera.clear_cache`.
             meta_overrides: Optional header overrides applied at construction.
                 Currently supports ``{"crs": int | CRS}`` for TIFFs missing
                 or carrying incorrect georeferencing. Overrides always
@@ -199,8 +204,11 @@ class AsyncGeoTIFF:
             # Non-DIMAP .xml falls through — the normal TIFF open below
             # will surface the "unexpected magic bytes" error.
 
-        if cache:
-            gt = get_cached_geotiff(uri)
+        # Keyed before the fetch: a file rewritten during it must not be cached
+        # under its new version.
+        key = _cache_key(uri) if cache and _cache_max_size > 0 else None
+        if key is not None:
+            gt = _cache_get(key)
             if gt is not None:
                 return cls(uri, gt, meta_overrides=meta_overrides)
 
@@ -208,10 +216,10 @@ class AsyncGeoTIFF:
             store = _build_store(uri, **store_kwargs)
         geotiff = await GeoTIFF.open(_extract_key(uri), store=store, prefetch=prefetch)
 
-        if cache and _cache_max_size > 0:
+        if key is not None:
             if len(_geotiff_cache) >= _cache_max_size:
                 _geotiff_cache.popitem(last=False)
-            _geotiff_cache[uri] = geotiff
+            _geotiff_cache[key] = geotiff
 
         return cls(uri, geotiff, meta_overrides=meta_overrides)
 
@@ -815,10 +823,9 @@ def get_cached_geotiff(uri: str) -> GeoTIFF | None:
     when caching is disabled (``set_cache_size(0)``) or the URI is absent.
     """
     if _cache_max_size > 0:
-        gt = _geotiff_cache.get(uri)
-        if gt is not None:
-            _geotiff_cache.move_to_end(uri)
-        return gt
+        key = _cache_key(uri)
+        if key is not None:
+            return _cache_get(key)
     return None
 
 
@@ -1091,3 +1098,49 @@ def _validate_window(gt: _GeoTIFFLike, window: Window) -> None:
             f"rows={window.row_off}:{window.row_off + window.height}. "
             f"Image: {gt.width}x{gt.height}."
         )
+
+
+def _cache_get(key: _CacheKey) -> GeoTIFF | None:
+    gt = _geotiff_cache.get(key)
+    if gt is not None:
+        _geotiff_cache.move_to_end(key)
+    return gt
+
+
+def _cache_key(uri: str) -> _CacheKey | None:
+    """Where *uri*'s header is cached, or ``None`` when it cannot be.
+
+    A local file is keyed on its resolved path, modification time and size,
+    so a file rewritten in place, or a relative path opened again from another
+    directory, misses. A remote URI is keyed as given: checking that would cost
+    a request per open, which is what the cache saves.
+    """
+    path = _resolve_local_path(uri)
+    if path is None:
+        return uri
+    try:
+        st = path.stat()
+    except OSError:
+        return None  # the open itself says why
+    return (str(path), st.st_mtime_ns, st.st_size)
+
+
+def _source_store(
+    uri: str,
+    stores: dict[tuple[str, str | None], Any],
+    cache: bool,
+    **store_kwargs: Any,
+) -> Any | None:
+    """The store a VRT or DIMAP opens one of its sources with, shared per
+    bucket across them (see ``_shared_store``).
+
+    ``None`` when the header is cached: the open then returns before it needs
+    one, and a warm descriptor open built none before stores were shared. And
+    ``None`` for a nested VRT or DIMAP, whose own URI is never in the header
+    cache: it shares stores among its sources itself, for the ones not cached.
+    """
+    if uri.lower().endswith((".vrt", ".xml")):
+        return None
+    if cache and get_cached_geotiff(uri) is not None:
+        return None
+    return _shared_store(uri, stores, **store_kwargs)

@@ -22,7 +22,10 @@ from rastera.formats.dimap import (
     _tile_decomposition,
 )
 from rastera.geo import BBox, WindowOutOfRangeError
-from rastera.reader import AsyncGeoTIFF
+from rastera.reader import AsyncGeoTIFF, _geotiff_cache, clear_cache
+from tests.conftest import make_mock_geotiff
+
+pytestmark = pytest.mark.usefixtures("stub_shared_store")
 
 # Minimal but realistic PNEO-flavoured DIMAP: two band-groups (RGB + NED),
 # 2x2 tile grid, UTM33N. Trimmed from a real product descriptor.
@@ -193,6 +196,23 @@ class TestParseDIMAP:
         assert (layout.tile_width, layout.tile_height) == (800, 1000)
         assert layout.width == 800 and layout.height == 1000
 
+    @pytest.mark.parametrize("empty", [b"<Tile_Set></Tile_Set>", b"<Tile_Set/>"])
+    def test_an_empty_tile_set_is_untiled_too(self, empty: bytes):
+        """GDAL's untiled PNEO sample writes the element but leaves it empty,
+        which used to be rejected as an irregular tiling."""
+        untiled = _modified(
+            PNEO_DIMAP,
+            b"<Tile_Set>\n        <NTILES>4</NTILES>\n        <Regular_Tiling>\n"
+            b'          <NTILES_SIZE ncols="400" nrows="500" />\n'
+            b'          <NTILES_COUNT ntiles_C="2" ntiles_R="2" />\n'
+            b'          <NTILES_OVERLAP ncols="0" nrows="0" />\n'
+            b"        </Regular_Tiling>\n      </Tile_Set>",
+            empty,
+        )
+        layout = _parse_dimap_xml(untiled)
+        assert (layout.tile_rows, layout.tile_cols) == (1, 1)
+        assert (layout.tile_width, layout.tile_height) == (800, 1000)
+
     def test_parses_band_groups_and_virtual_band_order(self):
         """Virtual bands are concatenated across groups in document order;
         each remembers its group and its 1-based band index *within* a
@@ -337,16 +357,18 @@ class TestParseDIMAP:
         with pytest.raises(NotImplementedError, match="image/tiff"):
             _parse_dimap_xml(xml)
 
-    def test_geographic_crs_fallback(self):
+    def test_geodetic_crs_fallback(self):
+        """A product ordered in WGS84 lat/lon names its CRS in <Geodetic_CRS>,
+        the spelling GDAL reads."""
         xml = _modified(
             PNEO_DIMAP,
             b"""<Projected_CRS>
       <PROJECTED_CRS_NAME>WGS 84 / UTM zone 33N</PROJECTED_CRS_NAME>
       <PROJECTED_CRS_CODE>urn:ogc:def:crs:EPSG::32633</PROJECTED_CRS_CODE>
     </Projected_CRS>""",
-            b"""<Geographic_CRS>
-      <GEOGRAPHIC_CRS_CODE>urn:ogc:def:crs:EPSG::4326</GEOGRAPHIC_CRS_CODE>
-    </Geographic_CRS>""",
+            b"""<Geodetic_CRS>
+      <GEODETIC_CRS_CODE>urn:ogc:def:crs:EPSG::4326</GEODETIC_CRS_CODE>
+    </Geodetic_CRS>""",
         )
         assert _parse_dimap_xml(xml).crs_epsg == 4326
 
@@ -368,6 +390,20 @@ class TestParseDIMAP:
       <NBITS>32</NBITS>""",
         )
         assert _parse_dimap_xml(xml).dtype == np.dtype("float32")
+
+    def test_sensor_bit_depth_reads_in_its_container(self):
+        """Pleiades declares its 12-bit depth, and the tiles store it as
+        uint16, where GDAL reads it."""
+        xml = _modified(PNEO_DIMAP, b"<NBITS>16</NBITS>", b"<NBITS>12</NBITS>")
+        assert _parse_dimap_xml(xml).dtype == np.dtype("uint16")
+
+    @pytest.mark.parametrize("nbits", [b"0", b"65"])
+    def test_rejects_a_bit_depth_no_integer_has(self, nbits: bytes):
+        xml = _modified(
+            PNEO_DIMAP, b"<NBITS>16</NBITS>", b"<NBITS>" + nbits + b"</NBITS>"
+        )
+        with pytest.raises(ValueError, match="NBITS"):
+            _parse_dimap_xml(xml)
 
 
 class TestSingleGroupDIMAP:
@@ -681,6 +717,10 @@ def _mock_tile_ds(fill_fn: _TileFillFn) -> AsyncGeoTIFF:
         )
 
     ds._read_native = _read_native
+    # The header the tile check reads, agreeing with _two_group_layout's tiles.
+    ds.uri = "s3://bucket/prod/TILE.TIF"
+    ds.count = 3
+    ds._geotiff = SimpleNamespace(dtype=np.dtype("uint16"), width=400, height=500)
     return ds
 
 
@@ -942,6 +982,26 @@ class TestDIMAPRead:
             )
         assert open_count == 1  # tile (1,1) of group 0 opened exactly once
 
+    async def test_a_later_tile_is_checked_when_a_read_first_opens_it(self):
+        """Only the tile sniffed at open time was checked. A later tile wider
+        than the declared dtype was cast into the mosaic, wrapping its values."""
+        ds = _DIMAPDataset("/fake/DIM.xml", _two_group_layout())
+
+        async def fake_open(uri: str, **_: Any) -> Any:
+            tile = _fake_first_tile(dtype=np.dtype("uint32"))
+            tile.uri = uri
+            return tile
+
+        with (
+            patch.object(AsyncGeoTIFF, "open", side_effect=fake_open),
+            pytest.raises(ValueError, match=r"RGB_R2C2\.TIF.*does not fit"),
+        ):
+            # Inside tile (2, 2) of the RGB group only.
+            await ds._read_native(
+                window=Window(col_off=500, row_off=600, width=10, height=10),
+                band_indices=[0],
+            )
+
 
 def _fake_first_tile(
     nodata: int | float | None = 0,
@@ -952,7 +1012,7 @@ def _fake_first_tile(
 ) -> Any:
     """Stand-in for the pre-opened first tile supplied to ``_DIMAPDataset`` by
     ``_maybe_open_dimap``. Carries the ``_nodata`` the dataset inherits plus the
-    dtype/band-count/size ``_validate_first_tile`` checks against the
+    dtype/band-count/size ``_validate_tile`` checks against the
     descriptor. The defaults agree with both fixtures' declared tiling — 400x500
     uint16 — and with 4 bands, enough for PHR's NBANDS and PNEO's per-group 3."""
     tile = MagicMock(spec=AsyncGeoTIFF)
@@ -972,6 +1032,94 @@ def _patch_sniff(nodata: int | float | None = 0, **tile_kwargs: Any) -> Any:
         return (0, 1, 1), _fake_first_tile(nodata=nodata, **tile_kwargs)
 
     return patch("rastera.formats.dimap._sniff_first_tile", new=_fake)
+
+
+class TestTileStores:
+    """Each tile open built its own store: 80-160 ms of blocking setup apiece
+    for a remote product, and a connection pool per tile."""
+
+    async def test_a_remote_products_tiles_share_one_store(
+        self, stub_shared_store: MagicMock
+    ):
+        stores: list[Any] = []
+
+        async def fake_open(uri: str, **kwargs: Any) -> Any:
+            stores.append(kwargs["store"])
+            return _fake_first_tile()
+
+        with (
+            patch(
+                "rastera.formats.dimap._fetch_descriptor_bytes",
+                new=AsyncMock(return_value=PNEO_DIMAP),
+            ),
+            patch.object(AsyncGeoTIFF, "open", side_effect=fake_open),
+        ):
+            ds = await _maybe_open_dimap("s3://bucket/DIM_PNEO.XML")
+            assert ds is not None
+            for g, group in enumerate(ds._layout.groups):
+                for r, c in group.tile_paths:
+                    await ds._get_tile(g, r, c)
+
+        assert len(stores) == 8  # 2 groups x 2x2 tiles, the sniffed one included
+        assert all(s is stores[0] and s is not None for s in stores)
+        stub_shared_store.assert_called_once()
+
+    async def test_cached_tiles_build_no_store(self, stub_shared_store: MagicMock):
+        """A warm open returns every tile from the header cache, which needs no
+        store, so building one would cost 80-160 ms for nothing."""
+        dimap = "s3://bucket/DIM_PNEO.XML"
+        layout = _parse_dimap_xml(PNEO_DIMAP)
+        cached = [
+            _resolve_tile_uri(href, dimap)
+            for group in layout.groups
+            for href in group.tile_paths.values()
+        ]
+        for uri in cached:
+            _geotiff_cache[uri] = make_mock_geotiff()
+        seen: list[Any] = []
+
+        async def fake_open(uri: str, **kwargs: Any) -> Any:
+            seen.append(kwargs["store"])
+            return _fake_first_tile()
+
+        try:
+            with (
+                patch(
+                    "rastera.formats.dimap._fetch_descriptor_bytes",
+                    new=AsyncMock(return_value=PNEO_DIMAP),
+                ),
+                patch.object(AsyncGeoTIFF, "open", side_effect=fake_open),
+            ):
+                ds = await _maybe_open_dimap(dimap)
+                assert ds is not None
+                await ds._get_tile(1, 1, 1)
+        finally:
+            clear_cache()
+
+        assert seen == [None, None]
+        stub_shared_store.assert_not_called()
+
+    async def test_a_callers_store_is_used_as_given(self, stub_shared_store: MagicMock):
+        mine = MagicMock()
+        seen: list[Any] = []
+
+        async def fake_open(uri: str, **kwargs: Any) -> Any:
+            seen.append(kwargs["store"])
+            return _fake_first_tile()
+
+        with (
+            patch(
+                "rastera.formats.dimap._fetch_descriptor_bytes",
+                new=AsyncMock(return_value=PNEO_DIMAP),
+            ),
+            patch.object(AsyncGeoTIFF, "open", side_effect=fake_open),
+        ):
+            ds = await _maybe_open_dimap("s3://bucket/DIM_PNEO.XML", store=mine)
+            assert ds is not None
+            await ds._get_tile(1, 1, 1)
+
+        assert seen == [mine, mine]
+        stub_shared_store.assert_not_called()
 
 
 class TestDetection:
@@ -1143,7 +1291,7 @@ class TestResolveTileURI:
 
 class TestCRSParsing:
     def test_rejects_missing_epsg_code(self):
-        """If neither Projected_CRS nor Geographic_CRS carries an EPSG
+        """If neither Projected_CRS nor Geodetic_CRS carries an EPSG
         code, we bail rather than guess — downstream reprojection needs
         a real authority code."""
         xml = _modified(
@@ -1360,6 +1508,32 @@ class TestTileCache:
             assert await ds._get_tile(0, 0, 0) is tile
             assert await ds._get_tile(0, 0, 0) is tile
         assert calls == 1
+
+    async def test_a_cancelled_reader_leaves_the_open_to_the_others(self):
+        """Readers awaited the shared open directly, so cancelling one, as a
+        request timeout does, cancelled it for every reader waiting on it."""
+        ds = _DIMAPDataset("s3://bucket/DIM_PNEO.XML", self._layout())
+        tile = MagicMock()
+        release = asyncio.Event()
+        calls = 0
+
+        async def slow(*_: Any, **__: Any):
+            nonlocal calls
+            calls += 1
+            await release.wait()
+            return tile
+
+        with patch.object(_DIMAPDataset, "_open_tile", new=slow):
+            first = asyncio.ensure_future(ds._get_tile(0, 1, 1))
+            second = asyncio.ensure_future(ds._get_tile(0, 1, 1))
+            await asyncio.sleep(0)  # both readers are now waiting on the open
+            first.cancel()
+            release.set()
+            assert await second is tile
+            with pytest.raises(asyncio.CancelledError):
+                await first
+        assert calls == 1
+        assert ds._tiles[(0, 1, 1)] is tile
 
     def test_construction_needs_no_running_loop(self):
         """The primed first tile was held as a resolved Future, which requires a

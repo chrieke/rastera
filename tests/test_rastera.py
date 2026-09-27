@@ -1,5 +1,6 @@
 """Unit tests for AsyncGeoTIFF."""
 
+import os
 from dataclasses import replace as dc_replace
 from pathlib import Path
 from typing import Any
@@ -269,12 +270,15 @@ class TestOpen:
 
     @patch("rastera.reader.GeoTIFF")
     @patch("rastera.store.from_url")
-    async def test_open_many_accepts_sibling_local_paths(
+    async def test_open_many_accepts_local_paths_in_different_folders(
         self, mock_from_url: Any, mock_geotiff_cls: Any, tmp_path: Path
     ):
-        """Sibling local paths share a parent-dir bucket and must not be rejected."""
-        a = tmp_path / "a.tif"
-        b = tmp_path / "b.tif"
+        """One store at the filesystem root serves both, each under its full
+        path. Rooted at each file's folder, the pair was refused as two
+        buckets."""
+        (tmp_path / "A").mkdir()
+        (tmp_path / "B").mkdir()
+        a, b = tmp_path / "A" / "x.tif", tmp_path / "B" / "y.tif"
         a.write_bytes(b"")
         b.write_bytes(b"")
         mock_from_url.return_value = MagicMock()
@@ -283,7 +287,10 @@ class TestOpen:
         srcs = await rastera.open([str(a), str(b)], cache=False)
 
         assert len(srcs) == 2
-        mock_from_url.assert_called_once_with(tmp_path.resolve().as_uri())
+        anchor = Path(tmp_path.resolve().anchor)
+        mock_from_url.assert_called_once_with(anchor.as_uri())
+        keys = [c.args[0] for c in mock_geotiff_cls.open.call_args_list]
+        assert keys == [p.resolve().relative_to(anchor).as_posix() for p in (a, b)]
 
 
 # ── meta_overrides ──────────────────────────────────────────────────────
@@ -1179,3 +1186,56 @@ class TestLRUCache:
         _geotiff_cache["a"] = make_mock_geotiff()
         set_cache_size(0)
         assert len(_geotiff_cache) == 0
+
+    @staticmethod
+    def _headers(mock_geotiff_cls: Any) -> tuple[Any, Any]:
+        """Each header fetch returns a different header, so a stale hit shows."""
+        first, second = make_mock_geotiff(), make_mock_geotiff()
+        mock_geotiff_cls.open = AsyncMock(side_effect=[first, second])
+        return first, second
+
+    @patch("rastera.reader.GeoTIFF")
+    @patch("rastera.store.from_url")
+    async def test_a_local_file_rewritten_in_place_is_read_again(
+        self, mock_from_url: Any, mock_geotiff_cls: Any, tmp_path: Path
+    ):
+        first, second = self._headers(mock_geotiff_cls)
+        f = tmp_path / "out.tif"
+        f.write_bytes(b"v1")
+        assert (await AsyncGeoTIFF.open(str(f)))._geotiff is first
+        assert (await AsyncGeoTIFF.open(str(f)))._geotiff is first  # unchanged: hit
+        # Same size, so only the modification time tells the versions apart.
+        f.write_bytes(b"v2")
+        os.utime(f, ns=(f.stat().st_atime_ns, f.stat().st_mtime_ns + 1_000_000))
+        assert (await AsyncGeoTIFF.open(str(f)))._geotiff is second
+        assert mock_geotiff_cls.open.await_count == 2
+
+    @patch("rastera.reader.GeoTIFF")
+    @patch("rastera.store.from_url")
+    async def test_a_relative_path_is_keyed_where_it_resolves(
+        self,
+        mock_from_url: Any,
+        mock_geotiff_cls: Any,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        first, second = self._headers(mock_geotiff_cls)
+        for d in ("a", "b"):
+            (tmp_path / d).mkdir()
+            (tmp_path / d / "x.tif").write_bytes(b"v1")
+            os.utime(tmp_path / d / "x.tif", ns=(0, 0))
+        monkeypatch.chdir(tmp_path / "a")
+        assert (await AsyncGeoTIFF.open("x.tif"))._geotiff is first
+        monkeypatch.chdir(tmp_path / "b")
+        assert (await AsyncGeoTIFF.open("x.tif"))._geotiff is second
+
+    @patch("rastera.reader.GeoTIFF")
+    @patch("rastera.store.from_url")
+    async def test_a_remote_uri_is_not_checked_again(
+        self, mock_from_url: Any, mock_geotiff_cls: Any
+    ):
+        first, _ = self._headers(mock_geotiff_cls)
+        for _ in range(2):
+            ds = await AsyncGeoTIFF.open("s3://bucket/k.tif", skip_signature=True)
+            assert ds._geotiff is first
+        assert mock_geotiff_cls.open.await_count == 1

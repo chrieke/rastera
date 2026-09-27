@@ -15,6 +15,10 @@ dotted-bucket variants::
     https://s3.<region>.amazonaws.com/<bucket>/<key>
     https://s3.amazonaws.com/<bucket>/<key>
 
+An S3 URL with a query string — presigned, or ``?versionId=`` — is read over
+plain HTTP exactly as given instead, unsigned: the rewrite would drop the
+query, and with it the signature or the version.
+
 Other ``amazonaws.com`` hosts — dual-stack, transfer acceleration, FIPS, access
 points, S3 Express, VPC endpoints — are rejected. Each implies an endpoint and
 addressing style that cannot be inferred from the URL, and silently serving them
@@ -31,7 +35,9 @@ contradicts an explicit kwarg is an error rather than a silent pick.
 
 **Credentials** default to unsigned. ``skip_signature=False`` switches to
 ``Boto3CredentialProvider`` (env vars, ``~/.aws/credentials``, SSO, IAM roles);
-if it cannot be constructed, access falls back to unsigned.
+if it cannot be constructed, access falls back to unsigned. Static keys passed
+as ``access_key_id``/``secret_access_key``/``session_token``, or in ``config``,
+sign the requests themselves.
 """
 
 from __future__ import annotations
@@ -46,7 +52,8 @@ from typing import Any, Literal
 from urllib.parse import ParseResult, unquote, urlparse, urlunparse
 
 import obstore
-from async_tiff.store import from_url  # type: ignore[reportMissingImports]
+from async_tiff.store import HTTPStore, from_url  # type: ignore[reportMissingImports]
+from obstore.store import HTTPStore as ObstoreHTTPStore
 from obstore.store import from_url as obstore_from_url
 
 _DEFAULT_REGION = "us-west-2"
@@ -64,6 +71,20 @@ _AWS_SUFFIX_RE = re.compile(rf"\.{_AWS_SUFFIX}$", re.IGNORECASE)
 # Rejected outright by LocalFileSystem and HTTPStore ("Cannot pass config or
 # keyword parameters for scheme ..."), so they cannot be forwarded blindly.
 _S3_ONLY_KWARGS = ("skip_signature", "region", "credential_provider")
+
+# How obstore takes static S3 keys, as kwargs or in ``config``.
+_AWS_KEY_NAMES = frozenset(
+    {
+        "access_key_id",
+        "secret_access_key",
+        "session_token",
+        "token",
+        "aws_access_key_id",
+        "aws_secret_access_key",
+        "aws_session_token",
+        "aws_token",
+    }
+)
 
 UriKind = Literal["local", "aws", "cloud", "http"]
 
@@ -96,7 +117,12 @@ def _parse_uri(uri: str) -> ParsedURI:
     if scheme in ("", "file"):
         raw = unquote(parsed.path) if scheme == "file" else uri
         path = Path(raw).resolve()
-        return ParsedURI(uri, "local", path.parent.as_uri(), path.name, local_path=path)
+        # Rooted at the filesystem root, not the file's folder: rooted there,
+        # files in two folders read as two buckets, and open(list), merge and
+        # build_index refused them.
+        anchor = Path(path.anchor)
+        key = path.relative_to(anchor).as_posix()
+        return ParsedURI(uri, "local", anchor.as_uri(), key, local_path=path)
 
     if scheme == "s3":
         return ParsedURI(uri, "aws", f"s3://{parsed.netloc}", _path_key(parsed))
@@ -113,19 +139,45 @@ def _parse_uri(uri: str) -> ParsedURI:
     )
 
 
-def _build_store_with(uri: str, from_url_fn: Any, **store_kwargs: Any) -> Any:
+def _build_store_with(
+    uri: str, from_url_fn: Any, http_store: Any, **store_kwargs: Any
+) -> Any:
     """Build an object store rooted at the bucket/host level.
 
-    Accepts any ``from_url`` callable (e.g. ``async_tiff.store.from_url``
-    or ``obstore.store.from_url``) so the same logic serves both backends.
+    Takes a backend's ``from_url`` and ``HTTPStore`` (async-tiff's or
+    obstore's) so the same logic serves both.
     """
     parsed = _parse_uri(uri)
-    return from_url_fn(parsed.root, **_store_kwargs_for(parsed, store_kwargs))
+    kwargs = _store_kwargs_for(parsed, store_kwargs)
+    if parsed.kind == "http" and parsed.root == parsed.uri:
+        # Kept whole for its query. from_url picks the store by host, and for
+        # an S3 host that is an S3Store, which drops the query again.
+        return http_store.from_url(parsed.root, **kwargs)
+    return from_url_fn(parsed.root, **kwargs)
 
 
 def _build_store(uri: str, **store_kwargs: Any) -> Any:
     """Build an async-tiff object store rooted at the bucket/host level."""
-    return _build_store_with(uri, from_url, **store_kwargs)
+    return _build_store_with(uri, from_url, HTTPStore, **store_kwargs)
+
+
+def _shared_store(
+    uri: str, stores: dict[tuple[str, str | None], Any], **store_kwargs: Any
+) -> Any | None:
+    """*uri*'s async-tiff store from *stores*, built and added on first use.
+
+    For a descriptor opening its sources one by one, which otherwise built a
+    store per source: a remote one costs 80-160 ms of blocking setup, and
+    brings its own connection pool. ``None`` for a local path, whose store
+    costs nothing and is left to ``AsyncGeoTIFF.open``.
+    """
+    parsed = _parse_uri(uri)
+    if parsed.kind == "local":
+        return None
+    store = stores.get(parsed.identity)
+    if store is None:
+        store = stores[parsed.identity] = _build_store(uri, **store_kwargs)
+    return store
 
 
 def _extract_key(uri: str) -> str:
@@ -162,7 +214,7 @@ async def _fetch_descriptor_bytes(uri: str, **store_kwargs: Any) -> bytes:
     parsed = _parse_uri(uri)
     if parsed.local_path is not None:
         return parsed.local_path.read_bytes()
-    store = _build_store_with(uri, obstore_from_url, **store_kwargs)
+    store = _build_store_with(uri, obstore_from_url, ObstoreHTTPStore, **store_kwargs)
     result = await obstore.get_async(store, parsed.key)
     return bytes(await result.bytes_async())
 
@@ -225,6 +277,12 @@ def _path_key(parsed: ParseResult) -> str:
 
 
 def _parse_http_uri(uri: str, parsed: ParseResult) -> ParsedURI:
+    # A query carries auth material or a version — a presigned S3 URL,
+    # ``?versionId=`` — that a host- or bucket-rooted store would silently
+    # drop, so root at the whole URI in that case.
+    if parsed.query:
+        return ParsedURI(uri, "http", uri, "")
+
     host = parsed.netloc
     match = _AWS_HOST_RE.match(host)
 
@@ -238,9 +296,9 @@ def _parse_http_uri(uri: str, parsed: ParseResult) -> ParsedURI:
                 f"cannot be inferred from the URL. Pass an explicit store instead: "
                 f"store=S3Store(bucket=..., endpoint=..., region=...)."
             )
-        # A query or fragment carries auth material that a host-rooted store
-        # would silently drop, so root at the whole URI in that case.
-        if parsed.query or parsed.fragment:
+        # A fragment never reaches the server, but on a plain host it may be
+        # part of how the URL was handed out, so it is kept as well.
+        if parsed.fragment:
             return ParsedURI(uri, "http", uri, "")
         return ParsedURI(uri, "http", f"{parsed.scheme}://{host}", _path_key(parsed))
 
@@ -286,7 +344,14 @@ def _store_kwargs_for(
         return out
 
     if parsed.kind == "http":
-        if out.get("skip_signature") is False or "credential_provider" in out:
+        signing = out.get("skip_signature") is False or "credential_provider" in out
+        if signing and parsed.root == parsed.uri:
+            raise ValueError(
+                f"{parsed.uri!r} has a query string, so it is read as given over "
+                f"plain HTTP, which cannot sign requests. A presigned URL signs "
+                f"itself; otherwise drop the query, or pass s3://<bucket>/<key>."
+            )
+        if signing:
             raise ValueError(
                 f"{parsed.uri!r} resolves to a plain HTTP store, which cannot sign "
                 f"requests. rastera authenticates AWS S3 hosts only; for another "
@@ -323,7 +388,13 @@ def _aws_store_kwargs(parsed: ParsedURI, out: dict[str, Any]) -> dict[str, Any]:
         )
     region = parsed.region or caller_region or _env_region()
 
-    if out.get("skip_signature") is False:
+    # Credentials the caller passed, a provider or static keys, sign as given.
+    # Replacing them with unsigned access or the boto3 identity sent the
+    # request as no one, or as someone else.
+    own_credentials = "credential_provider" in out or any(
+        k.lower() in _AWS_KEY_NAMES for k in (*out, *config)
+    )
+    if not own_credentials and out.get("skip_signature") is False:
         del out["skip_signature"]
         provider = _boto3_provider()
         if provider is None:
@@ -332,7 +403,7 @@ def _aws_store_kwargs(parsed: ParsedURI, out: dict[str, Any]) -> dict[str, Any]:
             out["credential_provider"] = provider
             session_config: dict[str, Any] = provider.config or {}
             region = region or session_config.get("region")
-    elif "credential_provider" not in out:
+    elif not own_credentials:
         out.setdefault("skip_signature", True)
 
     out["region"] = region or _DEFAULT_REGION

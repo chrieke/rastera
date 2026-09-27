@@ -8,8 +8,10 @@ from typing import Any, cast
 import geopandas as gpd
 import obstore
 import pyarrow.parquet as pq
+import shapely
+from obstore.store import HTTPStore as ObstoreHTTPStore
 from obstore.store import from_url as obstore_from_url
-from pyproj import Transformer
+from pyproj import CRS, Transformer
 from shapely import ops
 from shapely.geometry import box
 
@@ -68,6 +70,7 @@ async def build_index(
         ValueError: If *uris* span more than one bucket/host. Index each
             bucket separately and concatenate the frames.
     """
+    _check_concurrency(concurrency)
     uris = list(uris)
     if not uris:
         return _empty_geodataframe()
@@ -82,8 +85,11 @@ async def build_index(
     async def _fetch_header(uri: str) -> tuple[str, str, bytes]:
         async with sem:
             key = _extract_key(uri)
-            hdr = bytes(await obstore.get_range_async(obs, key, start=0, end=prefetch))
-            return uri, key, hdr
+            try:
+                hdr = await obstore.get_range_async(obs, key, start=0, end=prefetch)
+            except Exception as exc:
+                raise RuntimeError(f"Failed to index {uri!r}") from exc
+            return uri, key, bytes(hdr)
 
     fetched = await asyncio.gather(*(_fetch_header(u) for u in uris))
     cache = {key: hdr for _, key, hdr in fetched}
@@ -93,16 +99,17 @@ async def build_index(
         async with sem:
             try:
                 src = await AsyncGeoTIFF.open(
-                    uri, store=cached_store, prefetch=prefetch
+                    uri,
+                    store=cached_store,
+                    prefetch=prefetch,
+                    cache=_resolve_local_path(uri) is None,
                 )
                 return src, hdr
             except Exception as exc:
-                hint = ""
-                if _resolve_local_path(uri) is not None:
-                    hint = " (local files are not supported, use remote URIs)"
-                raise RuntimeError(f"Failed to index {uri!r}{hint}") from exc
+                raise RuntimeError(f"Failed to index {uri!r}") from exc
 
     results = await asyncio.gather(*(_open_one(u, hdr) for u, _, hdr in fetched))
+    cache.clear()  # see open_from_index
 
     rows: dict[str, list[Any]] = {c: [] for c in _INDEX_COLUMNS}
     geometries: list[Any] = []
@@ -125,9 +132,11 @@ async def build_index(
         rows["overviews"].append(json.dumps(p["overviews"]))
         b = p["bounds"]
         geom = box(b.minx, b.miny, b.maxx, b.maxy)
-        if p["crs_epsg"] is not None and p["crs_epsg"] != 4326:
-            t = Transformer.from_crs(p["crs_epsg"], 4326, always_xy=True)
-            geom = ops.transform(t.transform, geom)
+        # Without an EPSG code, the CRS object. Skipping the reprojection for
+        # those files stored their native metres as degrees.
+        crs = p["crs_epsg"] if p["crs_epsg"] is not None else p["crs"]
+        if crs != 4326:
+            geom = _reproject(geom, crs, 4326)
         geometries.append(geom)
 
     return gpd.GeoDataFrame(rows, geometry=geometries, crs="EPSG:4326")
@@ -159,6 +168,7 @@ async def open_from_index(
         ValueError: If the selected rows span more than one bucket/host.
             Narrow the selection with *bbox* or open each bucket separately.
     """
+    _check_concurrency(concurrency)
     if isinstance(gdf_or_path, str):
         gdf = _read_geoparquet(gdf_or_path, bbox=bbox, bbox_crs=bbox_crs)
     else:
@@ -191,9 +201,22 @@ async def open_from_index(
             cached_gt = get_cached_geotiff(uri)
             if cached_gt is not None:
                 return AsyncGeoTIFF(uri, cached_gt)
-            return await AsyncGeoTIFF.open(uri, store=cached_store, prefetch=prefetch)
+            # Not cached for a local file: the header comes from the index, and
+            # the file may have been rewritten since, so it would land under
+            # the new version's cache key.
+            return await AsyncGeoTIFF.open(
+                uri,
+                store=cached_store,
+                prefetch=prefetch,
+                cache=_resolve_local_path(uri) is None,
+            )
 
-    return list(await asyncio.gather(*(_open_one(u) for u in uris)))
+    opened = list(await asyncio.gather(*(_open_one(u) for u in uris)))
+    # Parsed now, and later reads fall through to the inner store. Left in
+    # place, every header the reader's LRU keeps held this store, and with it
+    # every row's bytes: about 3 GB for 100k rows at the default prefetch.
+    cache.clear()
+    return opened
 
 
 class HeaderCacheStore:
@@ -365,16 +388,25 @@ def _filter_gdf(
     query_geom = box(minx, miny, maxx, maxy)
 
     if bbox_crs is not None and gdf.crs is not None and gdf.crs.to_epsg() != bbox_crs:
-        transformer = Transformer.from_crs(bbox_crs, gdf.crs.to_epsg(), always_xy=True)
-        query_geom = ops.transform(transformer.transform, query_geom)
+        query_geom = _reproject(query_geom, bbox_crs, gdf.crs)
 
     result = gdf[gdf.intersects(query_geom)]
     assert isinstance(result, gpd.GeoDataFrame)
     return result
 
 
+def _check_concurrency(concurrency: int) -> None:
+    # asyncio.Semaphore(0) lets nothing through, so the call hung.
+    if (
+        not isinstance(concurrency, int)
+        or isinstance(concurrency, bool)
+        or concurrency < 1
+    ):
+        raise ValueError(f"concurrency must be int >= 1, got {concurrency!r}")
+
+
 def _build_obstore(uri: str, **store_kwargs: Any) -> Any:
-    return _build_store_with(uri, obstore_from_url, **store_kwargs)
+    return _build_store_with(uri, obstore_from_url, ObstoreHTTPStore, **store_kwargs)
 
 
 def _empty_geodataframe() -> gpd.GeoDataFrame:
@@ -382,3 +414,26 @@ def _empty_geodataframe() -> gpd.GeoDataFrame:
     return gpd.GeoDataFrame(
         {c: [] for c in _INDEX_COLUMNS}, geometry=[], crs="EPSG:4326"
     )
+
+
+# Segments per side when densifying a box before reprojecting it. At 20, a
+# 110 km UTM tile's densified footprint misses 0.001% of its true area.
+_EDGE_SEGMENTS = 20
+
+
+def _reproject(geom: Any, from_crs: int | CRS, to_crs: int | CRS) -> Any:
+    """*geom* reprojected, with its edges densified first.
+
+    A straight box edge in a projected CRS is a curve in lon/lat, so
+    reprojecting the corners alone cuts a strip off the footprint: about 400 m
+    along the north edge of a 110 km UTM tile at 60N, 650 m at 70N. A query
+    landing there missed the tile, and a merge then filled it with nodata.
+    """
+    # A point or zero-height query box has no edge to bend: segmentize rejects
+    # the zero step, or empties the flat polygon, which then matches nothing.
+    if geom.area > 0:
+        minx, miny, maxx, maxy = geom.bounds
+        step = max(maxx - minx, maxy - miny) / _EDGE_SEGMENTS
+        geom = shapely.segmentize(geom, step)
+    t = Transformer.from_crs(from_crs, to_crs, always_xy=True)
+    return ops.transform(t.transform, geom)

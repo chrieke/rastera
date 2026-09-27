@@ -11,7 +11,7 @@ from affine import Affine
 from async_geotiff import RasterArray
 
 import rastera
-from rastera.reader import AsyncGeoTIFF
+from rastera.reader import AsyncGeoTIFF, _source_store
 from rastera.store import _fetch_descriptor_bytes
 from rastera.vrt import (
     _declared_nodata,
@@ -23,6 +23,8 @@ from rastera.vrt import (
     _VRTDataset,
 )
 from tests.conftest import make_mock_geotiff, make_raster_array
+
+pytestmark = pytest.mark.usefixtures("stub_shared_store")
 
 # ── fixtures / helpers ──────────────────────────────────────────────────────
 
@@ -883,6 +885,63 @@ class TestOpenVRT:
         # Bands 1-3 share a source; band 4 is distinct
         assert ds._band_sources[0][0] is ds._band_sources[2][0]
         assert ds._band_sources[0][0] is not ds._band_sources[3][0]
+
+    async def test_remote_sources_share_one_store(self, stub_shared_store: MagicMock):
+        """Each source open built its own: 80-160 ms of blocking setup apiece."""
+        stores: list[Any] = []
+
+        async def fake_open(uri: str, **kwargs: Any) -> AsyncGeoTIFF:
+            stores.append(kwargs["store"])
+            count = 3 if "rgb" in uri else 1
+            return AsyncGeoTIFF(uri, make_mock_geotiff(count=count, **_RGBNIR_DIMS))
+
+        with (
+            patch(
+                "rastera.vrt._fetch_descriptor_bytes",
+                new=AsyncMock(return_value=RGBNIR_VRT),
+            ),
+            patch.object(AsyncGeoTIFF, "open", side_effect=fake_open),
+        ):
+            await _open_vrt("s3://bucket/v.vrt")
+
+        assert len(stores) == 2
+        assert stores[0] is stores[1] and stores[0] is not None
+        stub_shared_store.assert_called_once()
+
+    @pytest.mark.parametrize("nested", ["s3://bucket/inner.vrt", "s3://bucket/DIM.XML"])
+    def test_a_nested_descriptor_gets_no_store(
+        self, stub_shared_store: MagicMock, nested: str
+    ):
+        """Its own URI is never in the header cache, so a store built for it
+        cost 80-160 ms even on a warm open where none of its sources needs one."""
+        assert _source_store(nested, {}, True) is None
+        stub_shared_store.assert_not_called()
+
+    async def test_local_sources_build_their_own_store(
+        self, stub_shared_store: MagicMock, tmp_path: Path
+    ):
+        """A local store costs nothing, so the open builds it as before."""
+        local = RGBNIR_VRT.replace(
+            b"<SourceFilename>/vsis3/bucket/", b'<SourceFilename relativeToVRT="1">'
+        )
+        stores: list[Any] = []
+
+        async def fake_open(uri: str, **kwargs: Any) -> AsyncGeoTIFF:
+            stores.append(kwargs["store"])
+            count = 3 if "rgb" in uri else 1
+            return AsyncGeoTIFF(uri, make_mock_geotiff(count=count, **_RGBNIR_DIMS))
+
+        with (
+            patch(
+                "rastera.vrt._fetch_descriptor_bytes",
+                new=AsyncMock(return_value=local),
+            ),
+            patch.object(AsyncGeoTIFF, "open", side_effect=fake_open),
+        ):
+            await _open_vrt(str(tmp_path / "v.vrt"))
+
+        assert stores == [None, None]
+        stub_shared_store.assert_not_called()
 
     async def test_forwards_meta_overrides_to_sources(self):
         """meta_overrides must reach each source open — otherwise the VRT
