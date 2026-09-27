@@ -1,5 +1,6 @@
 """Unit tests for AsyncGeoTIFF."""
 
+from dataclasses import replace as dc_replace
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
@@ -1071,6 +1072,25 @@ class TestReadCoverage:
             bbox=BBox(2.0, 2.0, 18.0, 18.0), bbox_crs=32632, target_resolution=1.0
         )
         assert arr.mask is None
+
+
+class TestAlphaBand:
+    """A band tagged alpha is read as a plain band: GDAL tags band 4 of any
+    4-band Byte file it creates, so the tagged band is often NIR."""
+
+    @pytest.mark.parametrize("band_indices", [None, [1, 2, 3]])
+    async def test_as_masked_ignores_it(self, band_indices: list[int] | None):
+        gt = make_mock_geotiff(width=4, height=4, count=4, dtype=np.dtype("u1"))
+        full = np.full((4, 4, 4), 100, dtype=np.uint8)
+        full[3, :, :2] = 0  # NIR with real zeros
+        read = slicing_read(gt, full)
+
+        async def _tagged_read(window: Any) -> RasterArray:
+            return dc_replace(await read(window=window), _alpha_band_idx=3)
+
+        gt.read = _tagged_read
+        arr = await AsyncGeoTIFF("s3://b/k.tif", gt).read(band_indices=band_indices)
+        assert not arr.as_masked().mask.any()
 
 
 # ── LRU cache behaviour ────────────────────────────────────────────────

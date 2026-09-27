@@ -605,6 +605,11 @@ class AsyncGeoTIFF:
         # their ``_geotiff`` override ``_read_native``, so this is always real.
         result = await cast("_Readable", readable).read(window=window)
 
+        # rastera reads an alpha band as a plain band. The file's tag is the only
+        # sign of one, and GDAL puts it on band 4 of any 4-band Byte file it
+        # creates, NIR or not. Left set, ``as_masked()`` masks every band by it,
+        # and a ``band_indices`` subset leaves it naming the wrong band, or none.
+        result = dc_replace(result, _alpha_band_idx=None)
         if band_indices is not None:
             result = dc_replace(
                 result,
