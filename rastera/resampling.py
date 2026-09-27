@@ -93,7 +93,9 @@ def resample(
 
     ``nodata`` may be a finite sentinel (e.g. -9999, 0) or NaN; NaN is
     detected via ``np.isnan`` so the center gate and renormalization
-    behave identically across sentinel types.
+    behave identically across sentinel types.  A real value the kernel
+    rounds or clips onto the sentinel is moved one step off it, as
+    gdalwarp does, so it does not read as missing.
 
     A destination pixel with no source pixel under its center is blanked
     regardless of ``nodata`` — to the sentinel when one is declared, to zero
@@ -958,6 +960,7 @@ def _finalize_kernel(
         if invalid.any():
             out_f[:, invalid] = float(nodata)
     else:
+        invalid = None
         out_f = acc_val
 
     src_dtype = src_array.dtype
@@ -969,7 +972,10 @@ def _finalize_kernel(
         info = np.iinfo(src_dtype)
         np.clip(out_f, info.min, info.max, out=out_f)
         np.round(out_f, out=out_f)
-    return out_f.astype(src_dtype)
+    out = out_f.astype(src_dtype)
+    if nodata is not None and invalid is not None:
+        _avoid_nodata(out, nodata, ~invalid)
+    return out
 
 
 def _two_pass_threshold(strategy: WarpStrategy) -> float | None:
@@ -1093,8 +1099,15 @@ def _resample_two_pass(
     if np.issubdtype(orig_dtype, np.integer):
         info = np.iinfo(orig_dtype)
         out = out.astype(np.float64, copy=False)
+        # Before the round: Pass B wrote the sentinel exactly into the pixels it
+        # gated, and moved any real value off it.
+        gated = None if nodata is None else out == nodata
         np.clip(out, info.min, info.max, out=out)
         np.round(out, out=out)
+        out = out.astype(orig_dtype)
+        if nodata is not None and gated is not None:
+            _avoid_nodata(out, nodata, ~gated)
+        return out, coverage
     return out.astype(orig_dtype, copy=False), coverage
 
 
@@ -1117,6 +1130,29 @@ def _sentinel_differs_across_bands(
         return False
     is_nodata = np.isnan(src_array) if nodata_is_nan else src_array == nodata
     return not np.array_equal(is_nodata.any(axis=0), is_nodata.all(axis=0))
+
+
+def _avoid_nodata(out: np.ndarray, nodata: int | float, valid: np.ndarray) -> None:
+    """Move real pixels of *out* that landed on *nodata* one step off it.
+
+    A kernel can round or clip a real value onto the sentinel — cubic undershoot
+    next to a bright edge clips to a nodata of 0 — and everything downstream
+    then reads it as missing. gdalwarp moves it the same way, warning "changed
+    to ... to avoid being treated as NoData": an integer steps down, or up from
+    the dtype minimum; a float moves to the next value up, or down from the
+    dtype maximum or +inf. *valid* is ``(h, w)``: the pixels not deliberately
+    nodata.
+    """
+    hit = (out == nodata) & valid
+    if not hit.any():
+        return
+    if np.issubdtype(out.dtype, np.integer):
+        step = 1 if nodata == np.iinfo(out.dtype).min else -1
+        out[hit] = int(nodata) + step
+    else:
+        # From +inf, which a value overflowing the dtype lands on, too.
+        toward = -np.inf if nodata >= np.finfo(out.dtype).max else np.inf
+        out[hit] = np.nextafter(out.dtype.type(nodata), out.dtype.type(toward))
 
 
 def _and_coverage(
