@@ -7,8 +7,12 @@ from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
+from async_tiff.store import HTTPStore  # type: ignore[reportMissingImports]
+from obstore.store import HTTPStore as ObstoreHTTPStore
+from obstore.store import from_url as obstore_from_url
 
 from rastera.store import (
+    _build_store,
     _build_store_with,
     _check_source_uri,
     _extract_key,
@@ -123,6 +127,32 @@ class TestParseUriAws:
     def test_unsupported_endpoint_raises(self, uri: str):
         with pytest.raises(ValueError, match="Unsupported S3 endpoint"):
             _parse_uri(uri)
+
+    @pytest.mark.parametrize(
+        "uri",
+        [
+            "https://bucket.s3.eu-north-1.amazonaws.com/k/a.tif"
+            "?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Signature=abc",
+            "https://s3.eu-north-1.amazonaws.com/bucket/k/a.tif?versionId=v1",
+            "https://bucket.s3.amazonaws.com/k/a.tif?versionId=v1",
+            # Presigned on an endpoint the rewrite rejects: served as given.
+            "https://bucket.s3.dualstack.us-east-1.amazonaws.com/k/a.tif?X-Amz-Signature=abc",
+        ],
+    )
+    def test_a_query_string_is_read_as_given(self, uri: str):
+        # Rewritten to s3://, a presigned URL lost its signature and 403'd, and
+        # ?versionId= silently served the latest version instead.
+        parsed = _parse_uri(uri)
+        assert (parsed.kind, parsed.root, parsed.key) == ("http", uri, "")
+
+    def test_a_fragment_on_an_s3_host_is_dropped_as_before(self):
+        # Never sent to the server, so nothing is lost rewriting to s3://.
+        parsed = _parse_uri("https://bucket.s3.eu-north-1.amazonaws.com/k/a.tif#f")
+        assert (parsed.kind, parsed.root, parsed.key) == (
+            "aws",
+            "s3://bucket",
+            "k/a.tif",
+        )
 
     def test_region_is_not_read_from_the_path(self):
         # A substring search over the whole URI reads a region out of an
@@ -415,13 +445,50 @@ class TestStoreKwargs:
 class TestBuildStoreWith:
     def test_roots_at_the_bucket(self):
         mock_from_url = MagicMock(return_value="store")
-        assert _build_store_with("s3://bucket/key", mock_from_url) == "store"
+        assert (
+            _build_store_with("s3://bucket/key", mock_from_url, MagicMock()) == "store"
+        )
         assert mock_from_url.call_args[0][0] == "s3://bucket"
+
+    @pytest.mark.parametrize(
+        "uri",
+        [
+            "https://bucket.s3.eu-north-1.amazonaws.com/k/a.tif?versionId=v1",
+            "https://s3.eu-north-1.amazonaws.com/bucket/k/a.tif?X-Amz-Signature=abc",
+            "https://bucket.s3.dualstack.us-east-1.amazonaws.com/k/a.tif?X-Amz-Signature=abc",
+        ],
+    )
+    @pytest.mark.parametrize(
+        ("build", "http_store"),
+        [
+            (_build_store, HTTPStore),
+            (
+                lambda u: _build_store_with(u, obstore_from_url, ObstoreHTTPStore),
+                ObstoreHTTPStore,
+            ),
+        ],
+        ids=["async_tiff", "obstore"],
+    )
+    def test_a_query_string_url_gets_a_plain_http_store(
+        self, uri: str, build: Any, http_store: Any
+    ):
+        """from_url picks the store by host: for an S3 host an S3Store, which
+        dropped the query and signed with whatever credentials were around."""
+        store = build(uri)
+        assert isinstance(store, http_store)
+        assert uri in repr(store)
+
+    def test_signing_a_query_string_url_names_the_query(self):
+        with pytest.raises(ValueError, match="has a query string"):
+            _build_store(
+                "https://bucket.s3.eu-north-1.amazonaws.com/k.tif?versionId=v1",
+                skip_signature=False,
+            )
 
     def test_local_roots_at_the_parent_directory(self, tmp_path: Path):
         f = tmp_path / "foo.tif"
         f.write_bytes(b"")
         mock_from_url = MagicMock(return_value="store")
-        _build_store_with(str(f), mock_from_url, skip_signature=False)
+        _build_store_with(str(f), mock_from_url, MagicMock(), skip_signature=False)
         assert mock_from_url.call_args[0][0] == tmp_path.resolve().as_uri()
         assert "skip_signature" not in mock_from_url.call_args[1]

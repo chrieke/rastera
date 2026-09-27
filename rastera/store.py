@@ -15,6 +15,10 @@ dotted-bucket variants::
     https://s3.<region>.amazonaws.com/<bucket>/<key>
     https://s3.amazonaws.com/<bucket>/<key>
 
+An S3 URL with a query string — presigned, or ``?versionId=`` — is read over
+plain HTTP exactly as given instead, unsigned: the rewrite would drop the
+query, and with it the signature or the version.
+
 Other ``amazonaws.com`` hosts — dual-stack, transfer acceleration, FIPS, access
 points, S3 Express, VPC endpoints — are rejected. Each implies an endpoint and
 addressing style that cannot be inferred from the URL, and silently serving them
@@ -46,7 +50,8 @@ from typing import Any, Literal
 from urllib.parse import ParseResult, unquote, urlparse, urlunparse
 
 import obstore
-from async_tiff.store import from_url  # type: ignore[reportMissingImports]
+from async_tiff.store import HTTPStore, from_url  # type: ignore[reportMissingImports]
+from obstore.store import HTTPStore as ObstoreHTTPStore
 from obstore.store import from_url as obstore_from_url
 
 _DEFAULT_REGION = "us-west-2"
@@ -113,19 +118,26 @@ def _parse_uri(uri: str) -> ParsedURI:
     )
 
 
-def _build_store_with(uri: str, from_url_fn: Any, **store_kwargs: Any) -> Any:
+def _build_store_with(
+    uri: str, from_url_fn: Any, http_store: Any, **store_kwargs: Any
+) -> Any:
     """Build an object store rooted at the bucket/host level.
 
-    Accepts any ``from_url`` callable (e.g. ``async_tiff.store.from_url``
-    or ``obstore.store.from_url``) so the same logic serves both backends.
+    Takes a backend's ``from_url`` and ``HTTPStore`` (async-tiff's or
+    obstore's) so the same logic serves both.
     """
     parsed = _parse_uri(uri)
-    return from_url_fn(parsed.root, **_store_kwargs_for(parsed, store_kwargs))
+    kwargs = _store_kwargs_for(parsed, store_kwargs)
+    if parsed.kind == "http" and parsed.root == parsed.uri:
+        # Kept whole for its query. from_url picks the store by host, and for
+        # an S3 host that is an S3Store, which drops the query again.
+        return http_store.from_url(parsed.root, **kwargs)
+    return from_url_fn(parsed.root, **kwargs)
 
 
 def _build_store(uri: str, **store_kwargs: Any) -> Any:
     """Build an async-tiff object store rooted at the bucket/host level."""
-    return _build_store_with(uri, from_url, **store_kwargs)
+    return _build_store_with(uri, from_url, HTTPStore, **store_kwargs)
 
 
 def _extract_key(uri: str) -> str:
@@ -162,7 +174,7 @@ async def _fetch_descriptor_bytes(uri: str, **store_kwargs: Any) -> bytes:
     parsed = _parse_uri(uri)
     if parsed.local_path is not None:
         return parsed.local_path.read_bytes()
-    store = _build_store_with(uri, obstore_from_url, **store_kwargs)
+    store = _build_store_with(uri, obstore_from_url, ObstoreHTTPStore, **store_kwargs)
     result = await obstore.get_async(store, parsed.key)
     return bytes(await result.bytes_async())
 
@@ -225,6 +237,12 @@ def _path_key(parsed: ParseResult) -> str:
 
 
 def _parse_http_uri(uri: str, parsed: ParseResult) -> ParsedURI:
+    # A query carries auth material or a version — a presigned S3 URL,
+    # ``?versionId=`` — that a host- or bucket-rooted store would silently
+    # drop, so root at the whole URI in that case.
+    if parsed.query:
+        return ParsedURI(uri, "http", uri, "")
+
     host = parsed.netloc
     match = _AWS_HOST_RE.match(host)
 
@@ -238,9 +256,9 @@ def _parse_http_uri(uri: str, parsed: ParseResult) -> ParsedURI:
                 f"cannot be inferred from the URL. Pass an explicit store instead: "
                 f"store=S3Store(bucket=..., endpoint=..., region=...)."
             )
-        # A query or fragment carries auth material that a host-rooted store
-        # would silently drop, so root at the whole URI in that case.
-        if parsed.query or parsed.fragment:
+        # A fragment never reaches the server, but on a plain host it may be
+        # part of how the URL was handed out, so it is kept as well.
+        if parsed.fragment:
             return ParsedURI(uri, "http", uri, "")
         return ParsedURI(uri, "http", f"{parsed.scheme}://{host}", _path_key(parsed))
 
@@ -286,7 +304,14 @@ def _store_kwargs_for(
         return out
 
     if parsed.kind == "http":
-        if out.get("skip_signature") is False or "credential_provider" in out:
+        signing = out.get("skip_signature") is False or "credential_provider" in out
+        if signing and parsed.root == parsed.uri:
+            raise ValueError(
+                f"{parsed.uri!r} has a query string, so it is read as given over "
+                f"plain HTTP, which cannot sign requests. A presigned URL signs "
+                f"itself; otherwise drop the query, or pass s3://<bucket>/<key>."
+            )
+        if signing:
             raise ValueError(
                 f"{parsed.uri!r} resolves to a plain HTTP store, which cannot sign "
                 f"requests. rastera authenticates AWS S3 hosts only; for another "

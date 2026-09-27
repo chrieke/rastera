@@ -8,6 +8,7 @@ from typing import Any, cast
 import geopandas as gpd
 import obstore
 import pyarrow.parquet as pq
+from obstore.store import HTTPStore as ObstoreHTTPStore
 from obstore.store import from_url as obstore_from_url
 from pyproj import Transformer
 from shapely import ops
@@ -374,7 +375,7 @@ def _filter_gdf(
 
 
 def _build_obstore(uri: str, **store_kwargs: Any) -> Any:
-    return _build_store_with(uri, obstore_from_url, **store_kwargs)
+    return _build_store_with(uri, obstore_from_url, ObstoreHTTPStore, **store_kwargs)
 
 
 def _empty_geodataframe() -> gpd.GeoDataFrame:
