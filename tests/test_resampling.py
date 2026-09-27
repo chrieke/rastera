@@ -627,7 +627,19 @@ class TestSeparableEquivalence:
         np.testing.assert_array_equal(out == 0, ref == 0)  # identical nodata mask
         np.testing.assert_allclose(out, ref, atol=1)
 
-    def test_block_size_invariance(self, monkeypatch: pytest.MonkeyPatch):
+
+class TestRowBlocks:
+    """Both kernel paths work through the destination a block of rows at a
+    time, which must not show in the output."""
+
+    @pytest.mark.parametrize(
+        "transformer",
+        [None, Transformer.from_crs(32632, 32632, always_xy=True)],
+        ids=["same_crs", "cross_crs"],
+    )
+    def test_block_size_invariance(
+        self, monkeypatch: pytest.MonkeyPatch, transformer: Transformer | None
+    ):
         """Chunking is purely an implementation detail: output must not depend
         on the row-block size (catches block-boundary indexing bugs)."""
         import rastera.resampling as r
@@ -635,14 +647,55 @@ class TestSeparableEquivalence:
         rng = np.random.default_rng(3)
         src = rng.integers(1, 5000, size=(2, 500, 64)).astype(np.uint16)
         src[:, rng.random((500, 64)) < 0.2] = 0
+        src[1, 100:140, 10:30] = 0  # a hole only band 1 has
         src_t = Affine(1, 0, 0, 0, -1, 500)
         dst_t = Affine(2, 0, 0, 0, -2, 500)
-        kw: dict[str, Any] = dict(nodata=0, method="cubic")
-        monkeypatch.setattr(r, "_SEPARABLE_ROW_BLOCK", 1_000_000)
+        kw: dict[str, Any] = dict(
+            nodata=0,
+            method="cubic",
+            transformer=transformer,
+            warp_strategy="single_pass",
+        )
+        monkeypatch.setattr(r, "_ROW_BLOCK", 1_000_000)
         whole = resample(src, src_t, dst_t, 32, 250, **kw)
-        monkeypatch.setattr(r, "_SEPARABLE_ROW_BLOCK", 7)
+        monkeypatch.setattr(r, "_ROW_BLOCK", 7)
         tiny = resample(src, src_t, dst_t, 32, 250, **kw)
         np.testing.assert_array_equal(whole, tiny)
+
+    def test_a_cross_crs_warp_peaks_at_a_few_times_its_output(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """The 2-D weights and sums used to span the whole grid: a cubic warp
+        peaked at 49x its output. Per block, the full-grid source coordinates
+        are what is left."""
+        import tracemalloc
+
+        import rastera.resampling as r
+
+        monkeypatch.setattr(r, "_ROW_BLOCK", 32)
+        src = np.random.default_rng(0).integers(1, 4000, (3, 512, 512), np.uint16)
+        to_src = Transformer.from_crs(32634, 32633, always_xy=True)
+        cx, cy = Transformer.from_crs(32633, 32634, always_xy=True).transform(
+            502560, 4997440
+        )
+        dst_t = Affine(9, 0, cx - 256 * 9, 0, -9, cy + 256 * 9)
+        tracemalloc.start()
+        try:
+            out = resample(
+                src,
+                Affine(10, 0, 500000, 0, -10, 5000000),
+                dst_t,
+                512,
+                512,
+                nodata=0,
+                transformer=to_src,
+                method="cubic",
+                warp_strategy="single_pass",
+            )
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        assert peak < 12 * out.nbytes
 
 
 class TestTwoPassReproject:

@@ -400,44 +400,7 @@ def _resample_kernel(
                 src_coverage,
             )
 
-    # Source pixel containing the dst center (pixel-corner convention).
-    # Used for the OOB gate and the GDAL-style center-pixel nodata gate.
-    center_col = _pixel_index(src_col_f)
-    center_row = _pixel_index(src_row_f)
-
-    # The same in-bounds-center test `_finalize_kernel` applies under nodata,
-    # hoisted out because coverage holds with or without a sentinel.
     h, w = src_array.shape[1], src_array.shape[2]
-    if coords_2d:
-        in_bounds_center = (
-            (center_row >= 0) & (center_row < h) & (center_col >= 0) & (center_col < w)
-        )
-    else:
-        in_bounds_center = ((center_row >= 0) & (center_row < h))[:, np.newaxis] & (
-            (center_col >= 0) & (center_col < w)
-        )[np.newaxis, :]
-    coverage = None if in_bounds_center.all() else in_bounds_center
-    if src_coverage is not None:
-        safe_row = np.clip(center_row, 0, h - 1)
-        safe_col = np.clip(center_col, 0, w - 1)
-        coverage = _and_coverage(
-            coverage,
-            src_coverage[safe_row, safe_col]
-            if coords_2d
-            else src_coverage[safe_row[:, np.newaxis], safe_col[np.newaxis, :]],
-        )
-
-    # Kernel base/frac: shift by -0.5 so the kernel interpolates between
-    # source pixel CENTERS (at integer + 0.5 in src pixel-corner space).
-    # Without this shift, a dst pixel landing exactly on a src pixel
-    # center would be a 50/50 blend with the neighbour instead of the
-    # exact src value.
-    shifted_col_f = src_col_f - 0.5
-    shifted_row_f = src_row_f - 0.5
-    base_col = np.floor(shifted_col_f).astype(np.intp)
-    base_row = np.floor(shifted_row_f).astype(np.intp)
-    frac_col = shifted_col_f - base_col
-    frac_row = shifted_row_f - base_row
 
     # --- Anti-aliasing: GDAL expands the kernel radius when downsampling
     # (scale > 1) so that bilinear/cubic act as proper low-pass filters
@@ -449,49 +412,102 @@ def _resample_kernel(
     n_y_radius = math.ceil(_BASE_RADIUS[method] * y_filter)
     x_offsets = tuple(range(1 - n_x_radius, n_x_radius + 1))
     y_offsets = tuple(range(1 - n_y_radius, n_y_radius + 1))
-
     weights_fn = _bilinear_weights if method == "bilinear" else _cubic_weights
-    wx = weights_fn(frac_col, x_offsets, x_filter)
-    wy = weights_fn(frac_row, y_offsets, y_filter)
 
-    # --- Accumulate kernel contributions.  The kernels drop a pixel from every
-    # band they are handed when any of those bands holds the sentinel.  gdalwarp
-    # judges each band on its own, so bands whose sentinel footprints differ
-    # are handed over one at a time.
+    # The kernels drop a pixel from every band they are handed when any of
+    # those bands holds the sentinel.  gdalwarp judges each band on its own,
+    # so bands whose sentinel footprints differ are handed over one at a time.
     if _sentinel_differs_across_bands(src_array, nodata, nodata_is_nan):
         band_groups = [src_array[b : b + 1] for b in range(src_array.shape[0])]
     else:
         band_groups = [src_array]
     accumulate = _accumulate_2d if coords_2d else _accumulate_separable
-    outs: list[np.ndarray] = []
-    for bands in band_groups:
-        acc_val, acc_wt, per_dim_ok = accumulate(
-            bands,
-            base_col,
-            base_row,
-            wx,
-            wy,
-            x_offsets,
-            y_offsets,
-            nodata,
-            nodata_is_nan,
-            method,
-        )
-        outs.append(
-            _finalize_kernel(
-                acc_val,
-                acc_wt,
-                per_dim_ok,
+
+    def _kernel(col_f: np.ndarray, row_f: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """The output at these destination coordinates, and which of those
+        pixels have a source pixel under their center."""
+        # Source pixel containing the dst center (pixel-corner convention).
+        # Used for the OOB gate and the GDAL-style center-pixel nodata gate.
+        center_col = _pixel_index(col_f)
+        center_row = _pixel_index(row_f)
+
+        # The same in-bounds-center test `_finalize_kernel` applies under
+        # nodata, taken here because coverage holds with or without a sentinel.
+        if coords_2d:
+            covered = (
+                (center_row >= 0)
+                & (center_row < h)
+                & (center_col >= 0)
+                & (center_col < w)
+            )
+        else:
+            covered = ((center_row >= 0) & (center_row < h))[:, np.newaxis] & (
+                (center_col >= 0) & (center_col < w)
+            )[np.newaxis, :]
+        if src_coverage is not None:
+            safe_row = np.clip(center_row, 0, h - 1)
+            safe_col = np.clip(center_col, 0, w - 1)
+            covered &= (
+                src_coverage[safe_row, safe_col]
+                if coords_2d
+                else src_coverage[safe_row[:, np.newaxis], safe_col[np.newaxis, :]]
+            )
+
+        # Kernel base/frac: shift by -0.5 so the kernel interpolates between
+        # source pixel CENTERS (at integer + 0.5 in src pixel-corner space).
+        # Without this shift, a dst pixel landing exactly on a src pixel
+        # center would be a 50/50 blend with the neighbour instead of the
+        # exact src value.
+        shifted_col = col_f - 0.5
+        shifted_row = row_f - 0.5
+        base_col = np.floor(shifted_col).astype(np.intp)
+        base_row = np.floor(shifted_row).astype(np.intp)
+        wx = weights_fn(shifted_col - base_col, x_offsets, x_filter)
+        wy = weights_fn(shifted_row - base_row, y_offsets, y_filter)
+
+        outs: list[np.ndarray] = []
+        for bands in band_groups:
+            acc_val, acc_wt, per_dim_ok = accumulate(
                 bands,
-                center_row,
-                center_col,
-                coords_2d,
+                base_col,
+                base_row,
+                wx,
+                wy,
+                x_offsets,
+                y_offsets,
                 nodata,
                 nodata_is_nan,
+                method,
             )
+            outs.append(
+                _finalize_kernel(
+                    acc_val,
+                    acc_wt,
+                    per_dim_ok,
+                    bands,
+                    center_row,
+                    center_col,
+                    coords_2d,
+                    nodata,
+                    nodata_is_nan,
+                )
+            )
+        return (outs[0] if len(outs) == 1 else np.concatenate(outs)), covered
+
+    if coords_2d:
+        # A block of destination rows at a time: the 2-D weights and sums are
+        # (taps, rows, W) and (bands, rows, W) in float64, and over the whole
+        # grid they peaked at 49x the output for cubic.
+        out = np.empty(
+            (src_array.shape[0], dst_height, dst_width), dtype=src_array.dtype
         )
-    out = outs[0] if len(outs) == 1 else np.concatenate(outs)
-    return out, coverage
+        covered = np.empty((dst_height, dst_width), dtype=bool)
+        for r0 in range(0, dst_height, _ROW_BLOCK):
+            rows = slice(r0, r0 + _ROW_BLOCK)
+            out[:, rows], covered[rows] = _kernel(src_col_f[rows], src_row_f[rows])
+    else:
+        out, covered = _kernel(src_col_f, src_row_f)
+    return out, None if covered.all() else covered
 
 
 # ---- Private helpers ----
@@ -560,9 +576,10 @@ def _validate_dtype_nodata(dtype: np.dtype, nodata: int | float | None) -> None:
 
 _WARP_GRID_STEP = 16
 
-# Output-row block size for the separable two-pass accumulator.  Bounds the
-# (bands, src_rows, dst_w) intermediate and keeps each pass cache-resident.
-_SEPARABLE_ROW_BLOCK = 256
+# Destination rows the kernels handle at a time.  Bounds the separable
+# accumulator's (bands, src_rows, dst_w) intermediate and the cross-CRS
+# path's 2-D weights and sums, and keeps each pass cache-resident.
+_ROW_BLOCK = 256
 
 
 def _coarse_grid_transform(
@@ -623,10 +640,17 @@ def _coarse_grid_transform(
     row_lo = np.clip(np.floor(row_idx).astype(int), 0, n_coarse_rows - 2)
     row_frac = (row_idx - row_lo)[:, np.newaxis]  # (dst_height, 1)
 
-    src_col_f = temp_col[row_lo] + row_frac * (temp_col[row_lo + 1] - temp_col[row_lo])
-    src_row_f = temp_row[row_lo] + row_frac * (temp_row[row_lo + 1] - temp_row[row_lo])
+    # In place, so each coordinate peaks at two full-size arrays rather than
+    # four: this is the largest allocation of a cross-CRS kernel read.
+    def _along_rows(temp: np.ndarray) -> np.ndarray:
+        out = temp[row_lo]
+        step = temp[row_lo + 1]
+        step -= out
+        step *= row_frac
+        out += step
+        return out
 
-    return src_col_f, src_row_f
+    return _along_rows(temp_col), _along_rows(temp_row)
 
 
 def _bilinear_weights(
@@ -822,8 +846,8 @@ def _accumulate_separable(
         else:
             valid_src = np.asarray(~(src_array == nodata).any(axis=0))
 
-    for r0 in range(0, dst_h, _SEPARABLE_ROW_BLOCK):
-        r1 = min(r0 + _SEPARABLE_ROW_BLOCK, dst_h)
+    for r0 in range(0, dst_h, _ROW_BLOCK):
+        r1 = min(r0 + _ROW_BLOCK, dst_h)
         br = base_row[r0:r1]
         # Source-row span this block touches (clamped into [0, h-1]).
         smin = int(np.clip(int(br.min()) + y_offsets[0], 0, h - 1))
@@ -1126,8 +1150,12 @@ def _footprint(coord: np.ndarray) -> float:
     downsample at all. The median is robust against outliers near the source
     extent boundary.
     """
-    extent = np.abs(np.diff(coord, axis=1))[:-1]
-    extent += np.abs(np.diff(coord, axis=0))[:, :-1]
+    extent = np.diff(coord[:-1], axis=1)
+    np.abs(extent, out=extent)
+    step = np.diff(coord[:, :-1], axis=0)
+    np.abs(step, out=step)
+    extent += step
+    del step
     return float(np.median(extent, overwrite_input=True))
 
 
