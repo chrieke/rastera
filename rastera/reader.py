@@ -129,21 +129,31 @@ class AsyncGeoTIFF:
             return CRS.from_epsg(self._crs_override)
         return self._geotiff.crs
 
-    def _best_overview_for_resolution(self, target_resolution: float):
-        """Return the Overview whose resolution is closest to *target_resolution*
-        without being coarser. Returns None to use full resolution.
+    def _best_overview_for_resolution(self, dst_res: tuple[float, float]):
+        """The coarsest overview no coarser than *dst_res* on either axis, or
+        None to read full resolution.
+
+        A level counts at its nominal factor, ``round(width / o.width)``. GDAL's
+        COG driver sizes levels by floor division, so an odd-sized file's level
+        is a hair coarser than its factor, 20.009 m for 2301 px at 10 m, and an
+        exact comparison skipped it at the very targets overviews serve.
 
         Reads the pyramid off ``_geotiff``, not ``self.overviews``: this needs
         readable ``Overview`` objects, while ``self.overviews`` holds (width,
         height) pairs and is emptied by both VRT flavours.
         """
-        native_res = self._geotiff.res[0]
-        valid = [
-            (o, native_res * (self._geotiff.width / o.width))
-            for o in self._geotiff.overviews
-            if native_res * (self._geotiff.width / o.width) <= target_resolution
-        ]
-        return max(valid, key=lambda x: x[1])[0] if valid else None
+        gt = self._geotiff
+        # The largest factor each axis allows; the slack absorbs float noise in
+        # an exact request such as 20 m from 10 m.
+        max_fx = dst_res[0] / gt.res[0] * (1 + 1e-9)
+        max_fy = dst_res[1] / gt.res[1] * (1 + 1e-9)
+        best, best_factor = None, 0
+        for o in gt.overviews:
+            fx = round(gt.width / o.width)
+            fy = round(gt.height / o.height)
+            if fx <= max_fx and fy <= max_fy and fx * fy > best_factor:
+                best, best_factor = o, fx * fy
+        return best
 
     @classmethod
     async def open(
@@ -569,10 +579,10 @@ class AsyncGeoTIFF:
             dst_res = _src_units_per_pixel(transformer, read_bbox, dst_res)
             read_bbox = transform_bbox(read_bbox, out_crs, src_crs)
 
-        # min(): the coarsest overview no coarser than *either* axis wants, so
-        # neither upsamples from a level that already lost the detail.
+        # Per axis: the coarsest overview no coarser than *either* axis wants,
+        # so neither upsamples from a level that already lost the detail.
         overview = (
-            self._best_overview_for_resolution(min(dst_res)) if use_overviews else None
+            self._best_overview_for_resolution(dst_res) if use_overviews else None
         )
         readable = overview if overview is not None else self._geotiff
         read_bbox = _halo_bbox(

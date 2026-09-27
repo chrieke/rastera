@@ -588,7 +588,7 @@ class TestRead:
         ov.read = slicing_read(ov, np.zeros((1, 100, 100), np.uint16))
 
         obj = AsyncGeoTIFF("s3://b/k.tif", gt)
-        obj._best_overview_for_resolution = lambda r: ov if r >= 4.0 else None  # type: ignore[method-assign]
+        obj._best_overview_for_resolution = lambda r: ov if min(r) >= 4.0 else None  # type: ignore[method-assign]
 
         arr = await obj.read(
             window=Window(col_off=300, row_off=0, width=80, height=80),
@@ -670,6 +670,54 @@ class TestRead:
         arr = await obj.read(bbox=(0, 160, 80, 320), bbox_crs=32632, snap_to_grid=False)
         assert arr.transform.a == 10.0
         assert arr.transform.e == -20.0
+
+
+# ── overview choice ─────────────────────────────────────────────────────
+
+
+class TestOverviewChoice:
+    @staticmethod
+    def _cog(
+        width: int, height: int, res: tuple[float, float] = (10.0, 10.0)
+    ) -> tuple[AsyncGeoTIFF, list[Any]]:
+        """A mock COG with three levels, halved by floor division as GDAL's COG
+        driver sizes them."""
+        gt = make_mock_geotiff(
+            width=width, height=height, scale=res[0], y_scale=res[1], count=1
+        )
+        levels: list[Any] = []
+        w, h = width, height
+        for _ in range(3):
+            w, h = w // 2, h // 2
+            levels.append(
+                make_mock_geotiff(
+                    width=w,
+                    height=h,
+                    scale=res[0] * width / w,
+                    y_scale=res[1] * height / h,
+                    count=1,
+                )
+            )
+        gt.overviews = levels
+        return AsyncGeoTIFF("s3://b/k.tif", gt), levels
+
+    @pytest.mark.parametrize(
+        ("target", "level"), [(20.0, 0), (40.0, 1), (80.0, 2), (19.9, None)]
+    )
+    def test_an_odd_sized_level_counts_at_its_nominal_factor(
+        self, target: float, level: int | None
+    ):
+        """A 2301-px 10 m file's first level is 1150 px, so 20.009 m. Compared
+        exactly, it was skipped at 20 m and the read fetched 4x the bytes."""
+        ds, levels = self._cog(2301, 1701)
+        chosen = ds._best_overview_for_resolution((target, target))
+        assert chosen is (None if level is None else levels[level])
+
+    def test_a_level_must_fit_both_axes(self):
+        """A 10x20 m source's 2x level is 40 m tall; only its width was checked,
+        so a 20 m read took it and resampled the rows up from 40 m."""
+        ds, _ = self._cog(512, 256, res=(10.0, 20.0))
+        assert ds._best_overview_for_resolution((20.0, 20.0)) is None
 
 
 # ── read: output grid is a pure function of the arguments ───────────────
