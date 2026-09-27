@@ -2,7 +2,7 @@
 
 import math
 from pathlib import Path
-from typing import Any, TypedDict
+from typing import Any, TypedDict, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import numpy as np
@@ -381,11 +381,13 @@ def _one_source_ds_over(
     *,
     source_nodata: float | None,
     vrt_nodata: float | None = None,
+    hide_nodata: bool = False,
 ) -> AsyncGeoTIFF:
     """A dataset over *pixels* at 1 unit/px, for comparing read paths.
 
-    With *vrt_nodata* the result is a 1-band ``_VRTDataset`` declaring it;
-    without, a bare ``AsyncGeoTIFF``. Either way the source's ``_read_native``
+    With *vrt_nodata* the result is a 1-band ``_VRTDataset`` declaring it (and
+    hiding it with *hide_nodata*); without, a bare ``AsyncGeoTIFF``. Either
+    way the source's ``_read_native``
     returns all of *pixels* — the reads below are full-extent, so the requested
     bbox is the source's own bounds.
     """
@@ -412,7 +414,7 @@ def _one_source_ds_over(
         return src
     return _VRTDataset(
         "s3://b/x.vrt",
-        [_VRTBand("s3://b/a.tif", 1, nodata=vrt_nodata)],
+        [_VRTBand("s3://b/a.tif", 1, nodata=vrt_nodata, hide_nodata=hide_nodata)],
         {"s3://b/a.tif": src},
     )
 
@@ -480,9 +482,8 @@ class TestDeclaredNodata:
         assert ds._band_sources[0][0]._nodata == 0
 
     async def test_declared_nodata_reaches_sources(self):
-        """The sources do the resampling on the VRT's behalf, so they need the
-        value too — not just the VRT's own metadata. Pixel-level consequence in
-        ``test_bilinear_read_honours_declared_nodata``."""
+        """A source that fills pixels itself, as DIMAP does for a tile with no
+        data, fills them with the VRT's value."""
         ds = await self._open(_one_band_vrt(band_inner="<NoDataValue>0</NoDataValue>"))
         assert ds._band_sources[0][0]._nodata == 0
 
@@ -516,8 +517,8 @@ class TestDeclaredNodata:
             source_nodata=0,
         )
         assert ds._nodata is None
-        # Suppression is about reporting and compositing; the source still
-        # resamples around its own value, which GDAL also still fills with.
+        # Suppression is about the VRT; the source keeps its own value, which
+        # GDAL also still fills with.
         assert ds._band_sources[0][0]._nodata == 0
 
     async def test_partly_hidden_nodata_still_reports_the_visible_band(self):
@@ -569,14 +570,12 @@ class TestDeclaredNodata:
         assert inner._band_sources[0][0]._nodata == 3
 
     async def test_bilinear_read_honours_declared_nodata(self):
-        """The pixel-level consequence of pushing the value to the sources.
+        """The kernel renormalizes around the VRT's nodata, not the source's.
 
-        ``_VRTDataset.read`` does not resample — it forwards target_resolution
-        to each source, whose bilinear kernel renormalizes around whatever
-        nodata *it* carries. A source declaring none averaged the VRT's nodata
-        pixels in as real values, so a half-nodata edge came back as a gradient
-        instead of a clean step. Measured against GDAL on a real product, 63 of
-        400 pixels differed.
+        A source declaring none averaged the VRT's nodata pixels in as real
+        values, so a half-nodata edge came back as a gradient instead of a
+        clean step. Measured against GDAL on a real product, 63 of 400 pixels
+        differed.
 
         The baseline is the same pixels read through a plain TIFF that declares
         nodata 0 on the file, which was always correct.
@@ -599,11 +598,35 @@ class TestDeclaredNodata:
         # input can only ever emit those two values.
         assert set(np.unique(got).tolist()) <= {0, 100}
 
+    async def test_bilinear_read_ignores_hidden_nodata(self):
+        """``gdalbuildvrt -hidenodata`` over a source declaring 0. GDAL
+        resamples that VRT as it does the same pixels with no nodata, averaging
+        the zeros in. The source used to resample with its own 0 and skip them.
+        """
+        pixels = np.zeros((1, 8, 8), dtype=np.uint16)
+        pixels[:, :, 4:] = 100
+
+        vrt = _one_source_ds_over(
+            pixels, source_nodata=0, vrt_nodata=0.0, hide_nodata=True
+        )
+        baseline = _one_source_ds_over(pixels, source_nodata=None)
+
+        kwargs: dict[str, Any] = dict(target_resolution=2.0, resampling="bilinear")
+        vrt_data: np.ndarray[Any, Any] = (await vrt.read(**kwargs)).data  # type: ignore[reportUnknownMemberType]
+        base_data: np.ndarray[Any, Any] = (await baseline.read(**kwargs)).data  # type: ignore[reportUnknownMemberType]
+        got, want = np.asarray(vrt_data), np.asarray(base_data)
+
+        # The baseline does blend across the seam, else this compares nothing.
+        assert not set(np.unique(want).tolist()) <= {0, 100}
+        np.testing.assert_array_equal(got, want)
+
     async def test_read_result_carries_vrt_nodata(self):
         """Not just the dataset: the returned array must report it too, since
         callers (and merge) key masking off the result."""
         ds = await self._open(_one_band_vrt(band_inner="<NoDataValue>0</NoDataValue>"))
-        ds._band_sources[0][0].read = AsyncMock(return_value=_read_result((1, 8, 8)))
+        ds._band_sources[0][0]._read_native = AsyncMock(
+            return_value=_read_result((1, 8, 8))
+        )
         arr = await ds.read()
         assert arr.nodata == 0
 
@@ -1193,16 +1216,16 @@ class TestVRTRead:
 
         rgb_read = AsyncMock(return_value=_read_result((3, 8, 8), fill=10))
         nir_read = AsyncMock(return_value=_read_result((1, 8, 8), fill=99))
-        rgb_src.read = rgb_read
-        nir_src.read = nir_read
+        rgb_src._read_native = rgb_read
+        nir_src._read_native = nir_read
 
         arr = await ds.read()
 
         # One read per unique source, with the full band list bundled.
         assert rgb_read.call_count == 1
         assert nir_read.call_count == 1
-        assert rgb_read.call_args.kwargs["band_indices"] == [1, 2, 3]
-        assert nir_read.call_args.kwargs["band_indices"] == [1]
+        assert rgb_read.call_args.kwargs["band_indices"] == [0, 1, 2]
+        assert nir_read.call_args.kwargs["band_indices"] == [0]
 
         data: np.ndarray[Any, Any] = arr.data  # type: ignore[reportUnknownMemberType]
         assert data.shape == (4, 8, 8)
@@ -1231,8 +1254,8 @@ class TestVRTRead:
                 _geotiff=geotiff,
             )
 
-        rgb_src.read = AsyncMock(return_value=make_result(rgb_data))
-        nir_src.read = AsyncMock(return_value=make_result(nir_data))
+        rgb_src._read_native = AsyncMock(return_value=make_result(rgb_data))
+        nir_src._read_native = AsyncMock(return_value=make_result(nir_data))
 
         arr = await ds.read(band_indices=[4, 1])
         data: np.ndarray[Any, Any] = arr.data  # type: ignore[reportUnknownMemberType]
@@ -1247,9 +1270,9 @@ class TestVRTRead:
         ds = _make_rgbnir_ds()
         rgb_src, nir_src = ds._band_sources[0][0], ds._band_sources[3][0]
 
-        rgb_src.read = AsyncMock(return_value=_read_result((2, 4, 4), fill=7))
+        rgb_src._read_native = AsyncMock(return_value=_read_result((2, 4, 4), fill=7))
         nir_read = AsyncMock()
-        nir_src.read = nir_read
+        nir_src._read_native = nir_read
 
         arr = await ds.read(band_indices=[1, 3])
         assert nir_read.call_count == 0
@@ -1260,6 +1283,14 @@ class TestVRTRead:
         ds = _make_rgbnir_ds()
         with pytest.raises(ValueError, match="out of range"):
             await ds.read(band_indices=[5])
+
+    async def test_resampled_read_refuses_a_masked_source(self):
+        """``_geotiff`` is band 1's source, so a mask on any other source has
+        to be found by asking the sources."""
+        ds = _make_rgbnir_ds()
+        cast(Any, ds._band_sources[3][0]._geotiff).mask_ifd = object()
+        with pytest.raises(NotImplementedError, match="nir.tif has an internal mask"):
+            await ds.read(target_resolution=20.0)
 
     async def test_read_native_dispatches_to_sources(self):
         """_read_native is the primitive merge uses — groups by source like read()."""
@@ -1551,8 +1582,8 @@ def _mocked_rgbnir_ds() -> _VRTDataset:
     so a group/result mix-up in the reassembly shows up as wrong pixels."""
     ds = _make_rgbnir_ds()
     rgb_src, nir_src = ds._band_sources[0][0], ds._band_sources[3][0]
-    rgb_src.read = AsyncMock(return_value=_read_result((3, 8, 8), fill=10))
-    nir_src.read = AsyncMock(return_value=_read_result((1, 8, 8), fill=99))
+    rgb_src._read_native = AsyncMock(return_value=_read_result((3, 8, 8), fill=10))
+    nir_src._read_native = AsyncMock(return_value=_read_result((1, 8, 8), fill=99))
     return ds
 
 

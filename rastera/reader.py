@@ -85,11 +85,21 @@ class AsyncGeoTIFF:
         A value this dataset's dtype cannot carry is ignored rather than
         treated as "no nodata", which would discard a sentinel the file does
         declare. Subclasses that wrap other datasets override this to push the
-        value down to whoever actually resamples (see ``_VRTDataset``).
+        value down to them (see ``_VRTDataset``).
         """
         coerced = _coerce_nodata(nodata, self._geotiff.dtype)
         if coerced is not None:
             self._nodata = coerced
+
+    def _internal_mask_uri(self) -> str | None:
+        """The URI of the file behind this dataset with an internal mask, if any.
+
+        ``getattr``: only a real ``GeoTIFF`` header has ``mask_ifd``. Datasets
+        over other files override this to ask them.
+        """
+        if getattr(self._geotiff, "mask_ifd", None) is not None:
+            return self.uri
+        return None
 
     @property
     def count(self) -> int:
@@ -523,11 +533,11 @@ class AsyncGeoTIFF:
         ``self._crs_epsg`` when the grid is already in this dataset's own CRS.
         """
         # The warp takes validity from nodata alone, so it would resample the
-        # pixels an internal mask hides as data. ``getattr``: only a real
-        # ``GeoTIFF`` header has the attribute.
-        if getattr(self._geotiff, "mask_ifd", None) is not None:
+        # pixels an internal mask hides as data.
+        masked_uri = self._internal_mask_uri()
+        if masked_uri is not None:
             raise NotImplementedError(
-                f"{self.uri} has an internal mask, which resampled and "
+                f"{masked_uri} has an internal mask, which resampled and "
                 "reprojected reads do not support. Read it at native "
                 "resolution, where the mask comes back on RasterArray.mask."
             )

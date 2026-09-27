@@ -36,7 +36,7 @@ from async_geotiff import RasterArray, Window
 from pyproj import CRS
 
 from . import config
-from .geo import BBox, normalize_band_indices
+from .geo import BBox
 from .reader import (
     AsyncGeoTIFF,
     MetaOverrides,
@@ -189,8 +189,8 @@ async def _open_vrt_checked(
 class _VRTDataset(AsyncGeoTIFF):
     """Band-stack VRT dataset presenting as an ``AsyncGeoTIFF``.
 
-    Reads are dispatched to the underlying sources, grouping bands that share
-    a source into a single ``read()`` call.
+    ``_read_native`` is dispatched to the underlying sources, grouping bands
+    that share a source into a single call. ``read()`` resamples that stack.
     """
 
     def __init__(
@@ -219,15 +219,11 @@ class _VRTDataset(AsyncGeoTIFF):
             self._nodata = None
 
     def _override_nodata(self, nodata: float) -> None:
-        """Adopt *nodata* and push it onto the sources, which do the resampling.
+        """Adopt *nodata* and push it onto the sources.
 
-        Reporting it on the VRT alone is not enough: ``read()`` forwards
-        ``target_crs`` / ``target_resolution`` to each source, and
-        ``resample``'s bilinear/cubic kernels renormalize around whatever
-        nodata *that source* carries. A source declaring none — the shape this
-        whole feature exists for — would otherwise average the VRT's nodata
-        pixels in as if they were real values. (``nearest`` is unaffected;
-        there nodata is only a fill value.)
+        The kernels do not need the push: ``read()`` resamples the stack with
+        the VRT's own nodata. A source that fills pixels itself still reads its
+        own value, as DIMAP does for a tile that returns no data.
 
         Mutating a source is safe because these wrappers are ours:
         ``AsyncGeoTIFF.open`` caches only the inner ``GeoTIFF``, so a wrapper
@@ -238,7 +234,7 @@ class _VRTDataset(AsyncGeoTIFF):
         Dispatch handles the source flavours: a nested VRT source recurses
         through this same method, while a ``_VRTProcessedDataset`` source
         inherits the base method and stops here on purpose — its nodata is
-        post-LUT Byte while its own child resamples pre-LUT reflectance, so
+        post-LUT Byte while its own child holds pre-LUT reflectance, so
         pushing this value further down would corrupt pixels.
         """
         super()._override_nodata(nodata)
@@ -252,6 +248,14 @@ class _VRTDataset(AsyncGeoTIFF):
     @property
     def count(self) -> int:
         return len(self._band_sources)
+
+    def _internal_mask_uri(self) -> str | None:
+        # ``_geotiff`` is band 1's source only; a mask on any source counts.
+        for src, _ in self._band_sources:
+            uri = src._internal_mask_uri()
+            if uri is not None:
+                return uri
+        return None
 
     async def read(
         self,
@@ -269,26 +273,18 @@ class _VRTDataset(AsyncGeoTIFF):
             # Each source would pick its own overview level independently,
             # which can yield mismatched output shapes across sources.
             raise NotImplementedError("use_overviews is not supported on VRT datasets")
-        # Public entry: band_indices are 1-based (or None).
-        vrt_indices = normalize_band_indices(band_indices, len(self._band_sources))
-        return await _dispatch_source_reads(
-            self._band_sources,
-            vrt_indices,
-            "read",
-            # offset 0: src.read is public and takes 1-based band indices;
-            # source_band values are already stored 1-based.
-            source_band_offset=0,
-            read_kwargs=dict(
-                bbox=bbox,
-                bbox_crs=bbox_crs,
-                window=window,
-                target_crs=target_crs,
-                target_resolution=target_resolution,
-                snap_to_grid=snap_to_grid,
-                use_overviews=False,
-                resampling=resampling,
-            ),
-            output_nodata=self._nodata,
+        # Not forwarded to each source: GDAL resamples the VRT's pixels with
+        # the VRT's nodata, which is what the base read does with our stack.
+        return await super().read(
+            bbox=bbox,
+            bbox_crs=bbox_crs,
+            window=window,
+            band_indices=band_indices,
+            target_crs=target_crs,
+            target_resolution=target_resolution,
+            snap_to_grid=snap_to_grid,
+            use_overviews=False,
+            resampling=resampling,
         )
 
     async def _read_native(
@@ -314,10 +310,6 @@ class _VRTDataset(AsyncGeoTIFF):
         return await _dispatch_source_reads(
             self._band_sources,
             vrt_indices,
-            "_read_native",
-            # offset -1: _read_native is internal and expects 0-based band
-            # indices; stored source_band values are 1-based.
-            source_band_offset=-1,
             read_kwargs=dict(bbox=bbox, window=window, snap_to_grid=snap_to_grid),
             output_nodata=self._nodata,
         )
@@ -335,8 +327,8 @@ class _VRTProcessedDataset(AsyncGeoTIFF):
 
     The LUT step is index-to-index — ``lut_N`` is applied to source band N
     and yields output band N. Band selection (``band_indices`` on
-    ``read``/``_read_native``) is forwarded to the source unchanged; we
-    apply only the LUTs matching the selected bands.
+    ``_read_native``) is forwarded to the source unchanged; we apply only the
+    LUTs matching the selected bands. ``read()`` resamples the LUT's output.
     """
 
     def __init__(
@@ -363,6 +355,10 @@ class _VRTProcessedDataset(AsyncGeoTIFF):
     def count(self) -> int:
         return self._spec.output_count
 
+    def _internal_mask_uri(self) -> str | None:
+        # ``_geotiff`` is synthesized; the source's header is the real one.
+        return self._source._internal_mask_uri()
+
     async def read(
         self,
         bbox: BBox | tuple[float, float, float, float] | None = None,
@@ -381,22 +377,19 @@ class _VRTProcessedDataset(AsyncGeoTIFF):
             raise NotImplementedError(
                 "use_overviews is not supported on processed VRT datasets"
             )
-        # normalize_band_indices returns 0-based output band positions.
-        # Forward to ``source.read`` (public API, 1-based) and apply the
-        # matching LUT row per output band.
-        out_indices_0 = normalize_band_indices(band_indices, self._spec.output_count)
-        src_result = await self._source.read(
+        # Not forwarded to the source: GDAL applies the LUT, then resamples its
+        # output with ``dst_nodata``, which is what the base read does here.
+        return await super().read(
             bbox=bbox,
             bbox_crs=bbox_crs,
             window=window,
-            band_indices=[b + 1 for b in out_indices_0],
+            band_indices=band_indices,
             target_crs=target_crs,
             target_resolution=target_resolution,
             snap_to_grid=snap_to_grid,
             use_overviews=False,
             resampling=resampling,
         )
-        return self._apply_luts(src_result, out_indices_0)
 
     async def _read_native(
         self,
@@ -450,10 +443,8 @@ class _VRTProcessedDataset(AsyncGeoTIFF):
         )
         for i, b0 in enumerate(band_indices_0):
             out[i] = self._spec.luts[b0][in_data[i]]
-        # Take the CRS from the sub-read, not from ``self._geotiff``: a read
-        # with ``target_crs`` reprojects inside the source, and reporting our
-        # own (source) CRS would label the returned pixels with the wrong one.
-        # The nodata is ours, since the LUT writes ``dst_nodata``.
+        # The CRS is the sub-read's. The nodata is ours, since the LUT writes
+        # ``dst_nodata``.
         return _make_output_array(
             out,
             src_result.transform,
@@ -865,9 +856,8 @@ def _declared_nodata(bands: Sequence[_VRTBand]) -> float | None:
     *reporting*, so it is skipped here — see ``_hides_declared_nodata``, which
     is what stops the source's value being inherited in its place.
 
-    The value is used for compositing (``merge``), for reporting, and — via
-    ``_VRTDataset._override_nodata`` — for the resampling the sources perform
-    on the VRT's behalf.
+    The value is used for compositing (``merge``), for reporting, and for
+    resampling.
     """
     declared = {b.nodata for b in bands if b.nodata is not None and not b.hide_nodata}
     # NaN is never equal to itself, so a NaN-nodata VRT would look like a
@@ -1072,19 +1062,15 @@ async def _open_vrt_source(
 async def _dispatch_source_reads(
     band_sources: Sequence[tuple[AsyncGeoTIFF, int]],
     vrt_indices: Sequence[int],
-    method_name: str,
     *,
-    source_band_offset: int,
     read_kwargs: dict[str, Any],
     output_nodata: int | float | None,
 ) -> RasterArray:
-    """Group output bands by source, invoke *method_name* on each source with
+    """Group output bands by source, call ``_read_native`` on each source with
     the bundled source-band list, and reassemble into VRT output order.
 
-    *vrt_indices* are 0-based indices into ``band_sources``.
-    *source_band_offset* is added to each source's stored (1-based) source band
-    before it is forwarded — 0 for public ``read`` (keeps 1-based), -1 for
-    internal ``_read_native`` (converts to 0-based).
+    *vrt_indices* are 0-based indices into ``band_sources``, and so are the
+    source bands forwarded; the stored ones are 1-based.
     *output_nodata* is the VRT's own nodata; when it differs from what the
     sources report, the result carries the VRT's value instead of theirs. It has
     no default on purpose — defaulting to ``None`` would make a caller that
@@ -1094,7 +1080,7 @@ async def _dispatch_source_reads(
     for out_idx, vrt_idx in enumerate(vrt_indices):
         src, src_band = band_sources[vrt_idx]
         entry = groups.setdefault(id(src), (src, []))
-        entry[1].append((out_idx, src_band + source_band_offset))
+        entry[1].append((out_idx, src_band - 1))
 
     group_list = list(groups.values())
     # Sequential by default: each source read already fans out internally
@@ -1103,7 +1089,7 @@ async def _dispatch_source_reads(
     # saturated links. Set ``rastera.set_concurrency(vrt=N>1)`` to opt
     # into outer fan-out across distinct sources.
     coros: list[Awaitable[RasterArray]] = [
-        getattr(src, method_name)(band_indices=[b for _, b in entries], **read_kwargs)
+        src._read_native(band_indices=[b for _, b in entries], **read_kwargs)
         for src, entries in group_list
     ]
     results: list[RasterArray] = await config._gather_bounded(
