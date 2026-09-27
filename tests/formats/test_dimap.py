@@ -1509,6 +1509,32 @@ class TestTileCache:
             assert await ds._get_tile(0, 0, 0) is tile
         assert calls == 1
 
+    async def test_a_cancelled_reader_leaves_the_open_to_the_others(self):
+        """Readers awaited the shared open directly, so cancelling one, as a
+        request timeout does, cancelled it for every reader waiting on it."""
+        ds = _DIMAPDataset("s3://bucket/DIM_PNEO.XML", self._layout())
+        tile = MagicMock()
+        release = asyncio.Event()
+        calls = 0
+
+        async def slow(*_: Any, **__: Any):
+            nonlocal calls
+            calls += 1
+            await release.wait()
+            return tile
+
+        with patch.object(_DIMAPDataset, "_open_tile", new=slow):
+            first = asyncio.ensure_future(ds._get_tile(0, 1, 1))
+            second = asyncio.ensure_future(ds._get_tile(0, 1, 1))
+            await asyncio.sleep(0)  # both readers are now waiting on the open
+            first.cancel()
+            release.set()
+            assert await second is tile
+            with pytest.raises(asyncio.CancelledError):
+                await first
+        assert calls == 1
+        assert ds._tiles[(0, 1, 1)] is tile
+
     def test_construction_needs_no_running_loop(self):
         """The primed first tile was held as a resolved Future, which requires a
         running event loop and binds the dataset to it."""
