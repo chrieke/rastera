@@ -11,7 +11,7 @@ import numpy as np
 import pytest
 from affine import Affine
 from async_geotiff import RasterArray, Window
-from pyproj import CRS
+from pyproj import CRS, Transformer
 
 import rastera
 from rastera.formats.dimap import _DIMAPDataset
@@ -718,6 +718,35 @@ class TestOverviewChoice:
         so a 20 m read took it and resampled the rows up from 40 m."""
         ds, _ = self._cog(512, 256, res=(10.0, 20.0))
         assert ds._best_overview_for_resolution((20.0, 20.0)) is None
+
+    @pytest.mark.parametrize(("target", "reads_level"), [(18.5, False), (20.5, True)])
+    async def test_a_rotated_reprojection_picks_by_pixel_spacing(
+        self, target: float, reads_level: bool
+    ):
+        """UTM32 into UTM33 near 60N turns the grid about 5 degrees. An 18.5 m
+        pixel reaches 20.1 m along each source axis, and picked by that reach
+        the read took the 20 m level and resampled it up."""
+        x0, y0 = 690000.0, 6700000.0
+        gt = make_mock_geotiff(400, 400, 10.0, 1, origin_x=x0, origin_y=y0)
+        level = make_mock_geotiff(200, 200, 20.0, 1, origin_x=x0, origin_y=y0)
+        gt.overviews = [level]
+        gt.read = AsyncMock(side_effect=slicing_read(gt, np.zeros((1, 400, 400))))
+        level.read = AsyncMock(side_effect=slicing_read(level, np.zeros((1, 200, 200))))
+        ds = AsyncGeoTIFF("s3://b/k.tif", gt)
+
+        cx, cy = Transformer.from_crs(32632, 32633, always_xy=True).transform(
+            692000, 6698000
+        )
+        await ds.read(
+            bbox=(cx - 500, cy - 500, cx + 500, cy + 500),
+            bbox_crs=32633,
+            target_crs=32633,
+            target_resolution=target,
+            use_overviews=True,
+            resampling="bilinear",
+        )
+        assert level.read.called is reads_level
+        assert gt.read.called is not reads_level
 
 
 # ── read: output grid is a pure function of the arguments ───────────────

@@ -568,27 +568,28 @@ class AsyncGeoTIFF:
         needs_reproject = out_crs != src_crs
         # Destination pixel size, expressed in *source* units once reprojected,
         # so the halo and the overview are chosen against the grid the kernel
-        # actually walks.
-        dst_res = (float(dst_transform.a), -float(dst_transform.e))
+        # actually walks: the spacing picks the overview, the reach sizes the
+        # halo (see ``_src_units_per_pixel``). In one CRS the two are the same.
+        spacing = reach = (float(dst_transform.a), -float(dst_transform.e))
 
         read_bbox = bounds_from_transform(dst_transform, dst_width, dst_height)
         transformer = None
         if needs_reproject:
             assert src_crs is not None and out_crs is not None
             transformer = Transformer.from_crs(out_crs, src_crs, always_xy=True)
-            dst_res = _src_units_per_pixel(transformer, read_bbox, dst_res)
+            spacing, reach = _src_units_per_pixel(transformer, read_bbox, spacing)
             read_bbox = transform_bbox(read_bbox, out_crs, src_crs)
 
         # Per axis: the coarsest overview no coarser than *either* axis wants,
         # so neither upsamples from a level that already lost the detail.
         overview = (
-            self._best_overview_for_resolution(dst_res) if use_overviews else None
+            self._best_overview_for_resolution(spacing) if use_overviews else None
         )
         readable = overview if overview is not None else self._geotiff
         read_bbox = _halo_bbox(
             read_bbox,
             method=resampling,
-            dst_res=dst_res,
+            dst_res=reach,
             src_res=(float(readable.res[0]), float(readable.res[1])),
         )
 
@@ -985,31 +986,41 @@ def _make_output_array(
 
 def _src_units_per_pixel(
     transformer: Transformer, bbox: BBox, dst_res: tuple[float, float]
-) -> tuple[float, float]:
-    """How far one destination pixel of *dst_res* reaches along each source
-    axis, in source-CRS units.
+) -> tuple[tuple[float, float], tuple[float, float]]:
+    """One destination pixel of *dst_res* in source-CRS units, per axis: its
+    spacing, then its reach.
 
-    Both destination steps count along each source axis, since the CRSs may be
-    rotated against each other. The kernel is widened by the same measure
-    (``resampling._footprint``), so the halo covers it.
+    The spacing is the length of one destination step, and picks the overview.
+    The reach adds both destination steps along each source axis, since the
+    CRSs may be rotated against each other. The kernel is widened by the reach
+    (``resampling._footprint``), so the halo sized from it covers the kernel.
+    The overview is not picked by the reach: on a grid rotated by θ it is
+    cos θ + sin θ times the spacing, so a level that much coarser than the
+    request was read and resampled up.
 
     A one-pixel finite difference at *bbox*'s centre, not a ratio of the bbox
     extents: ``transform_bbox`` returns a densified *envelope*, so for a thin
     grid — merge hands us 1-px-wide edge contributors — the envelope's width is
     set by the projection's curvature over the long axis rather than by the
     grid's own width, inflating the ratio by 100x and with it the halo.
-    Falls back to *dst_res* if the probe leaves the transform's domain;
-    ``transform_bbox`` on the same rectangle raises loudly right after.
+    Falls back to *dst_res* for both if the probe leaves the transform's
+    domain; ``transform_bbox`` on the same rectangle raises loudly right after.
     """
     cx = (bbox.minx + bbox.maxx) / 2.0
     cy = (bbox.miny + bbox.maxy) / 2.0
     rx, ry = dst_res
     xs, ys = transformer.transform([cx, cx + rx, cx], [cy, cy, cy + ry])
     if not all(math.isfinite(v) for v in (*xs, *ys)):
-        return dst_res
-    step_x = abs(xs[1] - xs[0]) + abs(xs[2] - xs[0])
-    step_y = abs(ys[1] - ys[0]) + abs(ys[2] - ys[0])
-    return (step_x or rx, step_y or ry)
+        return dst_res, dst_res
+    spacing = (
+        math.hypot(xs[1] - xs[0], ys[1] - ys[0]) or rx,
+        math.hypot(xs[2] - xs[0], ys[2] - ys[0]) or ry,
+    )
+    reach = (
+        abs(xs[1] - xs[0]) + abs(xs[2] - xs[0]) or rx,
+        abs(ys[1] - ys[0]) + abs(ys[2] - ys[0]) or ry,
+    )
+    return spacing, reach
 
 
 def _halo_bbox(
