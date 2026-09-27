@@ -956,7 +956,9 @@ def _finalize_kernel(
     h, w = src_array.shape[1], src_array.shape[2]
     if nodata is not None:
         assert acc_wt is not None
-        out_f = np.zeros_like(acc_val)
+        # In place: every pixel without weight is invalid and overwritten with
+        # nodata below, so what the divide leaves there never shows.
+        out_f = acc_val
         has_weight = acc_wt > 0
         np.divide(acc_val, acc_wt, out=out_f, where=has_weight)
 

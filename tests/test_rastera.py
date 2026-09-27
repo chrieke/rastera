@@ -510,6 +510,20 @@ class TestRead:
         np.testing.assert_array_equal(arr.data[0], data[0])  # type: ignore[reportUnknownMemberType]
         np.testing.assert_array_equal(arr.data[1], data[2])  # type: ignore[reportUnknownMemberType]
 
+    @pytest.mark.parametrize("band_indices", [None, [1, 2, 3]])
+    async def test_every_band_in_order_is_not_copied(
+        self, band_indices: list[int] | None
+    ):
+        """Selecting every band by fancy index copied the whole read, so a
+        default read held it twice."""
+        gt = make_mock_geotiff(width=16, height=16, scale=1.0, count=3)
+        data = np.arange(3 * 16 * 16, dtype=np.uint16).reshape(3, 16, 16)
+        gt.read = AsyncMock(
+            return_value=make_raster_array(data, Affine(1, 0, 0, 0, -1, 16), gt)
+        )
+        arr = await AsyncGeoTIFF("s3://b/k.tif", gt).read(band_indices=band_indices)
+        assert arr.data is data  # type: ignore[reportUnknownMemberType]
+
     async def test_read_band_index_zero_raises(self):
         gt = make_mock_geotiff(width=16, height=16, scale=1.0, count=3)
         obj = AsyncGeoTIFF("s3://b/k.tif", gt)

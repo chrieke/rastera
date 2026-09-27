@@ -654,7 +654,9 @@ class AsyncGeoTIFF:
         # creates, NIR or not. Left set, ``as_masked()`` masks every band by it,
         # and a ``band_indices`` subset leaves it naming the wrong band, or none.
         result = dc_replace(result, _alpha_band_idx=None)
-        if band_indices is not None:
+        # Every band in order, the default read, is left alone: the fancy index
+        # would copy it all, and the read then held twice its size.
+        if band_indices is not None and list(band_indices) != list(range(result.count)):
             result = dc_replace(
                 result,
                 data=result.data[band_indices],  # type: ignore[reportUnknownMemberType]
