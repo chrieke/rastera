@@ -1,5 +1,6 @@
 """Unit tests for the resample() function and its kernel/coord helpers."""
 
+import math
 from typing import Any
 
 import numpy as np
@@ -8,7 +9,13 @@ from affine import Affine
 from pyproj import Transformer
 
 from rastera.config import WarpStrategy
-from rastera.resampling import ResamplingMethod, _resample_impl, resample
+from rastera.resampling import (
+    ResamplingMethod,
+    _footprint,
+    _kernel_scale,
+    _resample_impl,
+    resample,
+)
 
 
 def _src_grid(n: int):
@@ -121,6 +128,20 @@ class TestResampleNearest:
         transformer = Transformer.from_crs(4326, 32632, always_xy=True)
         out = resample(src_arr, src_t, dst_t, 1, 1, nodata=0, transformer=transformer)
         assert out.shape == (1, 1, 1)
+
+    def test_a_center_on_a_source_edge_takes_the_pixel_past_it(self):
+        """A half-pixel-phase source read on the lattice of its own resolution
+        puts every destination center on a source edge. Float noise broke that
+        tie differently per bbox origin, so overlapping reads disagreed by a
+        whole column; GDAL takes the pixel past the edge."""
+        res = 1e-4
+        src_t = Affine(res, 0, 10.00005, 0, -res, 50.00005)
+        grid = np.indices((32, 32))  # band 0 holds the row, band 1 the column
+        for k in range(12):
+            dst_t = Affine(res, 0, (100000 + k) * res, 0, -res, (500000 - k) * res)
+            out = resample(grid, src_t, dst_t, 8, 8)
+            assert out[1, 0].tolist() == list(range(k, k + 8))
+            assert out[0, :, 0].tolist() == list(range(k + 1, k + 9))
 
 
 # ── resample (bilinear) ──────────────────────────────────────────────────
@@ -285,6 +306,31 @@ class TestResampleBilinear:
         dst_t = Affine(1, 0, 14.5, 0, -1, 15.5)  # center → src pixel (1, 1)
         out = resample(arr, src_t, dst_t, 1, 1, nodata=float("nan"), method="bilinear")
         assert np.isnan(out[0, 0, 0]), f"expected NaN output, got {out}"
+
+    def test_a_scale_just_above_one_interpolates_plainly(self):
+        """gdalwarp rounds a downsample factor within 0.05 of a whole one. At
+        1.02 that leaves plain 2x2 interpolation, where widening the kernel by
+        1.02 blurred slightly and sampled 4x4."""
+        src = np.random.default_rng(0).uniform(0, 200, (1, 40, 40))
+        st = Affine(10, 0, 0, 0, -10, 400)
+        dt = Affine(10.2, 0, 50, 0, -10.2, 350)
+        out = resample(src, st, dt, 30, 30, method="bilinear")
+
+        # Both axes sample at 1.02 * (i + 0.5) + 5; interpolate between the
+        # source pixel centers, which sit at j + 0.5.
+        pos = 1.02 * (np.arange(30) + 0.5) + 5 - 0.5
+        lo = np.floor(pos).astype(int)
+        w = np.zeros((30, 40))
+        w[np.arange(30), lo] = 1 - (pos - lo)
+        w[np.arange(30), lo + 1] = pos - lo
+        np.testing.assert_allclose(out[0], w @ src[0] @ w.T, rtol=0, atol=1e-9)
+
+    @pytest.mark.parametrize(
+        ("scale", "used"),
+        [(1.02, 1.0), (1.06, 1.06), (2.03, 2.0), (9.96, 10.0), (0.98, 0.98)],
+    )
+    def test_kernel_scale_rounds_like_gdalwarp(self, scale: float, used: float):
+        assert _kernel_scale(scale) == used
 
 
 # ── resample (cubic) ─────────────────────────────────────────────────────
@@ -581,7 +627,19 @@ class TestSeparableEquivalence:
         np.testing.assert_array_equal(out == 0, ref == 0)  # identical nodata mask
         np.testing.assert_allclose(out, ref, atol=1)
 
-    def test_block_size_invariance(self, monkeypatch: pytest.MonkeyPatch):
+
+class TestRowBlocks:
+    """Both kernel paths work through the destination a block of rows at a
+    time, which must not show in the output."""
+
+    @pytest.mark.parametrize(
+        "transformer",
+        [None, Transformer.from_crs(32632, 32632, always_xy=True)],
+        ids=["same_crs", "cross_crs"],
+    )
+    def test_block_size_invariance(
+        self, monkeypatch: pytest.MonkeyPatch, transformer: Transformer | None
+    ):
         """Chunking is purely an implementation detail: output must not depend
         on the row-block size (catches block-boundary indexing bugs)."""
         import rastera.resampling as r
@@ -589,14 +647,55 @@ class TestSeparableEquivalence:
         rng = np.random.default_rng(3)
         src = rng.integers(1, 5000, size=(2, 500, 64)).astype(np.uint16)
         src[:, rng.random((500, 64)) < 0.2] = 0
+        src[1, 100:140, 10:30] = 0  # a hole only band 1 has
         src_t = Affine(1, 0, 0, 0, -1, 500)
         dst_t = Affine(2, 0, 0, 0, -2, 500)
-        kw: dict[str, Any] = dict(nodata=0, method="cubic")
-        monkeypatch.setattr(r, "_SEPARABLE_ROW_BLOCK", 1_000_000)
+        kw: dict[str, Any] = dict(
+            nodata=0,
+            method="cubic",
+            transformer=transformer,
+            warp_strategy="single_pass",
+        )
+        monkeypatch.setattr(r, "_ROW_BLOCK", 1_000_000)
         whole = resample(src, src_t, dst_t, 32, 250, **kw)
-        monkeypatch.setattr(r, "_SEPARABLE_ROW_BLOCK", 7)
+        monkeypatch.setattr(r, "_ROW_BLOCK", 7)
         tiny = resample(src, src_t, dst_t, 32, 250, **kw)
         np.testing.assert_array_equal(whole, tiny)
+
+    def test_a_cross_crs_warp_peaks_at_a_few_times_its_output(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """The 2-D weights and sums used to span the whole grid: a cubic warp
+        peaked at 49x its output. Per block, the full-grid source coordinates
+        are what is left."""
+        import tracemalloc
+
+        import rastera.resampling as r
+
+        monkeypatch.setattr(r, "_ROW_BLOCK", 32)
+        src = np.random.default_rng(0).integers(1, 4000, (3, 512, 512), np.uint16)
+        to_src = Transformer.from_crs(32634, 32633, always_xy=True)
+        cx, cy = Transformer.from_crs(32633, 32634, always_xy=True).transform(
+            502560, 4997440
+        )
+        dst_t = Affine(9, 0, cx - 256 * 9, 0, -9, cy + 256 * 9)
+        tracemalloc.start()
+        try:
+            out = resample(
+                src,
+                Affine(10, 0, 500000, 0, -10, 5000000),
+                dst_t,
+                512,
+                512,
+                nodata=0,
+                transformer=to_src,
+                method="cubic",
+                warp_strategy="single_pass",
+            )
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        assert peak < 12 * out.nbytes
 
 
 class TestTwoPassReproject:
@@ -724,6 +823,17 @@ class TestTwoPassReproject:
         extra_nodata = (tp == 0) & (sp != 0)
         assert extra_nodata.mean() < 0.01
 
+    def test_the_default_is_the_single_warp(self):
+        """Two-pass is the opt-in speed mode: it is softer than gdalwarp, and a
+        pixel's value depends on the bbox it was read with."""
+        arr, st, dt, dw, dh, T = self._cross_setup(0.16, 0.5)
+        kw: dict[str, Any] = dict(transformer=T, method="cubic")
+        default = resample(arr, st, dt, dw, dh, **kw)
+        single = resample(arr, st, dt, dw, dh, warp_strategy="single_pass", **kw)
+        two = resample(arr, st, dt, dw, dh, warp_strategy="auto", **kw)
+        assert not np.array_equal(single, two)
+        np.testing.assert_array_equal(default, single)
+
     def test_global_setter_and_validation(self):
         import rastera
         import rastera.config as config
@@ -767,6 +877,67 @@ class TestTwoPassReproject:
         two, coverage = _resample_impl(arr, st, dt, dw, dh, warp_strategy="auto", **kw)
         assert coverage is not None
         assert np.abs(two[0][coverage] - single[0][coverage]).max() < 1e-3
+
+
+# ── cross-CRS kernel width ───────────────────────────────────────────────
+
+
+class TestCrossCrsKernelScale:
+    """A cross-CRS kernel is widened by how far a destination pixel reaches
+    along each source axis, which is what gdalwarp sizes it by."""
+
+    SRC = np.random.default_rng(0).uniform(0, 200, (1, 60, 60))
+    SRC_T = Affine(10, 0, 0, 0, -10, 600)
+    # Destination (x, y) -> source (-y, x): an exact quarter turn.
+    QUARTER_TURN = Transformer.from_pipeline(
+        "+proj=pipeline +step +proj=affine +s11=0 +s12=-1 +s21=1 +s22=0"
+    )
+
+    @pytest.mark.parametrize("method", ["bilinear", "cubic"])
+    def test_a_rotated_downsample_is_filtered_like_an_unrotated_one(
+        self, method: ResamplingMethod
+    ):
+        """Only the step along the matching axis used to count. A quarter turn
+        has none there, so a 3x downsample was sampled unfiltered."""
+        rotated = resample(
+            self.SRC,
+            self.SRC_T,
+            Affine(30, 0, 0, 0, -30, 0),
+            20,
+            20,
+            transformer=self.QUARTER_TURN,
+            method=method,
+            warp_strategy="single_pass",
+        )
+        same_crs = resample(
+            self.SRC, self.SRC_T, Affine(30, 0, 0, 0, -30, 600), 20, 20, method=method
+        )
+        np.testing.assert_allclose(rotated[0], np.rot90(same_crs[0], -1), atol=1e-9)
+
+    @pytest.mark.parametrize("shape", [(1, 20), (20, 1)])
+    def test_a_one_pixel_axis_is_filtered_like_a_wider_one(
+        self, shape: tuple[int, int]
+    ):
+        """A 1-pixel axis has no step to measure, and its factor defaulted to 1:
+        a 3x downsample there was sampled unfiltered."""
+        h, w = shape
+        kw: dict[str, Any] = dict(
+            transformer=Transformer.from_crs(32632, 32632, always_xy=True),
+            method="bilinear",
+            warp_strategy="single_pass",
+        )
+        dt = Affine(30, 0, 0, 0, -30, 600)
+        thin = resample(self.SRC, self.SRC_T, dt, w, h, **kw)
+        wide = resample(self.SRC, self.SRC_T, dt, 20, 20, **kw)
+        np.testing.assert_allclose(thin[0], wide[0, :h, :w], atol=1e-9)
+
+    def test_both_steps_count_as_gdalwarp_counts_them(self):
+        """cos + sin of the rotation: 1.366 source pixels at 30 degrees."""
+        t = math.radians(30)
+        j, i = np.mgrid[0:8, 0:8].astype(float)
+        assert _footprint(math.cos(t) * i - math.sin(t) * j) == pytest.approx(
+            math.cos(t) + math.sin(t)
+        )
 
 
 # ── pixels outside the source extent ─────────────────────────────────────

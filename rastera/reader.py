@@ -129,21 +129,31 @@ class AsyncGeoTIFF:
             return CRS.from_epsg(self._crs_override)
         return self._geotiff.crs
 
-    def _best_overview_for_resolution(self, target_resolution: float):
-        """Return the Overview whose resolution is closest to *target_resolution*
-        without being coarser. Returns None to use full resolution.
+    def _best_overview_for_resolution(self, dst_res: tuple[float, float]):
+        """The coarsest overview no coarser than *dst_res* on either axis, or
+        None to read full resolution.
+
+        A level counts at its nominal factor, ``round(width / o.width)``. GDAL's
+        COG driver sizes levels by floor division, so an odd-sized file's level
+        is a hair coarser than its factor, 20.009 m for 2301 px at 10 m, and an
+        exact comparison skipped it at the very targets overviews serve.
 
         Reads the pyramid off ``_geotiff``, not ``self.overviews``: this needs
         readable ``Overview`` objects, while ``self.overviews`` holds (width,
         height) pairs and is emptied by both VRT flavours.
         """
-        native_res = self._geotiff.res[0]
-        valid = [
-            (o, native_res * (self._geotiff.width / o.width))
-            for o in self._geotiff.overviews
-            if native_res * (self._geotiff.width / o.width) <= target_resolution
-        ]
-        return max(valid, key=lambda x: x[1])[0] if valid else None
+        gt = self._geotiff
+        # The largest factor each axis allows; the slack absorbs float noise in
+        # an exact request such as 20 m from 10 m.
+        max_fx = dst_res[0] / gt.res[0] * (1 + 1e-9)
+        max_fy = dst_res[1] / gt.res[1] * (1 + 1e-9)
+        best, best_factor = None, 0
+        for o in gt.overviews:
+            fx = round(gt.width / o.width)
+            fy = round(gt.height / o.height)
+            if fx <= max_fx and fy <= max_fy and fx * fy > best_factor:
+                best, best_factor = o, fx * fy
+        return best
 
     @classmethod
     async def open(
@@ -558,27 +568,28 @@ class AsyncGeoTIFF:
         needs_reproject = out_crs != src_crs
         # Destination pixel size, expressed in *source* units once reprojected,
         # so the halo and the overview are chosen against the grid the kernel
-        # actually walks.
-        dst_res = (float(dst_transform.a), -float(dst_transform.e))
+        # actually walks: the spacing picks the overview, the reach sizes the
+        # halo (see ``_src_units_per_pixel``). In one CRS the two are the same.
+        spacing = reach = (float(dst_transform.a), -float(dst_transform.e))
 
         read_bbox = bounds_from_transform(dst_transform, dst_width, dst_height)
         transformer = None
         if needs_reproject:
             assert src_crs is not None and out_crs is not None
             transformer = Transformer.from_crs(out_crs, src_crs, always_xy=True)
-            dst_res = _src_units_per_pixel(transformer, read_bbox, dst_res)
+            spacing, reach = _src_units_per_pixel(transformer, read_bbox, spacing)
             read_bbox = transform_bbox(read_bbox, out_crs, src_crs)
 
-        # min(): the coarsest overview no coarser than *either* axis wants, so
-        # neither upsamples from a level that already lost the detail.
+        # Per axis: the coarsest overview no coarser than *either* axis wants,
+        # so neither upsamples from a level that already lost the detail.
         overview = (
-            self._best_overview_for_resolution(min(dst_res)) if use_overviews else None
+            self._best_overview_for_resolution(spacing) if use_overviews else None
         )
         readable = overview if overview is not None else self._geotiff
         read_bbox = _halo_bbox(
             read_bbox,
             method=resampling,
-            dst_res=dst_res,
+            dst_res=reach,
             src_res=(float(readable.res[0]), float(readable.res[1])),
         )
 
@@ -588,17 +599,25 @@ class AsyncGeoTIFF:
             overview=overview,
         )
 
-        out_data, coverage = _resample_impl(
-            native.data,  # type: ignore[reportUnknownMemberType]
-            src_transform=native.transform,
-            dst_transform=dst_transform,
-            dst_width=dst_width,
-            dst_height=dst_height,
-            nodata=self._nodata,
-            transformer=transformer,
-            method=resampling,
-        )
-        out_data = _fill_uncovered(out_data, coverage, self._nodata)
+        def _warp() -> tuple[np.ndarray, np.ndarray | None]:
+            # pyproj >= 3.1 gives each thread its own handle under one
+            # Transformer, so the one built above is safe to use here.
+            out, covered = _resample_impl(
+                native.data,  # type: ignore[reportUnknownMemberType]
+                src_transform=native.transform,
+                dst_transform=dst_transform,
+                dst_width=dst_width,
+                dst_height=dst_height,
+                nodata=self._nodata,
+                transformer=transformer,
+                method=resampling,
+            )
+            return _fill_uncovered(out, covered, self._nodata), covered
+
+        # CPU-bound, and seconds long for a large warp: on the event loop it
+        # stalled every other task for that long, and set_concurrency could not
+        # overlap two of them.
+        out_data, coverage = await asyncio.to_thread(_warp)
 
         # Coverage stands in as the mask only when the dataset declares no
         # sentinel. With one, the warp already wrote it outside the footprint
@@ -646,7 +665,9 @@ class AsyncGeoTIFF:
         # creates, NIR or not. Left set, ``as_masked()`` masks every band by it,
         # and a ``band_indices`` subset leaves it naming the wrong band, or none.
         result = dc_replace(result, _alpha_band_idx=None)
-        if band_indices is not None:
+        # Every band in order, the default read, is left alone: the fancy index
+        # would copy it all, and the read then held twice its size.
+        if band_indices is not None and list(band_indices) != list(range(result.count)):
             result = dc_replace(
                 result,
                 data=result.data[band_indices],  # type: ignore[reportUnknownMemberType]
@@ -965,28 +986,41 @@ def _make_output_array(
 
 def _src_units_per_pixel(
     transformer: Transformer, bbox: BBox, dst_res: tuple[float, float]
-) -> tuple[float, float]:
-    """*dst_res* re-expressed in source-CRS units, per axis.
+) -> tuple[tuple[float, float], tuple[float, float]]:
+    """One destination pixel of *dst_res* in source-CRS units, per axis: its
+    spacing, then its reach.
+
+    The spacing is the length of one destination step, and picks the overview.
+    The reach adds both destination steps along each source axis, since the
+    CRSs may be rotated against each other. The kernel is widened by the reach
+    (``resampling._footprint``), so the halo sized from it covers the kernel.
+    The overview is not picked by the reach: on a grid rotated by θ it is
+    cos θ + sin θ times the spacing, so a level that much coarser than the
+    request was read and resampled up.
 
     A one-pixel finite difference at *bbox*'s centre, not a ratio of the bbox
     extents: ``transform_bbox`` returns a densified *envelope*, so for a thin
     grid — merge hands us 1-px-wide edge contributors — the envelope's width is
     set by the projection's curvature over the long axis rather than by the
     grid's own width, inflating the ratio by 100x and with it the halo.
-    Falls back to *dst_res* if the probe leaves the transform's domain;
-    ``transform_bbox`` on the same rectangle raises loudly right after.
+    Falls back to *dst_res* for both if the probe leaves the transform's
+    domain; ``transform_bbox`` on the same rectangle raises loudly right after.
     """
     cx = (bbox.minx + bbox.maxx) / 2.0
     cy = (bbox.miny + bbox.maxy) / 2.0
     rx, ry = dst_res
     xs, ys = transformer.transform([cx, cx + rx, cx], [cy, cy, cy + ry])
     if not all(math.isfinite(v) for v in (*xs, *ys)):
-        return dst_res
-    # Hypotenuse, not the x/y component: the two CRSs may be rotated relative to
-    # each other, so a step along dst x moves in both source axes.
-    step_x = math.hypot(xs[1] - xs[0], ys[1] - ys[0])
-    step_y = math.hypot(xs[2] - xs[0], ys[2] - ys[0])
-    return (step_x or rx, step_y or ry)
+        return dst_res, dst_res
+    spacing = (
+        math.hypot(xs[1] - xs[0], ys[1] - ys[0]) or rx,
+        math.hypot(xs[2] - xs[0], ys[2] - ys[0]) or ry,
+    )
+    reach = (
+        abs(xs[1] - xs[0]) + abs(xs[2] - xs[0]) or rx,
+        abs(ys[1] - ys[0]) + abs(ys[2] - ys[0]) or ry,
+    )
+    return spacing, reach
 
 
 def _halo_bbox(

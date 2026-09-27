@@ -1,5 +1,6 @@
 """Unit tests for AsyncGeoTIFF."""
 
+import asyncio
 import os
 from dataclasses import replace as dc_replace
 from pathlib import Path
@@ -10,7 +11,7 @@ import numpy as np
 import pytest
 from affine import Affine
 from async_geotiff import RasterArray, Window
-from pyproj import CRS
+from pyproj import CRS, Transformer
 
 import rastera
 from rastera.formats.dimap import _DIMAPDataset
@@ -509,6 +510,20 @@ class TestRead:
         np.testing.assert_array_equal(arr.data[0], data[0])  # type: ignore[reportUnknownMemberType]
         np.testing.assert_array_equal(arr.data[1], data[2])  # type: ignore[reportUnknownMemberType]
 
+    @pytest.mark.parametrize("band_indices", [None, [1, 2, 3]])
+    async def test_every_band_in_order_is_not_copied(
+        self, band_indices: list[int] | None
+    ):
+        """Selecting every band by fancy index copied the whole read, so a
+        default read held it twice."""
+        gt = make_mock_geotiff(width=16, height=16, scale=1.0, count=3)
+        data = np.arange(3 * 16 * 16, dtype=np.uint16).reshape(3, 16, 16)
+        gt.read = AsyncMock(
+            return_value=make_raster_array(data, Affine(1, 0, 0, 0, -1, 16), gt)
+        )
+        arr = await AsyncGeoTIFF("s3://b/k.tif", gt).read(band_indices=band_indices)
+        assert arr.data is data  # type: ignore[reportUnknownMemberType]
+
     async def test_read_band_index_zero_raises(self):
         gt = make_mock_geotiff(width=16, height=16, scale=1.0, count=3)
         obj = AsyncGeoTIFF("s3://b/k.tif", gt)
@@ -573,7 +588,7 @@ class TestRead:
         ov.read = slicing_read(ov, np.zeros((1, 100, 100), np.uint16))
 
         obj = AsyncGeoTIFF("s3://b/k.tif", gt)
-        obj._best_overview_for_resolution = lambda r: ov if r >= 4.0 else None  # type: ignore[method-assign]
+        obj._best_overview_for_resolution = lambda r: ov if min(r) >= 4.0 else None  # type: ignore[method-assign]
 
         arr = await obj.read(
             window=Window(col_off=300, row_off=0, width=80, height=80),
@@ -655,6 +670,83 @@ class TestRead:
         arr = await obj.read(bbox=(0, 160, 80, 320), bbox_crs=32632, snap_to_grid=False)
         assert arr.transform.a == 10.0
         assert arr.transform.e == -20.0
+
+
+# ── overview choice ─────────────────────────────────────────────────────
+
+
+class TestOverviewChoice:
+    @staticmethod
+    def _cog(
+        width: int, height: int, res: tuple[float, float] = (10.0, 10.0)
+    ) -> tuple[AsyncGeoTIFF, list[Any]]:
+        """A mock COG with three levels, halved by floor division as GDAL's COG
+        driver sizes them."""
+        gt = make_mock_geotiff(
+            width=width, height=height, scale=res[0], y_scale=res[1], count=1
+        )
+        levels: list[Any] = []
+        w, h = width, height
+        for _ in range(3):
+            w, h = w // 2, h // 2
+            levels.append(
+                make_mock_geotiff(
+                    width=w,
+                    height=h,
+                    scale=res[0] * width / w,
+                    y_scale=res[1] * height / h,
+                    count=1,
+                )
+            )
+        gt.overviews = levels
+        return AsyncGeoTIFF("s3://b/k.tif", gt), levels
+
+    @pytest.mark.parametrize(
+        ("target", "level"), [(20.0, 0), (40.0, 1), (80.0, 2), (19.9, None)]
+    )
+    def test_an_odd_sized_level_counts_at_its_nominal_factor(
+        self, target: float, level: int | None
+    ):
+        """A 2301-px 10 m file's first level is 1150 px, so 20.009 m. Compared
+        exactly, it was skipped at 20 m and the read fetched 4x the bytes."""
+        ds, levels = self._cog(2301, 1701)
+        chosen = ds._best_overview_for_resolution((target, target))
+        assert chosen is (None if level is None else levels[level])
+
+    def test_a_level_must_fit_both_axes(self):
+        """A 10x20 m source's 2x level is 40 m tall; only its width was checked,
+        so a 20 m read took it and resampled the rows up from 40 m."""
+        ds, _ = self._cog(512, 256, res=(10.0, 20.0))
+        assert ds._best_overview_for_resolution((20.0, 20.0)) is None
+
+    @pytest.mark.parametrize(("target", "reads_level"), [(18.5, False), (20.5, True)])
+    async def test_a_rotated_reprojection_picks_by_pixel_spacing(
+        self, target: float, reads_level: bool
+    ):
+        """UTM32 into UTM33 near 60N turns the grid about 5 degrees. An 18.5 m
+        pixel reaches 20.1 m along each source axis, and picked by that reach
+        the read took the 20 m level and resampled it up."""
+        x0, y0 = 690000.0, 6700000.0
+        gt = make_mock_geotiff(400, 400, 10.0, 1, origin_x=x0, origin_y=y0)
+        level = make_mock_geotiff(200, 200, 20.0, 1, origin_x=x0, origin_y=y0)
+        gt.overviews = [level]
+        gt.read = AsyncMock(side_effect=slicing_read(gt, np.zeros((1, 400, 400))))
+        level.read = AsyncMock(side_effect=slicing_read(level, np.zeros((1, 200, 200))))
+        ds = AsyncGeoTIFF("s3://b/k.tif", gt)
+
+        cx, cy = Transformer.from_crs(32632, 32633, always_xy=True).transform(
+            692000, 6698000
+        )
+        await ds.read(
+            bbox=(cx - 500, cy - 500, cx + 500, cy + 500),
+            bbox_crs=32633,
+            target_crs=32633,
+            target_resolution=target,
+            use_overviews=True,
+            resampling="bilinear",
+        )
+        assert level.read.called is reads_level
+        assert gt.read.called is not reads_level
 
 
 # ── read: output grid is a pure function of the arguments ───────────────
@@ -1051,6 +1143,47 @@ class TestOutputLabels:
 
 
 # ── Coverage on the output ──────────────────────────────────────────────
+
+
+class TestWarpOffTheLoop:
+    """The warp is CPU-bound and runs for seconds on a large read. On the event
+    loop it stalled every other task that long; a 4000x4000 cubic reproject
+    held the loop for 2.7 s."""
+
+    async def test_the_loop_runs_while_the_warp_does(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        import threading
+
+        import rastera.reader
+
+        gt = make_mock_geotiff(width=20, height=20, scale=1.0, count=1)
+        gt.read = slicing_read(gt, np.ones((1, 20, 20), dtype=np.uint16))
+        ds = AsyncGeoTIFF("s3://b/k.tif", gt)
+
+        started, released = threading.Event(), threading.Event()
+        seen: dict[str, Any] = {}
+        real = rastera.reader._resample_impl
+
+        def warp(*args: Any, **kwargs: Any) -> Any:
+            seen["thread"] = threading.get_ident()
+            started.set()
+            # Released by a coroutine, which runs only if the loop is free.
+            seen["loop_ran"] = released.wait(timeout=2)
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(rastera.reader, "_resample_impl", warp)
+        read = asyncio.ensure_future(
+            ds.read(bbox=BBox(0, 0, 20, 20), bbox_crs=32632, target_resolution=0.5)
+        )
+        while not started.is_set() and not read.done():
+            await asyncio.sleep(0.001)
+        released.set()
+        arr = await read
+
+        assert seen["loop_ran"]
+        assert seen["thread"] != threading.get_ident()
+        assert arr.data.shape == (1, 40, 40)  # type: ignore[reportUnknownMemberType]
 
 
 class TestSouthUp:
