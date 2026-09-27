@@ -1,5 +1,6 @@
 """Unit tests for build_index, open_from_index, and HeaderCacheStore."""
 
+import asyncio
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -247,6 +248,64 @@ class TestBuildIndex:
         assert maxx > minx
         assert maxy > miny
 
+    @patch("rastera.index._build_obstore")
+    @patch("rastera.index.AsyncGeoTIFF.open", new_callable=AsyncMock)
+    @patch("rastera.index.obstore.get_range_async", new_callable=AsyncMock)
+    async def test_lets_go_of_the_headers_once_opened(
+        self, mock_get_range: Any, mock_open: Any, mock_build_obs: Any
+    ) -> None:
+        """Each header the reader's LRU caches keeps the store it was opened
+        through, and that store held every row's header bytes."""
+        mock_build_obs.return_value = MagicMock()
+        mock_get_range.return_value = b"\x00" * 100
+        mock_open.return_value = _make_mock_async_geotiff()
+
+        await build_index(["s3://bucket/a.tif", "s3://bucket/b.tif"])
+
+        store = mock_open.call_args.kwargs["store"]
+        assert isinstance(store, HeaderCacheStore)
+        assert store._cache == {}
+
+    @patch("rastera.index._build_obstore")
+    @patch("rastera.index.AsyncGeoTIFF.open", new_callable=AsyncMock)
+    @patch("rastera.index.obstore.get_range_async", new_callable=AsyncMock)
+    async def test_a_failed_local_open_blames_the_file(
+        self, mock_get_range: Any, mock_open: Any, mock_build_obs: Any, tmp_path: Any
+    ) -> None:
+        """Local files index fine, so the hint that they are not supported sent
+        the caller off to upload a file that was only broken."""
+        mock_build_obs.return_value = MagicMock()
+        mock_get_range.return_value = b"not a tiff"
+        mock_open.side_effect = ValueError("unexpected magic bytes")
+        uri = str(tmp_path / "bad.tif")
+
+        with pytest.raises(RuntimeError) as err:
+            await build_index([uri])
+        assert str(err.value) == f"Failed to index {uri!r}"
+
+    @patch("rastera.index._build_obstore")
+    @patch("rastera.index.obstore.get_range_async", new_callable=AsyncMock)
+    async def test_a_failed_header_fetch_names_the_uri(
+        self, mock_get_range: Any, mock_build_obs: Any
+    ) -> None:
+        mock_build_obs.return_value = MagicMock()
+        mock_get_range.side_effect = FileNotFoundError("tiles/missing.tif")
+
+        with pytest.raises(RuntimeError, match="Failed to index 's3://b/tiles/m"):
+            await build_index(["s3://b/tiles/missing.tif"])
+
+    async def test_concurrency_below_one_raises(self) -> None:
+        """asyncio.Semaphore(0) lets nothing through, so the call hung."""
+        gdf = _make_index_gdf(
+            [{"uri": "s3://b/a.tif", "minx": 0, "miny": 0, "maxx": 1, "maxy": 1}]
+        )
+        for call in (
+            lambda: build_index(["s3://b/a.tif"], concurrency=0),
+            lambda: open_from_index(gdf, concurrency=0),
+        ):
+            with pytest.raises(ValueError, match="concurrency"):
+                await asyncio.wait_for(call(), timeout=5)
+
     async def test_cross_bucket_raises(self) -> None:
         with pytest.raises(ValueError, match="same bucket/host"):
             await build_index(["s3://bucket-a/key.tif", "s3://bucket-b/key.tif"])
@@ -427,6 +486,29 @@ class TestOpenFromIndex:
 
         assert mock_open.call_args.kwargs["cache"] is not local
 
+    @patch("rastera.index._build_obstore")
+    @patch("rastera.index.AsyncGeoTIFF.open", new_callable=AsyncMock)
+    @patch("rastera.index.get_cached_geotiff", return_value=None)
+    async def test_lets_go_of_the_headers_once_opened(
+        self, mock_cache: Any, mock_open: Any, mock_build_obs: Any
+    ) -> None:
+        """Every row's header bytes stayed alive as long as any one opened
+        header did in the reader's LRU: GBs for a large index."""
+        mock_build_obs.return_value = MagicMock()
+        mock_open.return_value = MagicMock(spec=AsyncGeoTIFF)
+        gdf = _make_index_gdf(
+            [
+                {"uri": "s3://b/a.tif", "minx": 0, "miny": 0, "maxx": 1, "maxy": 1},
+                {"uri": "s3://b/b.tif", "minx": 1, "miny": 0, "maxx": 2, "maxy": 1},
+            ]
+        )
+
+        await open_from_index(gdf)
+
+        store = mock_open.call_args.kwargs["store"]
+        assert isinstance(store, HeaderCacheStore)
+        assert store._cache == {}
+
     async def test_cross_bucket_raises(self) -> None:
         """Mirrored buckets sharing a key path would collapse in the header
         cache, serving one file's header for the other's URI."""
@@ -572,17 +654,20 @@ class TestReadGeoparquet:
         test in this file hands ``open_from_index`` a frame directly."""
         path = str(tmp_path / "index.parquet")
         self._write(path)
+        # Recorded during the open: the headers are let go of once it is done.
+        cached: dict[str, bytes] = {}
+
+        async def fake_open(uri: str, *, store: Any, **_: Any) -> Any:
+            cached.update(store._cache)
+            return MagicMock(spec=AsyncGeoTIFF)
+
         with (
             patch("rastera.index._build_obstore", return_value=MagicMock()),
             patch("rastera.index.get_cached_geotiff", return_value=None),
-            patch(
-                "rastera.index.AsyncGeoTIFF.open",
-                new=AsyncMock(return_value=MagicMock(spec=AsyncGeoTIFF)),
-            ) as mock_open,
+            patch("rastera.index.AsyncGeoTIFF.open", new=fake_open),
         ):
             result = await open_from_index(path, bbox=(99, -1, 102, 2), bbox_crs=4326)
         assert len(result) == 2
-        cached = mock_open.await_args_list[0].kwargs["store"]._cache
         assert cached == {"1.tif": bytes([1]) * 64, "3.tif": bytes([3]) * 64}
 
 

@@ -70,6 +70,7 @@ async def build_index(
         ValueError: If *uris* span more than one bucket/host. Index each
             bucket separately and concatenate the frames.
     """
+    _check_concurrency(concurrency)
     uris = list(uris)
     if not uris:
         return _empty_geodataframe()
@@ -84,8 +85,11 @@ async def build_index(
     async def _fetch_header(uri: str) -> tuple[str, str, bytes]:
         async with sem:
             key = _extract_key(uri)
-            hdr = bytes(await obstore.get_range_async(obs, key, start=0, end=prefetch))
-            return uri, key, hdr
+            try:
+                hdr = await obstore.get_range_async(obs, key, start=0, end=prefetch)
+            except Exception as exc:
+                raise RuntimeError(f"Failed to index {uri!r}") from exc
+            return uri, key, bytes(hdr)
 
     fetched = await asyncio.gather(*(_fetch_header(u) for u in uris))
     cache = {key: hdr for _, key, hdr in fetched}
@@ -102,12 +106,10 @@ async def build_index(
                 )
                 return src, hdr
             except Exception as exc:
-                hint = ""
-                if _resolve_local_path(uri) is not None:
-                    hint = " (local files are not supported, use remote URIs)"
-                raise RuntimeError(f"Failed to index {uri!r}{hint}") from exc
+                raise RuntimeError(f"Failed to index {uri!r}") from exc
 
     results = await asyncio.gather(*(_open_one(u, hdr) for u, _, hdr in fetched))
+    cache.clear()  # see open_from_index
 
     rows: dict[str, list[Any]] = {c: [] for c in _INDEX_COLUMNS}
     geometries: list[Any] = []
@@ -166,6 +168,7 @@ async def open_from_index(
         ValueError: If the selected rows span more than one bucket/host.
             Narrow the selection with *bbox* or open each bucket separately.
     """
+    _check_concurrency(concurrency)
     if isinstance(gdf_or_path, str):
         gdf = _read_geoparquet(gdf_or_path, bbox=bbox, bbox_crs=bbox_crs)
     else:
@@ -208,7 +211,12 @@ async def open_from_index(
                 cache=_resolve_local_path(uri) is None,
             )
 
-    return list(await asyncio.gather(*(_open_one(u) for u in uris)))
+    opened = list(await asyncio.gather(*(_open_one(u) for u in uris)))
+    # Parsed now, and later reads fall through to the inner store. Left in
+    # place, every header the reader's LRU keeps held this store, and with it
+    # every row's bytes: about 3 GB for 100k rows at the default prefetch.
+    cache.clear()
+    return opened
 
 
 class HeaderCacheStore:
@@ -385,6 +393,16 @@ def _filter_gdf(
     result = gdf[gdf.intersects(query_geom)]
     assert isinstance(result, gpd.GeoDataFrame)
     return result
+
+
+def _check_concurrency(concurrency: int) -> None:
+    # asyncio.Semaphore(0) lets nothing through, so the call hung.
+    if (
+        not isinstance(concurrency, int)
+        or isinstance(concurrency, bool)
+        or concurrency < 1
+    ):
+        raise ValueError(f"concurrency must be int >= 1, got {concurrency!r}")
 
 
 def _build_obstore(uri: str, **store_kwargs: Any) -> Any:
