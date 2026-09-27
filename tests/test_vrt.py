@@ -29,25 +29,25 @@ from tests.conftest import make_mock_geotiff, make_raster_array
 RGBNIR_VRT = b"""<VRTDataset rasterXSize="10000" rasterYSize="10000">
   <SRS>EPSG:3006</SRS>
   <GeoTransform>637500.0, 0.25, 0.0, 6557500.0, 0.0, -0.25</GeoTransform>
-  <VRTRasterBand dataType="Byte" band="1">
+  <VRTRasterBand dataType="UInt16" band="1">
     <SimpleSource>
       <SourceFilename>/vsis3/bucket/rgb.tif</SourceFilename>
       <SourceBand>1</SourceBand>
     </SimpleSource>
   </VRTRasterBand>
-  <VRTRasterBand dataType="Byte" band="2">
+  <VRTRasterBand dataType="UInt16" band="2">
     <SimpleSource>
       <SourceFilename>/vsis3/bucket/rgb.tif</SourceFilename>
       <SourceBand>2</SourceBand>
     </SimpleSource>
   </VRTRasterBand>
-  <VRTRasterBand dataType="Byte" band="3">
+  <VRTRasterBand dataType="UInt16" band="3">
     <SimpleSource>
       <SourceFilename>/vsis3/bucket/rgb.tif</SourceFilename>
       <SourceBand>3</SourceBand>
     </SimpleSource>
   </VRTRasterBand>
-  <VRTRasterBand dataType="Byte" band="4">
+  <VRTRasterBand dataType="UInt16" band="4">
     <SimpleSource>
       <SourceFilename>/vsis3/bucket/nir.tif</SourceFilename>
       <SourceBand>1</SourceBand>
@@ -65,9 +65,21 @@ RGBNIR_VRT = b"""<VRTDataset rasterXSize="10000" rasterYSize="10000">
 class _Dims(TypedDict):
     width: int
     height: int
+    scale: float
+    origin_x: float
+    origin_y: float
 
 
-_RGBNIR_DIMS: _Dims = {"width": 10000, "height": 10000}
+# On RGBNIR_VRT's <GeoTransform> too, which _validate_source_windows also checks.
+_RGBNIR_GEOTRANSFORM = b"637500.0, 0.25, 0.0, 6557500.0, 0.0, -0.25"
+_PNEO_GEOTRANSFORM = b"369516.0, 0.3, 0.0, 6447186.0, 0.0, -0.3"
+_RGBNIR_DIMS: _Dims = {
+    "width": 10000,
+    "height": 10000,
+    "scale": 0.25,
+    "origin_x": 637500.0,
+    "origin_y": 6557500.0,
+}
 
 
 def _read_result(
@@ -103,14 +115,14 @@ class TestParseVRTXML:
 
     def test_missing_source_filename_raises(self):
         xml = b"""<VRTDataset rasterXSize="1" rasterYSize="1">
-          <VRTRasterBand band="1"><SimpleSource><SourceBand>1</SourceBand></SimpleSource></VRTRasterBand>
+          <VRTRasterBand dataType="UInt16" band="1"><SimpleSource><SourceBand>1</SourceBand></SimpleSource></VRTRasterBand>
         </VRTDataset>"""
         with pytest.raises(ValueError, match="SourceFilename"):
             _parse_vrt_xml(xml, "s3://b/x.vrt")
 
     def test_missing_source_band_defaults_to_one(self):
         xml = b"""<VRTDataset rasterXSize="1" rasterYSize="1">
-          <VRTRasterBand band="1"><SimpleSource>
+          <VRTRasterBand dataType="UInt16" band="1"><SimpleSource>
             <SourceFilename>/vsis3/b/a.tif</SourceFilename>
           </SimpleSource></VRTRasterBand>
         </VRTDataset>"""
@@ -120,7 +132,7 @@ class TestParseVRTXML:
 
     def test_kernel_filtered_source_rejected(self):
         xml = b"""<VRTDataset rasterXSize="1" rasterYSize="1">
-          <VRTRasterBand band="1"><KernelFilteredSource>
+          <VRTRasterBand dataType="UInt16" band="1"><KernelFilteredSource>
             <SourceFilename>/vsis3/b/a.tif</SourceFilename><SourceBand>1</SourceBand>
           </KernelFilteredSource></VRTRasterBand>
         </VRTDataset>"""
@@ -129,7 +141,7 @@ class TestParseVRTXML:
 
     def test_multi_source_band_rejected(self):
         xml = b"""<VRTDataset rasterXSize="1" rasterYSize="1">
-          <VRTRasterBand band="1">
+          <VRTRasterBand dataType="UInt16" band="1">
             <SimpleSource>
               <SourceFilename>/vsis3/b/a.tif</SourceFilename><SourceBand>1</SourceBand>
             </SimpleSource>
@@ -165,7 +177,7 @@ def _one_band_vrt(
     """
     return (
         f'<VRTDataset rasterXSize="{size}" rasterYSize="{size}" {root_attrs}>'
-        f'<VRTRasterBand band="1" {band_attrs}>{band_inner}<{source_tag}>'
+        f'<VRTRasterBand dataType="UInt16" band="1" {band_attrs}>{band_inner}<{source_tag}>'
         f"<SourceFilename>/vsis3/b/a.tif</SourceFilename><SourceBand>1</SourceBand>"
         f"{inner}"
         f"</{source_tag}></VRTRasterBand></VRTDataset>"
@@ -205,6 +217,7 @@ class TestRejectUnsupportedSource:
                 src_rect_size=(100.0, 100.0),
                 dst_rect_size=(100.0, 100.0),
                 vrt_declared_size=(100.0, 100.0),
+                data_type="UInt16",
             )
         ]
 
@@ -262,6 +275,7 @@ class TestComplexSourceAndNodata:
                 source_uri="s3://b/a.tif",
                 source_band=1,
                 vrt_declared_size=(100.0, 100.0),
+                data_type="UInt16",
             )
         ]
 
@@ -525,12 +539,12 @@ class TestDeclaredNodata:
         """A mix is not a suppression claim — the un-hidden band still declares
         a value, and `_declared_nodata` picks it up as usual."""
         xml = RGBNIR_VRT.replace(
-            b'<VRTRasterBand dataType="Byte" band="1">',
-            b'<VRTRasterBand dataType="Byte" band="1">'
+            b'<VRTRasterBand dataType="UInt16" band="1">',
+            b'<VRTRasterBand dataType="UInt16" band="1">'
             b"<NoDataValue>0</NoDataValue><HideNoDataValue>1</HideNoDataValue>",
         ).replace(
-            b'<VRTRasterBand dataType="Byte" band="4">',
-            b'<VRTRasterBand dataType="Byte" band="4"><NoDataValue>0</NoDataValue>',
+            b'<VRTRasterBand dataType="UInt16" band="4">',
+            b'<VRTRasterBand dataType="UInt16" band="4"><NoDataValue>0</NoDataValue>',
         )
         bands = _parse_vrt_xml(xml, "s3://bucket/x.vrt")
         assert isinstance(bands, list)
@@ -634,8 +648,8 @@ class TestDeclaredNodata:
         """A band with no <NoDataValue> is not a claim of "no nodata" — GDAL
         reports the dataset value off band 1 regardless."""
         xml = RGBNIR_VRT.replace(
-            b'<VRTRasterBand dataType="Byte" band="1">',
-            b'<VRTRasterBand dataType="Byte" band="1"><NoDataValue>0</NoDataValue>',
+            b'<VRTRasterBand dataType="UInt16" band="1">',
+            b'<VRTRasterBand dataType="UInt16" band="1"><NoDataValue>0</NoDataValue>',
         )
         gt = make_mock_geotiff(count=3, **_RGBNIR_DIMS)
 
@@ -655,11 +669,11 @@ class TestDeclaredNodata:
         """rastera carries one nodata per dataset, so two different declared
         values cannot both be honoured."""
         xml = RGBNIR_VRT.replace(
-            b'<VRTRasterBand dataType="Byte" band="1">',
-            b'<VRTRasterBand dataType="Byte" band="1"><NoDataValue>0</NoDataValue>',
+            b'<VRTRasterBand dataType="UInt16" band="1">',
+            b'<VRTRasterBand dataType="UInt16" band="1"><NoDataValue>0</NoDataValue>',
         ).replace(
-            b'<VRTRasterBand dataType="Byte" band="4">',
-            b'<VRTRasterBand dataType="Byte" band="4"><NoDataValue>255</NoDataValue>',
+            b'<VRTRasterBand dataType="UInt16" band="4">',
+            b'<VRTRasterBand dataType="UInt16" band="4"><NoDataValue>255</NoDataValue>',
         )
         # Rejected at parse time, before any source header is fetched.
         with pytest.raises(NotImplementedError, match="differing <NoDataValue>"):
@@ -692,11 +706,11 @@ class TestDeclaredNodata:
 
     def test_nan_mixed_with_value_rejected(self):
         xml = RGBNIR_VRT.replace(
-            b'<VRTRasterBand dataType="Byte" band="1">',
-            b'<VRTRasterBand dataType="Byte" band="1"><NoDataValue>nan</NoDataValue>',
+            b'<VRTRasterBand dataType="UInt16" band="1">',
+            b'<VRTRasterBand dataType="UInt16" band="1"><NoDataValue>nan</NoDataValue>',
         ).replace(
-            b'<VRTRasterBand dataType="Byte" band="4">',
-            b'<VRTRasterBand dataType="Byte" band="4"><NoDataValue>0</NoDataValue>',
+            b'<VRTRasterBand dataType="UInt16" band="4">',
+            b'<VRTRasterBand dataType="UInt16" band="4"><NoDataValue>0</NoDataValue>',
         )
         with pytest.raises(NotImplementedError, match="both NaN"):
             _parse_vrt_xml(xml, "s3://bucket/x.vrt")
@@ -886,11 +900,12 @@ class TestOpenVRT:
         vrt_with_xml_source = (
             RGBNIR_VRT.replace(b"/vsis3/bucket/rgb.tif", b"/vsis3/bucket/DIM_PNEO.XML")
             .replace(b"/vsis3/bucket/nir.tif", b"/vsis3/bucket/DIM_PNEO.XML")
-            # Declared size must match the PNEO fixture's real dimensions.
+            # Declared size and geotransform must match the PNEO fixture's.
             .replace(
                 b'rasterXSize="10000" rasterYSize="10000"',
                 b'rasterXSize="800" rasterYSize="1000"',
             )
+            .replace(_RGBNIR_GEOTRANSFORM, _PNEO_GEOTRANSFORM)
         )
 
         from tests.formats.test_dimap import _patch_sniff
@@ -930,6 +945,7 @@ class TestOpenVRT:
                 b'rasterXSize="10000" rasterYSize="10000"',
                 b'rasterXSize="800" rasterYSize="1000"',
             )
+            .replace(_RGBNIR_GEOTRANSFORM, _PNEO_GEOTRANSFORM)
             .replace(b"<SimpleSource>", b"<NoDataValue>0</NoDataValue><SimpleSource>")
         )
         with (
@@ -1052,7 +1068,7 @@ class TestValidateSourceWindows:
     async def _open_rgbnir(nir_kwargs: dict[str, Any]):
         """Open RGBNIR_VRT where nir.tif differs from rgb.tif by *nir_kwargs*."""
         # RGBNIR_VRT's canvas
-        base: dict[str, Any] = dict(count=3, width=10000, height=10000)
+        base: dict[str, Any] = dict(count=3, **_RGBNIR_DIMS)
         nir: dict[str, Any] = {**base, "count": 1, **nir_kwargs}
         gt_rgb = make_mock_geotiff(**base)
         gt_nir = make_mock_geotiff(**nir)
@@ -1090,6 +1106,71 @@ class TestValidateSourceWindows:
         assert isinstance(ds, _VRTDataset)
 
 
+class TestDeclaredGridAndType:
+    """A VRT can say its source sits elsewhere, or holds another type:
+    gdal_translate -of VRT -a_ullr / -a_gt, or -ot. GDAL then moves or converts
+    the pixels; reading the source as is returned them at the wrong place, or
+    unconverted."""
+
+    @staticmethod
+    async def _open(xml: bytes) -> AsyncGeoTIFF:
+        async def fake_open(uri: str, **_: Any) -> AsyncGeoTIFF:
+            count = 3 if "rgb" in uri else 1
+            return AsyncGeoTIFF(uri, make_mock_geotiff(count=count, **_RGBNIR_DIMS))
+
+        with (
+            patch(
+                "rastera.vrt._fetch_descriptor_bytes", new=AsyncMock(return_value=xml)
+            ),
+            patch.object(AsyncGeoTIFF, "open", side_effect=fake_open),
+        ):
+            return await _open_vrt("s3://bucket/v.vrt")
+
+    async def test_a_geotransform_moving_the_source_is_rejected(self):
+        moved = RGBNIR_VRT.replace(
+            _RGBNIR_GEOTRANSFORM, b"737500.0, 0.25, 0.0, 6557500.0, 0.0, -0.25"
+        )
+        with pytest.raises(NotImplementedError, match="georeferences its source"):
+            await self._open(moved)
+
+    async def test_a_geotransform_written_differently_passes(self):
+        # How GDAL itself writes one: padded, in exponent notation.
+        spelled = RGBNIR_VRT.replace(
+            _RGBNIR_GEOTRANSFORM,
+            b"  6.3750000000000000e+05,  2.5000000000000000e-01,  0.0e+00,"
+            b"  6.5575000000000000e+06,  0.0e+00, -2.5000000000000000e-01",
+        )
+        assert isinstance(await self._open(spelled), _VRTDataset)
+
+    async def test_a_narrower_data_type_is_rejected(self):
+        byte = RGBNIR_VRT.replace(
+            b'<VRTRasterBand dataType="UInt16" band="4">',
+            b'<VRTRasterBand dataType="Byte" band="4">',
+        )
+        with pytest.raises(
+            NotImplementedError, match="band 4 declares dataType='Byte'"
+        ):
+            await self._open(byte)
+
+    async def test_an_omitted_data_type_is_byte(self):
+        omitted = RGBNIR_VRT.replace(
+            b'<VRTRasterBand dataType="UInt16" band="1">', b'<VRTRasterBand band="1">'
+        )
+        with pytest.raises(
+            NotImplementedError, match="band 1 declares dataType='Byte'"
+        ):
+            await self._open(omitted)
+
+    async def test_a_data_type_is_matched_whatever_its_case(self):
+        lower = RGBNIR_VRT.replace(b'dataType="UInt16"', b'dataType="uint16"')
+        assert isinstance(await self._open(lower), _VRTDataset)
+
+    def test_a_malformed_geotransform_raises(self):
+        broken = RGBNIR_VRT.replace(_RGBNIR_GEOTRANSFORM, b"637500.0, 0.25, 0.0")
+        with pytest.raises(ValueError, match="3 coefficients"):
+            _parse_vrt_xml(broken, "s3://bucket/v.vrt")
+
+
 class TestTransformsMatch:
     UTM = Affine(10.0, 0.0, 399960.0, 0.0, -10.0, 5900040.0)
 
@@ -1121,7 +1202,7 @@ class TestVRTCycle:
         RecursionError, issuing a network GET per level."""
         xml = (
             b'<VRTDataset rasterXSize="100" rasterYSize="100">'
-            b'<VRTRasterBand band="1"><SimpleSource>'
+            b'<VRTRasterBand dataType="UInt16" band="1"><SimpleSource>'
             b"<SourceFilename>/vsis3/bucket/self.vrt</SourceFilename>"
             b"<SourceBand>1</SourceBand>"
             b"</SimpleSource></VRTRasterBand></VRTDataset>"

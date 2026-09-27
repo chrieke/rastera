@@ -4,9 +4,11 @@ Two flavours are supported:
 
 - *Band-stack* VRTs: each ``<VRTRasterBand>`` is driven by a single
   ``<SimpleSource>`` or ``<ComplexSource>`` naming a source file and band. All
-  sources are assumed to describe the same spatial image, so the VRT's own
-  geotransform, SRS, and raster size are ignored in favour of the first
-  source's metadata.
+  sources are assumed to describe the same spatial image, so pixels are read
+  on the first source's grid and labelled with its SRS. The VRT's own raster
+  size, geotransform and band ``dataType`` must agree with the sources; its
+  SRS is not compared. An omitted ``<GeoTransform>`` or ``<SRS>`` is taken
+  from the first source, where GDAL would leave the VRT ungeoreferenced.
 
   That "same spatial image" assumption is load-bearing, so anything in the XML
   contradicting it is *rejected* rather than ignored — a silently wrong pixel
@@ -52,10 +54,11 @@ from .store import _check_source_uri, _fetch_descriptor_bytes, _join_relative_ur
 class _VRTBand:
     """One output band of a band-stack VRT.
 
-    The rect sizes and ``vrt_declared_size`` exist only to be re-checked
-    against the real source dimensions once the sources are open (see
-    ``_validate_source_windows``); they are never used to transform pixels.
-    ``vrt_declared_size`` is stamped identically on every band.
+    The rect sizes, ``vrt_declared_size``, ``vrt_geotransform`` and
+    ``data_type`` exist only to be re-checked against the real sources once
+    they are open (see ``_validate_source_windows``); they are never used to
+    transform pixels. The two ``vrt_`` fields are stamped identically on every
+    band.
     """
 
     source_uri: str
@@ -68,6 +71,10 @@ class _VRTBand:
     dst_rect_size: tuple[float, float] | None = None
     # The VRT root's declared (rasterXSize, rasterYSize), or None if omitted.
     vrt_declared_size: tuple[float, float] | None = None
+    # The VRT root's <GeoTransform>, or None if omitted.
+    vrt_geotransform: Affine | None = None
+    # The band's dataType attribute; GDAL reads an omitted one as Byte.
+    data_type: str = "Byte"
     # The band's own <NoDataValue>, or None when it declares none. Unlike the
     # rest of the VRT's metadata this is *honoured* — see _declared_nodata.
     nodata: float | None = None
@@ -491,6 +498,7 @@ def _parse_vrt_xml(
         )
 
     declared_size = _declared_raster_size(root)
+    declared_transform = _declared_geotransform(root)
 
     source_tags = {
         "SimpleSource",
@@ -531,6 +539,8 @@ def _parse_vrt_xml(
                 src_rect_size=src_rect_size,
                 dst_rect_size=dst_rect_size,
                 vrt_declared_size=declared_size,
+                vrt_geotransform=declared_transform,
+                data_type=vrt_band.attrib.get("dataType", "Byte"),
                 nodata=band_nodata,
                 hide_nodata=_hides_nodata(vrt_band),
             )
@@ -607,6 +617,22 @@ def _declared_raster_size(root: ET.Element) -> tuple[float, float] | None:
         return float(x), float(y)
     except ValueError as e:
         raise ValueError(f"VRT has malformed rasterXSize/rasterYSize: {e}") from e
+
+
+def _declared_geotransform(root: ET.Element) -> Affine | None:
+    """The VRT's declared ``<GeoTransform>``, or None if absent."""
+    el = root.find("GeoTransform")
+    if el is None or not (el.text or "").strip():
+        return None
+    try:
+        coeffs = [float(v) for v in (el.text or "").split(",")]
+    except ValueError as e:
+        raise ValueError(f"VRT has a malformed <GeoTransform>: {e}") from e
+    if len(coeffs) != 6:
+        raise ValueError(
+            f"VRT <GeoTransform> has {len(coeffs)} coefficients; expected 6"
+        )
+    return Affine.from_gdal(*coeffs)
 
 
 def _rect(parent: ET.Element, tag: str) -> tuple[float, float, float, float] | None:
@@ -956,6 +982,16 @@ def _validate_source_windows(
                 f"{reference._geotiff.transform!r}; band-stack VRTs must "
                 f"reference sources covering the same extent."
             )
+        # GDAL looks the name up case-insensitively.
+        declared_dtype = _GDAL_DTYPES.get(band.data_type.casefold())
+        if declared_dtype != src._geotiff.dtype:
+            # GDAL converts to the declared type, clamping or rounding: a Byte
+            # VRT over UInt16 reads 999 as 255. An omitted dataType is Byte.
+            raise NotImplementedError(
+                f"VRT band {i} declares dataType={band.data_type!r} but its "
+                f"source {band.source_uri!r} is {src._geotiff.dtype}; converting "
+                f"a source to another type is not supported. {_GDAL_HINT}"
+            )
         if band.src_rect_size is not None and band.src_rect_size != src_dims:
             raise NotImplementedError(
                 f"VRT band {i} has a <SrcRect> of "
@@ -976,6 +1012,18 @@ def _validate_source_windows(
                 f"supported. Pass target_resolution to read() instead."
             )
 
+    # A VRT that places its source elsewhere — gdal_translate -of VRT -a_ullr or
+    # -a_gt — would otherwise be read at the source's location.
+    declared_gt = bands[0].vrt_geotransform
+    if declared_gt is not None and not _transforms_match(
+        declared_gt, reference._geotiff.transform
+    ):
+        raise NotImplementedError(
+            f"VRT declares geotransform {declared_gt.to_gdal()} but its source "
+            f"{ref_uri!r} has {reference._geotiff.transform.to_gdal()}; a VRT "
+            f"that georeferences its source anew is not supported. {_GDAL_HINT}"
+        )
+
     declared = bands[0].vrt_declared_size
     if declared is not None and declared != ref_dims:
         raise NotImplementedError(
@@ -986,6 +1034,24 @@ def _validate_source_windows(
             f"GDAL/rasterio for this VRT."
         )
 
+
+# GDAL band type names, as a VRT's dataType attribute spells them, casefolded
+# for the lookup.
+_GDAL_DTYPES = {
+    "byte": np.dtype("uint8"),
+    "int8": np.dtype("int8"),
+    "uint16": np.dtype("uint16"),
+    "int16": np.dtype("int16"),
+    "uint32": np.dtype("uint32"),
+    "int32": np.dtype("int32"),
+    "uint64": np.dtype("uint64"),
+    "int64": np.dtype("int64"),
+    "float16": np.dtype("float16"),
+    "float32": np.dtype("float32"),
+    "float64": np.dtype("float64"),
+    "cfloat32": np.dtype("complex64"),
+    "cfloat64": np.dtype("complex128"),
+}
 
 _VSI_SCHEMES = {"vsis3": "s3", "vsigs": "gs", "vsiaz": "az"}
 
