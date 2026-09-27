@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
+from typing import Protocol
 
 import numpy as np
 from affine import Affine
@@ -365,3 +366,38 @@ def _normalize_crs(crs: int | CRS) -> int:
             f"CRS {crs.name!r} has no EPSG code; pass an integer EPSG code instead."
         )
     return epsg
+
+
+class _Grid(Protocol):
+    @property
+    def transform(self) -> Affine: ...
+    @property
+    def width(self) -> int: ...
+    @property
+    def height(self) -> int: ...
+
+
+def _grid_bounds(grid: _Grid) -> BBox:
+    """The extent of a header's pixel grid.
+
+    Not ``BBox(*grid.bounds)``: async-geotiff gives an unrotated grid's bounds
+    as its first and last corner, so a south-up one comes back with
+    ``miny > maxy`` and every intersect and clip built on it goes wrong.
+    """
+    return bounds_from_transform(grid.transform, grid.width, grid.height)
+
+
+def _require_north_up(t: Affine) -> None:
+    """Raise unless *t* is north-up, as a ``snap_to_grid=False`` read's anchor
+    assumes; it labelled a south-up or rotated source's pixels somewhere else.
+
+    Rotation terms within float noise of zero count as none: real north-up
+    files carry 1e-16 there.
+    """
+    tol = max(abs(float(t.a)), abs(float(t.e))) * 1e-6
+    if abs(float(t.b)) > tol or abs(float(t.d)) > tol or t.a <= 0 or t.e >= 0:
+        raise NotImplementedError(
+            f"snap_to_grid=False needs a north-up source; this one's "
+            f"geotransform is {t.to_gdal()}. Pass snap_to_grid=True, which "
+            f"keeps the source's own orientation."
+        )

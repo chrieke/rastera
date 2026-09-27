@@ -1018,6 +1018,81 @@ class TestOutputLabels:
 # ── Coverage on the output ──────────────────────────────────────────────
 
 
+class TestSouthUp:
+    """A south-up grid (positive e) is valid, but async-geotiff hands back its
+    bounds as the first and last corner, so ``miny > maxy``. Built on those,
+    read() raised, a resampled read came back one row tall, and merge filled
+    everything with nodata.
+    """
+
+    # 64x48 @10m whose origin is the south edge; rows run northwards.
+    T = Affine(10, 0, 500000, 0, 10, 7000000)
+
+    def _dataset(self) -> tuple[AsyncGeoTIFF, np.ndarray[Any, Any]]:
+        # Constant over 2x2 blocks, so a 20 m read has one right answer per
+        # pixel whichever of a block's rows a nearest tie picks.
+        blocks = np.arange(24 * 32, dtype=np.uint16).reshape(24, 32) + 1
+        full = np.kron(blocks, np.ones((2, 2), dtype=np.uint16))[None]
+        gt = make_mock_geotiff(width=64, height=48, scale=10.0, count=1)
+        gt.transform = self.T
+        gt.bounds = (500000.0, 7000480.0, 500640.0, 7000000.0)  # as async-geotiff
+        gt.res = (10.0, 10.0)
+        gt.read = slicing_read(gt, full)
+        return AsyncGeoTIFF("s3://b/south-up.tif", gt), full
+
+    async def test_bounds_are_normalised(self):
+        ds, _ = self._dataset()
+        assert tuple(ds.profile["bounds"]) == (500000.0, 7000000.0, 500640.0, 7000480.0)
+
+    async def test_a_full_read_keeps_the_grid(self):
+        ds, full = self._dataset()
+        arr = await ds.read()
+        assert arr.transform == self.T
+        np.testing.assert_array_equal(arr.data, full)  # type: ignore[reportUnknownMemberType]
+
+    async def test_a_resampled_read_covers_the_image(self):
+        ds, full = self._dataset()
+        arr = await ds.read(target_resolution=20)
+        data: np.ndarray[Any, Any] = arr.data  # type: ignore[reportUnknownMemberType]
+        assert data.shape == (1, 24, 32)
+        # The output is north-up, so its first row is the source's last.
+        np.testing.assert_array_equal(data[0], np.flipud(full[0, ::2, ::2]))
+
+    async def test_merge_covers_the_image(self):
+        ds, full = self._dataset()
+        arr = await rastera.merge(
+            [ds],
+            bbox=(500000, 7000000, 500640, 7000480),
+            bbox_crs=32632,
+            target_resolution=20,
+        )
+        data: np.ndarray[Any, Any] = arr.data  # type: ignore[reportUnknownMemberType]
+        assert arr.mask is not None and arr.mask.all()
+        np.testing.assert_array_equal(data[0], np.flipud(full[0, ::2, ::2]))
+
+    async def test_rotation_noise_still_counts_as_north_up(self):
+        """Real north-up files carry 1e-16 in the rotation terms; an exact
+        check rejected them."""
+        gt = make_mock_geotiff(width=64, height=48, scale=10.0, count=1)
+        gt.transform = Affine(10, 0, 500000, 1e-16, -10, 7000480)
+        gt.read = slicing_read(gt, np.ones((1, 48, 64), dtype=np.uint16))
+        arr = await AsyncGeoTIFF("s3://b/k.tif", gt).read(
+            bbox=(500105, 7000105, 500305, 7000205), bbox_crs=32632, snap_to_grid=False
+        )
+        assert arr.data.shape == (1, 10, 20)  # type: ignore[reportUnknownMemberType]
+
+    async def test_an_unsnapped_bbox_read_raises(self):
+        """Its transform is built north-up, which labelled every pixel of a
+        south-up source somewhere else."""
+        ds, _ = self._dataset()
+        with pytest.raises(NotImplementedError, match="north-up"):
+            await ds.read(
+                bbox=(500100, 7000100, 500300, 7000200),
+                bbox_crs=32632,
+                snap_to_grid=False,
+            )
+
+
 class TestReadCoverage:
     """A read whose grid runs past the image reports where the image stopped.
 

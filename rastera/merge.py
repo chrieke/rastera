@@ -16,6 +16,7 @@ from .geo import (
     WindowOutOfRangeError,
     _affine_apply,
     _denoise,
+    _grid_bounds,
     _is_on_res_grid,
     _normalize_crs,
     compute_paste_slices,
@@ -199,7 +200,7 @@ async def merge(
 
     sub_bboxes: list[tuple[AsyncGeoTIFF, BBox]] = []
     for cog in cogs:
-        sub_bbox = native_bbox.intersect(BBox(*cog._geotiff.bounds))
+        sub_bbox = native_bbox.intersect(_grid_bounds(cog._geotiff))
         if sub_bbox is not None:
             sub_bboxes.append((cog, sub_bbox))
 
@@ -262,7 +263,7 @@ async def _merge_reprojected(
     for cog in cogs:
         assert cog._crs_epsg is not None
         sub_bbox = target_bbox.intersect(
-            transform_bbox(BBox(*cog._geotiff.bounds), cog._crs_epsg, out_crs)
+            transform_bbox(_grid_bounds(cog._geotiff), cog._crs_epsg, out_crs)
         )
         if sub_bbox is not None:
             contributing.append((cog, sub_bbox))

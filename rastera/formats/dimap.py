@@ -23,7 +23,13 @@ from async_geotiff import RasterArray, Window
 from pyproj import CRS
 
 from .. import config
-from ..geo import BBox, ensure_bbox, window_from_bbox
+from ..geo import (
+    BBox,
+    _grid_bounds,
+    _require_north_up,
+    ensure_bbox,
+    window_from_bbox,
+)
 from ..reader import AsyncGeoTIFF, MetaOverrides, _make_output_array, _source_store
 from ..resampling import ResamplingMethod
 from ..store import _check_source_uri, _fetch_descriptor_bytes, _join_relative_uri
@@ -183,8 +189,10 @@ class _DIMAPDataset(AsyncGeoTIFF):
             )
 
         layout = self._layout
+        if bbox is not None and not snap_to_grid:
+            _require_north_up(layout.transform)  # before any tile read
         if bbox is None and window is None:
-            bbox = BBox(*self._geotiff.bounds)
+            bbox = _grid_bounds(self._geotiff)
         if window is None:
             assert bbox is not None
             window = window_from_bbox(self._geotiff, bbox, snap_to_grid=snap_to_grid)
@@ -250,7 +258,7 @@ class _DIMAPDataset(AsyncGeoTIFF):
             bbox = ensure_bbox(bbox)
             # Clamp to the mosaic: the window was clipped to it, so anchoring
             # on an edge the bbox overhangs would mislabel where the pixels are.
-            img = BBox(*self._geotiff.bounds)
+            img = _grid_bounds(self._geotiff)
             out_transform = Affine(
                 layout.transform.a,
                 0,

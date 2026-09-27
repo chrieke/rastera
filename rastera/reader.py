@@ -16,8 +16,10 @@ from pyproj import CRS, Transformer
 from .geo import (
     BBox,
     WindowOutOfRangeError,
+    _grid_bounds,
     _is_on_res_grid,
     _normalize_crs,
+    _require_north_up,
     bounds_from_transform,
     ensure_bbox,
     normalize_band_indices,
@@ -470,9 +472,9 @@ class AsyncGeoTIFF:
         elif needs_reproject:
             # needs_reproject implies target_crs was given, so out_crs is set.
             assert src_crs is not None and out_crs is not None
-            target_bbox = transform_bbox(BBox(*gt.bounds), src_crs, out_crs)
+            target_bbox = transform_bbox(_grid_bounds(gt), src_crs, out_crs)
         else:
-            target_bbox = BBox(*gt.bounds)
+            target_bbox = _grid_bounds(gt)
 
         # Clip to the dataset, matching the native path (see read()'s docstring
         # for the semantics). The *bbox* and not the grid, so the result stays an
@@ -486,7 +488,7 @@ class AsyncGeoTIFF:
         # source: a global EPSG:4326 extent comes back as x ∈ [500000, 1505647]
         # in UTM32N, rejecting any AOI west of the central meridian.
         if bbox is not None and not needs_reproject:
-            clipped = target_bbox.intersect(BBox(*gt.bounds))
+            clipped = target_bbox.intersect(_grid_bounds(gt))
             if clipped is None:
                 raise WindowOutOfRangeError("BBox does not intersect image")
             target_bbox = clipped
@@ -623,9 +625,11 @@ class AsyncGeoTIFF:
         # pull every pixel in the requested window at the chosen overview
         # level; any further downsampling happens post-fetch in `resample`.
         readable = overview if overview is not None else self._geotiff
+        if bbox is not None and not snap_to_grid:
+            _require_north_up(readable.transform)  # before any I/O
 
         if bbox is None and window is None:
-            bbox = BBox(*readable.bounds)
+            bbox = _grid_bounds(readable)
         if window is None:
             assert bbox is not None
             window = window_from_bbox(readable, bbox, snap_to_grid=snap_to_grid)
@@ -653,7 +657,7 @@ class AsyncGeoTIFF:
         if bbox is not None and not snap_to_grid:
             bbox = ensure_bbox(bbox)
             res_x, res_y = readable.res
-            img = BBox(*readable.bounds)
+            img = _grid_bounds(readable)
             result = dc_replace(
                 result,
                 transform=Affine(
@@ -875,6 +879,8 @@ class _OverviewLike(_Readable, Protocol):
     def res(self) -> tuple[float, float]: ...
     @property
     def bounds(self) -> tuple[float, float, float, float]: ...
+    @property
+    def transform(self) -> Affine: ...
 
 
 class _GeoTIFFLike(Protocol):
