@@ -188,20 +188,25 @@ def window_from_bbox(
     """
     bbox = ensure_bbox(bbox)
     inv = ~meta.transform
-    minx, miny, maxx, maxy = bbox.minx, bbox.miny, bbox.maxx, bbox.maxy
-
-    col_min_f, row_max_f = _affine_apply(inv, minx, maxy)
-    col_max_f, row_min_f = _affine_apply(inv, maxx, miny)
+    # All four corners, as rasterio's from_bounds takes them: on a rotated grid
+    # each one can set an edge of the pixel envelope.
+    corners = [
+        _affine_apply(inv, x, y)
+        for x in (bbox.minx, bbox.maxx)
+        for y in (bbox.miny, bbox.maxy)
+    ]
+    cols = [c for c, _ in corners]
+    rows = [r for _, r in corners]
 
     # The interval is clipped to the image first.  Clamping only the offset
     # (`max(0, floor(lo))`) leaves the span positive for a bbox lying entirely
     # left of or above the image, which yields a plausible window over the wrong
     # pixels.  For a bbox inside the image the clip is a no-op, so the sizing
     # rules below are unaffected.
-    col_lo = max(0.0, min(col_min_f, col_max_f))
-    col_hi = min(float(meta.width), max(col_min_f, col_max_f))
-    row_lo = max(0.0, min(row_min_f, row_max_f))
-    row_hi = min(float(meta.height), max(row_min_f, row_max_f))
+    col_lo = max(0.0, min(cols))
+    col_hi = min(float(meta.width), max(cols))
+    row_lo = max(0.0, min(rows))
+    row_hi = min(float(meta.height), max(rows))
 
     if col_hi <= col_lo or row_hi <= row_lo:
         raise WindowOutOfRangeError("BBox does not intersect image")
