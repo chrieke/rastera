@@ -31,6 +31,7 @@ from .reader import (
     _CrsNodata,
     _grid_for_bbox,
     _make_output_array,
+    _require_epsg,
 )
 from .resampling import ResamplingMethod, validate_resampling
 
@@ -108,6 +109,8 @@ async def merge(
         )
     validate_resampling(resampling)
     validate_resolution(target_resolution)
+    for cog in cogs:
+        _require_epsg(cog)  # every input is placed by its EPSG code
     # Before any read: an unusable sentinel should fail here rather than
     # several frames deep in np.full.
     fill_value, out_nodata = _resolve_output_nodata(nodata, cogs[0])

@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Any, Protocol
 
 import numpy as np
 from affine import Affine
@@ -356,16 +356,22 @@ def _is_on_res_grid(coord: float, res: float, tol: float = 1e-6) -> bool:
     return abs(q - round(q)) < tol
 
 
-def _normalize_crs(crs: int | CRS) -> int:
-    """Convert an EPSG integer or ``pyproj.CRS`` to an EPSG integer."""
-    if isinstance(crs, int):
-        return crs
-    epsg = crs.to_epsg()
-    if epsg is None:
-        raise ValueError(
-            f"CRS {crs.name!r} has no EPSG code; pass an integer EPSG code instead."
-        )
-    return epsg
+def _normalize_crs(crs: int | np.integer[Any] | CRS) -> int:
+    """Convert an EPSG integer or ``pyproj.CRS`` to an EPSG integer.
+
+    A NumPy integer counts, as it does for band indices: an EPSG code taken
+    from a DataFrame, such as the index's ``crs_epsg`` column, is one.
+    """
+    if isinstance(crs, CRS):
+        epsg = crs.to_epsg()
+        if epsg is None:
+            raise ValueError(
+                f"CRS {crs.name!r} has no EPSG code; pass an integer EPSG code instead."
+            )
+        return epsg
+    if isinstance(crs, int | np.integer) and not isinstance(crs, bool):
+        return int(crs)
+    raise ValueError(f"CRS must be an EPSG integer or a pyproj.CRS, got {crs!r}")
 
 
 class _Grid(Protocol):

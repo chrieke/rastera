@@ -184,6 +184,20 @@ class TestMergeArgumentValidation:
         )
         return merge([cog], **{**defaults, **kwargs})  # type: ignore[arg-type]
 
+    async def test_an_input_without_an_epsg_code_names_the_way_out(self):
+        """merge reprojects by each input's EPSG code. Without one it said to
+        pass target_crs, and doing so died on a bare AssertionError."""
+        codeless = _make_cog(width=10, height=10, scale=1.0, bands=1, crs=None)
+        codeless.uri = "s3://bucket/codeless.tif"
+        with pytest.raises(ValueError, match=r"codeless\.tif.*no EPSG code"):
+            await merge(
+                [_make_cog(width=10, height=10, scale=1.0, bands=1), codeless],
+                bbox=BBox(0, 0, 10, 10),
+                bbox_crs=32632,
+                target_crs=32632,
+                target_resolution=1.0,
+            )
+
     @pytest.mark.parametrize("bad", ["fisrt", "min", "MAX", "First"])
     async def test_unknown_mosaic_method_rejected(self, bad: str):
         """Anything that wasn't exactly "first" fell through to last-wins."""

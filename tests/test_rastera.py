@@ -367,6 +367,23 @@ class TestReadArgumentValidation:
         with pytest.raises(ValueError, match="Unknown resampling method"):
             await self._obj().read(resampling="lanczos")  # type: ignore[arg-type]
 
+    @pytest.mark.parametrize(
+        "kwargs",
+        [dict(target_crs=4326), dict(bbox=(0, 0, 8, 8), bbox_crs=32632)],
+        ids=["target_crs", "bbox"],
+    )
+    async def test_a_crs_without_an_epsg_code_names_the_way_out(
+        self, kwargs: dict[str, Any]
+    ):
+        """CRS arguments are EPSG codes, which such a dataset cannot be
+        compared against: a reprojecting read died on a bare AssertionError,
+        and a bbox read asked for a bbox_crs of None."""
+        gt = make_mock_geotiff(width=16, height=16, scale=1.0, count=1, crs_epsg=None)
+        gt.read = AsyncMock(side_effect=AssertionError("read was issued"))
+        obj = AsyncGeoTIFF("s3://b/k.tif", gt)
+        with pytest.raises(ValueError, match=r"no EPSG code.*meta_overrides"):
+            await obj.read(**kwargs)
+
     @pytest.mark.parametrize("res", [None, 1.0, 2.0])
     async def test_oversized_window_rejected_before_any_read(self, res: float | None):
         """Checked with the other arguments rather than inside a branch: the

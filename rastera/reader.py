@@ -319,6 +319,8 @@ class AsyncGeoTIFF:
             bbox_crs = _normalize_crs(bbox_crs)
         if target_crs is not None:
             target_crs = _normalize_crs(target_crs)
+        if bbox_crs is not None or target_crs is not None:
+            _require_epsg(self)
 
         needs_reproject = target_crs is not None and target_crs != self._crs_epsg
         # Both axes: a source with non-square pixels matching *target_resolution*
@@ -1103,6 +1105,17 @@ def _validate_window(gt: _GeoTIFFLike, window: Window) -> None:
             f"cols={window.col_off}:{window.col_off + window.width}, "
             f"rows={window.row_off}:{window.row_off + window.height}. "
             f"Image: {gt.width}x{gt.height}."
+        )
+
+
+def _require_epsg(ds: AsyncGeoTIFF) -> None:
+    """Raise unless *ds* has an EPSG code, which every CRS argument and every
+    reprojection is matched against."""
+    if ds._crs_epsg is None:
+        raise ValueError(
+            f"{ds.uri} has a CRS with no EPSG code, and rastera takes CRSs as "
+            f"EPSG codes. If it is EPSG:N, open it with meta_overrides="
+            f"{{'crs': N}}."
         )
 
 
