@@ -823,6 +823,17 @@ class TestTwoPassReproject:
         extra_nodata = (tp == 0) & (sp != 0)
         assert extra_nodata.mean() < 0.01
 
+    def test_the_default_is_the_single_warp(self):
+        """Two-pass is the opt-in speed mode: it is softer than gdalwarp, and a
+        pixel's value depends on the bbox it was read with."""
+        arr, st, dt, dw, dh, T = self._cross_setup(0.16, 0.5)
+        kw: dict[str, Any] = dict(transformer=T, method="cubic")
+        default = resample(arr, st, dt, dw, dh, **kw)
+        single = resample(arr, st, dt, dw, dh, warp_strategy="single_pass", **kw)
+        two = resample(arr, st, dt, dw, dh, warp_strategy="auto", **kw)
+        assert not np.array_equal(single, two)
+        np.testing.assert_array_equal(default, single)
+
     def test_global_setter_and_validation(self):
         import rastera
         import rastera.config as config

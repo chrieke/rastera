@@ -13,7 +13,7 @@ _dimap_concurrency: int = 1
 # How a cross-CRS warp (bilinear/cubic reprojection) is carried out.  See
 # ``set_warp_strategy`` for semantics.
 WarpStrategy = Literal["auto", "single_pass"]
-_warp_strategy: WarpStrategy = "auto"
+_warp_strategy: WarpStrategy = "single_pass"
 
 
 def set_concurrency(
@@ -76,13 +76,13 @@ def set_warp_strategy(strategy: WarpStrategy) -> None:
     only to bilinear/cubic when reprojecting *and* downsampling — nearest,
     same-CRS resamples, and upsampling are unaffected.
 
-    - ``"auto"`` (default): above a downsample scale of 2.0, downsample in the
-      source CRS first (fast separable path) then reproject the smaller
-      intermediate at near-unit scale: about 2x faster than the single warp
-      for bilinear, 3-5x for cubic. Below that threshold two-pass is
-      break-even-to-slower, so single-pass is used.
-    - ``"single_pass"``: always the single warp, within 0.2 DN RMS of
-      gdalwarp.
+    - ``"single_pass"`` (default): always the single warp, within 0.2 DN RMS
+      of gdalwarp.
+    - ``"auto"``: above a downsample scale of 2.0, downsample in the source
+      CRS first (fast separable path) then reproject the smaller intermediate
+      at near-unit scale: about 2x faster than the single warp for bilinear,
+      3-5x for cubic. Below that threshold two-pass is break-even-to-slower,
+      so single-pass is used.
 
     Two-pass is an approximation. It applies two kernels, on an intermediate
     grid sized from the read window, so its result is softer and depends on

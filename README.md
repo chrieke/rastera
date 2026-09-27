@@ -107,7 +107,7 @@ raster_array = await rastera.merge(
 
 By default the read path runs the *outer* fan-out across `merge` contributors, VRT sources, and DIMAP tiles sequentially — async-geotiff already parallelizes block range requests inside each source, so stacking outer concurrency on top tends to multiply the in-flight HTTP request count without adding throughput on a saturated link. Use `rastera.set_concurrency(merge=N, vrt=N, dimap=N)` to opt into outer fan-out per dispatcher; see the `set_concurrency` docstring for the per-knob trade-offs.
 
-Cross-CRS bilinear/cubic downsampling beyond 2x uses a faster two-pass warp, which is softer than gdalwarp's and depends on the bbox; `rastera.set_warp_strategy("single_pass")` matches gdalwarp at 2-5x the warp time.
+Cross-CRS bilinear/cubic downsampling matches gdalwarp by default. For downsamples beyond 2x, `rastera.set_warp_strategy("auto")` switches to a two-pass warp that runs 2-5x faster but is softer and depends on the bbox.
 
 ### Linting & type checking
 
