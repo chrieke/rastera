@@ -9,8 +9,11 @@ import pytest
 gpd = pytest.importorskip("geopandas")
 box = pytest.importorskip("shapely.geometry").box
 
+from pyproj import CRS, Transformer  # noqa: E402
+
 from rastera.index import (  # noqa: E402
     HeaderCacheStore,
+    _filter_gdf,
     _read_geoparquet,
     build_index,
     open_from_index,
@@ -268,6 +271,118 @@ class TestBuildIndex:
 
 
 # ── open_from_index ──────────────────────────────────────────────────────
+
+
+class TestFootprintEdges:
+    """A projected tile's straight edge is a curve in lon/lat. Reprojecting its
+    four corners alone cut a strip off the footprint, and off a UTM query box:
+    the ~650 m along the north edge of a 110 km tile at 70N.
+    """
+
+    # A 110 km tile in UTM 33N at ~70N, and a lon/lat point 100 m inside the
+    # middle of its north edge — in the strip the corners-only footprint lost.
+    UTM = (399960.0, 7690200.0, 509760.0, 7800000.0)
+    INSIDE_NORTH_EDGE = Transformer.from_crs(32633, 4326, always_xy=True).transform(
+        454860.0, 7800000.0 - 100.0
+    )
+
+    def _near_edge_box(self) -> tuple[float, float, float, float]:
+        x, y = self.INSIDE_NORTH_EDGE
+        return (x - 0.001, y - 0.0003, x + 0.001, y + 0.0003)
+
+    @patch("rastera.index._build_obstore")
+    @patch("rastera.index.AsyncGeoTIFF.open", new_callable=AsyncMock)
+    @patch("rastera.index.obstore.get_range_async", new_callable=AsyncMock)
+    async def test_an_indexed_tile_keeps_its_curved_edge(
+        self, mock_get_range: Any, mock_open: Any, mock_build_obs: Any
+    ) -> None:
+        mock_build_obs.return_value = MagicMock()
+        mock_get_range.return_value = b"\x00" * 100
+        minx, _, _, maxy = self.UTM
+        gt = make_mock_geotiff(
+            width=10980,
+            height=10980,
+            scale=10.0,
+            crs_epsg=32633,
+            origin_x=minx,
+            origin_y=maxy,
+        )
+        mock_open.return_value = AsyncGeoTIFF("s3://bucket/t.tif", gt)
+
+        gdf = await build_index(["s3://bucket/t.tif"])
+
+        assert len(_filter_gdf(gdf, self._near_edge_box(), 4326)) == 1
+
+    def test_a_projected_query_box_keeps_its_curved_edge(self) -> None:
+        minx, miny, maxx, maxy = self._near_edge_box()
+        gdf = _make_index_gdf(
+            [
+                {
+                    "uri": "s3://b/a.tif",
+                    "minx": minx,
+                    "miny": miny,
+                    "maxx": maxx,
+                    "maxy": maxy,
+                }
+            ]
+        )
+        assert len(_filter_gdf(gdf, self.UTM, 32633)) == 1
+
+    @pytest.mark.parametrize(
+        "query",
+        [
+            (454860.0, 7700000.0, 454860.0, 7700000.0),
+            (454000.0, 7700000.0, 456000.0, 7700000.0),
+        ],
+        ids=["point", "zero-height"],
+    )
+    def test_a_degenerate_projected_query_box_still_matches(
+        self, query: tuple[float, float, float, float]
+    ) -> None:
+        """Densifying one raised on a point and emptied a flat box."""
+        x, y = Transformer.from_crs(32633, 4326, always_xy=True).transform(
+            454860.0, 7700000.0
+        )
+        gdf = _make_index_gdf(
+            [
+                {
+                    "uri": "s3://b/a.tif",
+                    "minx": x - 1,
+                    "miny": y - 1,
+                    "maxx": x + 1,
+                    "maxy": y + 1,
+                }
+            ]
+        )
+        assert len(_filter_gdf(gdf, query, 32633)) == 1
+
+    @patch("rastera.index._build_obstore")
+    @patch("rastera.index.AsyncGeoTIFF.open", new_callable=AsyncMock)
+    @patch("rastera.index.obstore.get_range_async", new_callable=AsyncMock)
+    async def test_a_crs_without_an_epsg_code_is_still_reprojected(
+        self, mock_get_range: Any, mock_open: Any, mock_build_obs: Any
+    ) -> None:
+        """Skipped before: native metres were stored as EPSG:4326 degrees."""
+        mock_build_obs.return_value = MagicMock()
+        mock_get_range.return_value = b"\x00" * 100
+        lcc = CRS.from_proj4(
+            "+proj=lcc +lat_0=50 +lon_0=10 +lat_1=45 +lat_2=55 +datum=WGS84 +units=m"
+        )
+        gt = make_mock_geotiff(
+            width=100,
+            height=100,
+            scale=100.0,
+            crs_epsg=None,
+            origin_x=0.0,
+            origin_y=10000.0,
+        )
+        gt.crs = lcc
+        mock_open.return_value = AsyncGeoTIFF("s3://bucket/lcc.tif", gt)
+
+        gdf = await build_index(["s3://bucket/lcc.tif"])
+
+        minx, miny, maxx, maxy = gdf.geometry.iloc[0].bounds  # type: ignore[reportUnknownMemberType]
+        assert 9.9 < minx < maxx < 10.2 and 49.9 < miny < maxy < 50.1
 
 
 class TestOpenFromIndex:
