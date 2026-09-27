@@ -14,9 +14,11 @@ boundary rather than silently ignoring it.
   upsampling/identity, similarly widened when downsampling.
 
 Bilinear and cubic use GDAL-style nodata handling: kernel weights are
-renormalized over valid samples, with a center-pixel nodata gate and (for
-cubic) a per-dimension ≥2-valid safety gate to avoid overshoot from negative
-cubic weights at data/nodata boundaries.  As in gdalwarp, each band is judged
+renormalized over valid samples, with a center-pixel nodata gate.  Cubic adds
+a per-dimension ≥2-valid gate of rastera's own against overshoot from
+negative weights at data/nodata boundaries; where gdalwarp samples cubic 4x4,
+it instead falls back to bilinear for any pixel whose taps touch nodata or
+the source edge, so the two differ there.  As in gdalwarp, each band is judged
 on its own: a sentinel in one band leaves the others' kernels alone.
 """
 
@@ -87,11 +89,11 @@ def resample(
     samples (invalid samples are dropped from the kernel). A target
     pixel is set to ``nodata`` when the source pixel under the target
     center is nodata, when every kernel sample is nodata, or — for
-    cubic only — when fewer than 2 valid samples exist along each axis
-    of the kernel window (negative cubic weights cause severe overshoot
-    when valid/invalid samples alternate).  All of this is per band, as
-    in gdalwarp: a band comes out the same whether or not it is resampled
-    together with others.
+    cubic only, and rastera's own rule — when fewer than 2 valid samples
+    exist along each axis of the kernel window (negative cubic weights
+    cause severe overshoot when valid/invalid samples alternate).  All of
+    this is per band, as in gdalwarp: a band comes out the same whether or
+    not it is resampled together with others.
 
     ``nodata`` may be a finite sentinel (e.g. -9999, 0) or NaN; NaN is
     detected via ``np.isnan`` so the center gate and renormalization

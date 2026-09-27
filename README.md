@@ -73,8 +73,9 @@ raster_array = await rastera.merge(
 # nodata above — but real pixels can too, so the mask is what tells them apart.
 coverage = raster_array.mask
 
-# The exact grid read/merge return for snap_to_grid=True, without any I/O —
-# use it to pre-size buffers, key caches, or align a bbox to the grid.
+# The exact grid merge returns for snap_to_grid=True, without any I/O — use
+# it to pre-size buffers, key caches, or align a bbox to the grid. A same-CRS
+# read() returns it clipped to the dataset.
 transform, width, height = rastera.snapped_grid_for_bbox(bbox_shared, 10)
 ```
 
@@ -102,6 +103,8 @@ raster_array = await rastera.merge(
     sources, bbox=bbox, bbox_crs=4326, target_crs=32632, target_resolution=10
 )
 ```
+
+The index pins each file's header, so rebuild it when a file is rewritten in place: an old index reads the new pixels at the old georeference.
 
 `rastera.open()` also keeps an in-memory LRU cache of parsed headers within the session (default 128 entries, configurable via `set_cache_size()`), so repeated opens of the same URI skip the network fetch even without an index. A local file rewritten in place is read again; a remote object is assumed unchanged until `clear_cache()`.
 

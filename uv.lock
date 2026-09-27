@@ -741,7 +741,7 @@ requires-dist = [
     { name = "obstore", specifier = ">=0.9.0" },
     { name = "pyarrow", marker = "extra == 'index'", specifier = ">=18.0.0" },
     { name = "pyproj", specifier = ">=3.7.1" },
-    { name = "shapely", marker = "extra == 'index'", specifier = ">=2.0.0" },
+    { name = "shapely", marker = "extra == 'index'", specifier = ">=2.0.4" },
 ]
 provides-extras = ["index"]
 
@@ -755,7 +755,7 @@ dev = [
     { name = "pytest", specifier = ">=8.0.0" },
     { name = "pytest-asyncio", specifier = ">=1.0.0" },
     { name = "ruff", specifier = "==0.16.0" },
-    { name = "shapely", specifier = ">=2.0.0" },
+    { name = "shapely", specifier = ">=2.0.4" },
 ]
 
 [[package]]

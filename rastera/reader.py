@@ -181,7 +181,10 @@ class AsyncGeoTIFF:
             cache: When True, cache the parsed GeoTIFF object in memory so that
                 subsequent opens of the same URI skip the header fetch. A
                 local file rewritten since is read afresh; a remote object is
-                assumed unchanged until :func:`rastera.clear_cache`.
+                assumed unchanged until :func:`rastera.clear_cache`. A remote
+                URI is cached with the store it was first opened through, so
+                a later open with another store or other credentials reads
+                through that first one; pass ``cache=False`` where it matters.
             meta_overrides: Optional header overrides applied at construction.
                 Currently supports ``{"crs": int | CRS}`` for TIFFs missing
                 or carrying incorrect georeferencing. Overrides always
@@ -264,7 +267,8 @@ class AsyncGeoTIFF:
                 given with a bbox, the output grid is rounded outward onto
                 multiples of ``target_resolution`` — see
                 :func:`rastera.snapped_grid_for_bbox`. Transform and shape
-                are then a pure function of bbox and resolution; sources
+                are then a pure function of bbox and resolution, before the
+                clip to the dataset described below; sources
                 already on that grid are copied 1:1, anything else is
                 resampled onto it, shifting values by up to half a pixel.
                 Without *target_resolution* the window snaps outward on the
@@ -288,6 +292,9 @@ class AsyncGeoTIFF:
                 declares no sentinel — 0 is real data in most rasters, so
                 comparing against it would blank them; when it does declare
                 one the value is in the pixels and ``as_masked()`` finds it.
+                A NaN sentinel is the exception: ``as_masked()`` compares by
+                equality, which NaN never meets, so find it with
+                ``np.isnan``.
             use_overviews: When True, reads from pre-computed COG overview
                 levels to save bandwidth, and only when the read actually
                 changes resolution — a native-resolution or purely
