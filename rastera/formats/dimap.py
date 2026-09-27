@@ -484,11 +484,11 @@ def _require_positive_attr(el: ET.Element, attr: str) -> int:
 
 def _parse_regular_tiling(dims: ET.Element) -> tuple[int, int, int, int]:
     tile_set = dims.find("Tile_Set")
-    if tile_set is None:
-        # Untiled DIMAP: the whole raster is one tile per band-group. The
-        # Data_File entries still carry tile_R="1" tile_C="1", so the
-        # mosaic stitcher works unchanged with a 1x1 grid sized to the
-        # full raster.
+    if tile_set is None or len(tile_set) == 0:
+        # Untiled DIMAP, with <Tile_Set> left out or left empty: the whole
+        # raster is one tile per band-group. The Data_File entries still carry
+        # tile_R="1" tile_C="1", so the mosaic stitcher works unchanged with a
+        # 1x1 grid sized to the full raster.
         nrows = _require_positive_int(dims, "NROWS")
         ncols = _require_positive_int(dims, "NCOLS")
         return 1, 1, nrows, ncols
@@ -620,9 +620,13 @@ def _parse_dtype(encoding: ET.Element) -> np.dtype:
                 f"expected 'UNSIGNED' or 'SIGNED'"
             )
         prefix = "uint" if sign == "UNSIGNED" else "int"
-        if nbits not in (8, 16, 32, 64):
-            raise NotImplementedError(f"DIMAP unsupported integer NBITS={nbits}")
-        return np.dtype(f"{prefix}{nbits}")
+        if not 1 <= nbits <= 64:
+            raise ValueError(f"DIMAP: <NBITS> is {nbits}; expected 1 to 64")
+        # NBITS is the sensor's bit depth, 12 for Pleiades, which the tiles
+        # store in the next integer size up; GDAL reads that size too. The
+        # tile check still rejects a tile that does not fit it.
+        size = next(b for b in (8, 16, 32, 64) if nbits <= b)
+        return np.dtype(f"{prefix}{size}")
     if dt == "FLOAT":
         if nbits not in (32, 64):
             raise NotImplementedError(f"DIMAP unsupported float NBITS={nbits}")
@@ -631,11 +635,10 @@ def _parse_dtype(encoding: ET.Element) -> np.dtype:
 
 
 def _parse_crs_epsg(crs_root: ET.Element) -> int:
-    projected = crs_root.find("Projected_CRS")
-    geographic = crs_root.find("Geographic_CRS")
+    # The two elements GDAL reads, in its order.
     for el, code_tag in (
-        (projected, "PROJECTED_CRS_CODE"),
-        (geographic, "GEOGRAPHIC_CRS_CODE"),
+        (crs_root.find("Projected_CRS"), "PROJECTED_CRS_CODE"),
+        (crs_root.find("Geodetic_CRS"), "GEODETIC_CRS_CODE"),
     ):
         if el is None:
             continue
@@ -650,7 +653,7 @@ def _parse_crs_epsg(crs_root: ET.Element) -> int:
             raise ValueError(f"DIMAP: could not extract EPSG code from {code!r}") from e
     raise NotImplementedError(
         "DIMAP Coordinate_Reference_System has neither Projected_CRS nor "
-        "Geographic_CRS with an EPSG code"
+        "Geodetic_CRS with an EPSG code"
     )
 
 

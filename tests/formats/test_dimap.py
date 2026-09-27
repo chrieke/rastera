@@ -196,6 +196,23 @@ class TestParseDIMAP:
         assert (layout.tile_width, layout.tile_height) == (800, 1000)
         assert layout.width == 800 and layout.height == 1000
 
+    @pytest.mark.parametrize("empty", [b"<Tile_Set></Tile_Set>", b"<Tile_Set/>"])
+    def test_an_empty_tile_set_is_untiled_too(self, empty: bytes):
+        """GDAL's untiled PNEO sample writes the element but leaves it empty,
+        which used to be rejected as an irregular tiling."""
+        untiled = _modified(
+            PNEO_DIMAP,
+            b"<Tile_Set>\n        <NTILES>4</NTILES>\n        <Regular_Tiling>\n"
+            b'          <NTILES_SIZE ncols="400" nrows="500" />\n'
+            b'          <NTILES_COUNT ntiles_C="2" ntiles_R="2" />\n'
+            b'          <NTILES_OVERLAP ncols="0" nrows="0" />\n'
+            b"        </Regular_Tiling>\n      </Tile_Set>",
+            empty,
+        )
+        layout = _parse_dimap_xml(untiled)
+        assert (layout.tile_rows, layout.tile_cols) == (1, 1)
+        assert (layout.tile_width, layout.tile_height) == (800, 1000)
+
     def test_parses_band_groups_and_virtual_band_order(self):
         """Virtual bands are concatenated across groups in document order;
         each remembers its group and its 1-based band index *within* a
@@ -340,16 +357,18 @@ class TestParseDIMAP:
         with pytest.raises(NotImplementedError, match="image/tiff"):
             _parse_dimap_xml(xml)
 
-    def test_geographic_crs_fallback(self):
+    def test_geodetic_crs_fallback(self):
+        """A product ordered in WGS84 lat/lon names its CRS in <Geodetic_CRS>,
+        the spelling GDAL reads."""
         xml = _modified(
             PNEO_DIMAP,
             b"""<Projected_CRS>
       <PROJECTED_CRS_NAME>WGS 84 / UTM zone 33N</PROJECTED_CRS_NAME>
       <PROJECTED_CRS_CODE>urn:ogc:def:crs:EPSG::32633</PROJECTED_CRS_CODE>
     </Projected_CRS>""",
-            b"""<Geographic_CRS>
-      <GEOGRAPHIC_CRS_CODE>urn:ogc:def:crs:EPSG::4326</GEOGRAPHIC_CRS_CODE>
-    </Geographic_CRS>""",
+            b"""<Geodetic_CRS>
+      <GEODETIC_CRS_CODE>urn:ogc:def:crs:EPSG::4326</GEODETIC_CRS_CODE>
+    </Geodetic_CRS>""",
         )
         assert _parse_dimap_xml(xml).crs_epsg == 4326
 
@@ -371,6 +390,20 @@ class TestParseDIMAP:
       <NBITS>32</NBITS>""",
         )
         assert _parse_dimap_xml(xml).dtype == np.dtype("float32")
+
+    def test_sensor_bit_depth_reads_in_its_container(self):
+        """Pleiades declares its 12-bit depth, and the tiles store it as
+        uint16, where GDAL reads it."""
+        xml = _modified(PNEO_DIMAP, b"<NBITS>16</NBITS>", b"<NBITS>12</NBITS>")
+        assert _parse_dimap_xml(xml).dtype == np.dtype("uint16")
+
+    @pytest.mark.parametrize("nbits", [b"0", b"65"])
+    def test_rejects_a_bit_depth_no_integer_has(self, nbits: bytes):
+        xml = _modified(
+            PNEO_DIMAP, b"<NBITS>16</NBITS>", b"<NBITS>" + nbits + b"</NBITS>"
+        )
+        with pytest.raises(ValueError, match="NBITS"):
+            _parse_dimap_xml(xml)
 
 
 class TestSingleGroupDIMAP:
@@ -1234,7 +1267,7 @@ class TestResolveTileURI:
 
 class TestCRSParsing:
     def test_rejects_missing_epsg_code(self):
-        """If neither Projected_CRS nor Geographic_CRS carries an EPSG
+        """If neither Projected_CRS nor Geodetic_CRS carries an EPSG
         code, we bail rather than guess — downstream reprojection needs
         a real authority code."""
         xml = _modified(
