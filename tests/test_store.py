@@ -203,7 +203,11 @@ class TestParseUriLocal:
         parsed = _parse_uri(str(f))
         assert parsed.kind == "local"
         assert parsed.local_path == f.resolve()
-        assert (parsed.root, parsed.key) == (tmp_path.resolve().as_uri(), "file.tif")
+        anchor = Path(f.resolve().anchor)
+        assert (parsed.root, parsed.key) == (
+            anchor.as_uri(),
+            f.resolve().relative_to(anchor).as_posix(),
+        )
 
     def test_file_uri_is_percent_decoded(self, tmp_path: Path):
         d = tmp_path / "My Scenes"
@@ -319,12 +323,17 @@ class TestStoreRoot:
         b = "https://s3.us-east-1.amazonaws.com/bucket-b/y.tif"
         assert _parse_uri(a).root != _parse_uri(b).root
 
-    def test_local_siblings_share_a_root(self, tmp_path: Path):
-        a, b = tmp_path / "a.tif", tmp_path / "b.tif"
+    def test_local_files_share_a_root_across_folders(self, tmp_path: Path):
+        """Rooted at each file's folder, files in two folders read as two
+        buckets, and open(list), merge and build_index refused them."""
+        (tmp_path / "A").mkdir()
+        (tmp_path / "B").mkdir()
+        a, b = tmp_path / "A" / "x.tif", tmp_path / "B" / "y.tif"
         a.write_bytes(b"")
         b.write_bytes(b"")
-        root = tmp_path.resolve().as_uri()
+        root = Path(tmp_path.resolve().anchor).as_uri()
         assert _parse_uri(str(a)).root == _parse_uri(str(b)).root == root
+        _require_same_bucket([str(a), str(b)], "testing")
 
 
 # ── _require_same_bucket ─────────────────────────────────────────────────
@@ -485,10 +494,10 @@ class TestBuildStoreWith:
                 skip_signature=False,
             )
 
-    def test_local_roots_at_the_parent_directory(self, tmp_path: Path):
+    def test_local_roots_at_the_filesystem_root(self, tmp_path: Path):
         f = tmp_path / "foo.tif"
         f.write_bytes(b"")
         mock_from_url = MagicMock(return_value="store")
         _build_store_with(str(f), mock_from_url, MagicMock(), skip_signature=False)
-        assert mock_from_url.call_args[0][0] == tmp_path.resolve().as_uri()
+        assert mock_from_url.call_args[0][0] == Path(f.resolve().anchor).as_uri()
         assert "skip_signature" not in mock_from_url.call_args[1]

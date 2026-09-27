@@ -270,12 +270,15 @@ class TestOpen:
 
     @patch("rastera.reader.GeoTIFF")
     @patch("rastera.store.from_url")
-    async def test_open_many_accepts_sibling_local_paths(
+    async def test_open_many_accepts_local_paths_in_different_folders(
         self, mock_from_url: Any, mock_geotiff_cls: Any, tmp_path: Path
     ):
-        """Sibling local paths share a parent-dir bucket and must not be rejected."""
-        a = tmp_path / "a.tif"
-        b = tmp_path / "b.tif"
+        """One store at the filesystem root serves both, each under its full
+        path. Rooted at each file's folder, the pair was refused as two
+        buckets."""
+        (tmp_path / "A").mkdir()
+        (tmp_path / "B").mkdir()
+        a, b = tmp_path / "A" / "x.tif", tmp_path / "B" / "y.tif"
         a.write_bytes(b"")
         b.write_bytes(b"")
         mock_from_url.return_value = MagicMock()
@@ -284,7 +287,10 @@ class TestOpen:
         srcs = await rastera.open([str(a), str(b)], cache=False)
 
         assert len(srcs) == 2
-        mock_from_url.assert_called_once_with(tmp_path.resolve().as_uri())
+        anchor = Path(tmp_path.resolve().anchor)
+        mock_from_url.assert_called_once_with(anchor.as_uri())
+        keys = [c.args[0] for c in mock_geotiff_cls.open.call_args_list]
+        assert keys == [p.resolve().relative_to(anchor).as_posix() for p in (a, b)]
 
 
 # ── meta_overrides ──────────────────────────────────────────────────────

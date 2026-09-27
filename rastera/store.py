@@ -101,7 +101,12 @@ def _parse_uri(uri: str) -> ParsedURI:
     if scheme in ("", "file"):
         raw = unquote(parsed.path) if scheme == "file" else uri
         path = Path(raw).resolve()
-        return ParsedURI(uri, "local", path.parent.as_uri(), path.name, local_path=path)
+        # Rooted at the filesystem root, not the file's folder: rooted there,
+        # files in two folders read as two buckets, and open(list), merge and
+        # build_index refused them.
+        anchor = Path(path.anchor)
+        key = path.relative_to(anchor).as_posix()
+        return ParsedURI(uri, "local", anchor.as_uri(), key, local_path=path)
 
     if scheme == "s3":
         return ParsedURI(uri, "aws", f"s3://{parsed.netloc}", _path_key(parsed))
