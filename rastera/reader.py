@@ -588,17 +588,25 @@ class AsyncGeoTIFF:
             overview=overview,
         )
 
-        out_data, coverage = _resample_impl(
-            native.data,  # type: ignore[reportUnknownMemberType]
-            src_transform=native.transform,
-            dst_transform=dst_transform,
-            dst_width=dst_width,
-            dst_height=dst_height,
-            nodata=self._nodata,
-            transformer=transformer,
-            method=resampling,
-        )
-        out_data = _fill_uncovered(out_data, coverage, self._nodata)
+        def _warp() -> tuple[np.ndarray, np.ndarray | None]:
+            # pyproj >= 3.1 gives each thread its own handle under one
+            # Transformer, so the one built above is safe to use here.
+            out, covered = _resample_impl(
+                native.data,  # type: ignore[reportUnknownMemberType]
+                src_transform=native.transform,
+                dst_transform=dst_transform,
+                dst_width=dst_width,
+                dst_height=dst_height,
+                nodata=self._nodata,
+                transformer=transformer,
+                method=resampling,
+            )
+            return _fill_uncovered(out, covered, self._nodata), covered
+
+        # CPU-bound, and seconds long for a large warp: on the event loop it
+        # stalled every other task for that long, and set_concurrency could not
+        # overlap two of them.
+        out_data, coverage = await asyncio.to_thread(_warp)
 
         # Coverage stands in as the mask only when the dataset declares no
         # sentinel. With one, the warp already wrote it outside the footprint

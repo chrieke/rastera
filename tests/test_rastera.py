@@ -1,5 +1,6 @@
 """Unit tests for AsyncGeoTIFF."""
 
+import asyncio
 import os
 from dataclasses import replace as dc_replace
 from pathlib import Path
@@ -1051,6 +1052,47 @@ class TestOutputLabels:
 
 
 # ── Coverage on the output ──────────────────────────────────────────────
+
+
+class TestWarpOffTheLoop:
+    """The warp is CPU-bound and runs for seconds on a large read. On the event
+    loop it stalled every other task that long; a 4000x4000 cubic reproject
+    held the loop for 2.7 s."""
+
+    async def test_the_loop_runs_while_the_warp_does(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        import threading
+
+        import rastera.reader
+
+        gt = make_mock_geotiff(width=20, height=20, scale=1.0, count=1)
+        gt.read = slicing_read(gt, np.ones((1, 20, 20), dtype=np.uint16))
+        ds = AsyncGeoTIFF("s3://b/k.tif", gt)
+
+        started, released = threading.Event(), threading.Event()
+        seen: dict[str, Any] = {}
+        real = rastera.reader._resample_impl
+
+        def warp(*args: Any, **kwargs: Any) -> Any:
+            seen["thread"] = threading.get_ident()
+            started.set()
+            # Released by a coroutine, which runs only if the loop is free.
+            seen["loop_ran"] = released.wait(timeout=2)
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(rastera.reader, "_resample_impl", warp)
+        read = asyncio.ensure_future(
+            ds.read(bbox=BBox(0, 0, 20, 20), bbox_crs=32632, target_resolution=0.5)
+        )
+        while not started.is_set() and not read.done():
+            await asyncio.sleep(0.001)
+        released.set()
+        arr = await read
+
+        assert seen["loop_ran"]
+        assert seen["thread"] != threading.get_ident()
+        assert arr.data.shape == (1, 40, 40)  # type: ignore[reportUnknownMemberType]
 
 
 class TestSouthUp:
