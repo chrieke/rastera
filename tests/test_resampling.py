@@ -1111,3 +1111,73 @@ class TestCoverage:
         out = resample(arr, st, dt, 6, 6, nodata=-9999.0, method=method)
         assert (out[0, 4:, :] == -9999.0).all()
         assert (out[0, :, 4:] == -9999.0).all()
+
+
+# ── nodata per band ──────────────────────────────────────────────────────
+
+
+class TestPerBandNodata:
+    """gdalwarp judges nodata per band, so a sentinel in one band must not blank
+    or reweight the others: each band comes out as if resampled alone.
+
+    80x80 @10m in UTM 32N, three smooth bands, and a block of the sentinel in
+    band 1 only.
+    """
+
+    SRC_T = Affine(10, 0, 700000, 0, -10, 6000000)
+
+    @staticmethod
+    def _source(dtype: np.typing.DTypeLike, nodata: float) -> np.ndarray[Any, Any]:
+        yy, xx = np.mgrid[0:80, 0:80]
+        base = 1000 + 400 * np.sin(xx / 7.0) + 300 * np.cos(yy / 5.0)
+        arr = np.stack([base, base + 500, base + 1000]).astype(dtype)
+        arr[1, 30:42, 30:42] = nodata
+        return arr
+
+    def _grid(self, path: str) -> tuple[Affine, int, int, Transformer | None, str]:
+        """``(dst_t, dw, dh, transformer, warp_strategy)`` for *path*."""
+        src_t = self.SRC_T
+        if path in ("downsample", "upsample"):
+            res = 17.0 if path == "downsample" else 4.0
+            n = int(800 // res)
+            return Affine(res, 0, src_t.c, 0, -res, src_t.f), n, n, None, "single_pass"
+        # A 560m UTM 33N square on the source's centre: ~5° rotated against
+        # it, and clear of its edges. 25m is past the "auto" two-pass
+        # threshold, 12m is not.
+        res = 25.0 if path == "two_pass" else 12.0
+        fwd = Transformer.from_crs(32632, 32633, always_xy=True)
+        cx, cy = fwd.transform(src_t.c + 400, src_t.f - 400)
+        n = int(560 // res)
+        dst_t = Affine(res, 0, cx - n * res / 2, 0, -res, cy + n * res / 2)
+        strategy = "auto" if path == "two_pass" else "single_pass"
+        return dst_t, n, n, Transformer.from_crs(32633, 32632, always_xy=True), strategy
+
+    @pytest.mark.parametrize("method", ["bilinear", "cubic"])
+    @pytest.mark.parametrize(
+        "path", ["downsample", "upsample", "reproject", "two_pass"]
+    )
+    @pytest.mark.parametrize(
+        "dtype, nodata", [(np.uint16, 0), (np.float32, np.nan)], ids=["uint16", "nan"]
+    )
+    def test_each_band_comes_out_as_if_resampled_alone(
+        self,
+        method: ResamplingMethod,
+        path: str,
+        dtype: np.typing.DTypeLike,
+        nodata: float,
+    ):
+        arr = self._source(dtype, nodata)
+        dst_t, dw, dh, transformer, strategy = self._grid(path)
+        kw: dict[str, Any] = dict(
+            nodata=nodata,
+            transformer=transformer,
+            method=method,
+            warp_strategy=strategy,
+        )
+        together = resample(arr, self.SRC_T, dst_t, dw, dh, **kw)
+        for b in range(3):
+            alone = resample(arr[b : b + 1], self.SRC_T, dst_t, dw, dh, **kw)
+            np.testing.assert_array_equal(together[b], alone[0])
+        is_nodata = np.isnan(together) if nodata != nodata else together == nodata
+        assert is_nodata[1].any(), "the block must reach band 1's output"
+        assert not is_nodata[[0, 2]].any(), "bands 0 and 2 hold data everywhere"

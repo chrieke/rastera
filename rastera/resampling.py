@@ -16,7 +16,8 @@ boundary rather than silently ignoring it.
 Bilinear and cubic use GDAL-style nodata handling: kernel weights are
 renormalized over valid samples, with a center-pixel nodata gate and (for
 cubic) a per-dimension ≥2-valid safety gate to avoid overshoot from negative
-cubic weights at data/nodata boundaries.
+cubic weights at data/nodata boundaries.  As in gdalwarp, each band is judged
+on its own: a sentinel in one band leaves the others' kernels alone.
 """
 
 from __future__ import annotations
@@ -86,7 +87,9 @@ def resample(
     center is nodata, when every kernel sample is nodata, or — for
     cubic only — when fewer than 2 valid samples exist along each axis
     of the kernel window (negative cubic weights cause severe overshoot
-    when valid/invalid samples alternate).
+    when valid/invalid samples alternate).  All of this is per band, as
+    in gdalwarp: a band comes out the same whether or not it is resampled
+    together with others.
 
     ``nodata`` may be a finite sentinel (e.g. -9999, 0) or NaN; NaN is
     detected via ``np.isnan`` so the center gate and renormalization
@@ -444,32 +447,43 @@ def _resample_kernel(
     wx = weights_fn(frac_col, x_offsets, x_filter)
     wy = weights_fn(frac_row, y_offsets, y_filter)
 
-    # --- Accumulate kernel contributions.
+    # --- Accumulate kernel contributions.  The kernels drop a pixel from every
+    # band they are handed when any of those bands holds the sentinel.  gdalwarp
+    # judges each band on its own, so bands whose sentinel footprints differ
+    # are handed over one at a time.
+    if _sentinel_differs_across_bands(src_array, nodata, nodata_is_nan):
+        band_groups = [src_array[b : b + 1] for b in range(src_array.shape[0])]
+    else:
+        band_groups = [src_array]
     accumulate = _accumulate_2d if coords_2d else _accumulate_separable
-    acc_val, acc_wt, per_dim_ok = accumulate(
-        src_array,
-        base_col,
-        base_row,
-        wx,
-        wy,
-        x_offsets,
-        y_offsets,
-        nodata,
-        nodata_is_nan,
-        method,
-    )
-
-    out = _finalize_kernel(
-        acc_val,
-        acc_wt,
-        per_dim_ok,
-        src_array,
-        center_row,
-        center_col,
-        coords_2d,
-        nodata,
-        nodata_is_nan,
-    )
+    outs: list[np.ndarray] = []
+    for bands in band_groups:
+        acc_val, acc_wt, per_dim_ok = accumulate(
+            bands,
+            base_col,
+            base_row,
+            wx,
+            wy,
+            x_offsets,
+            y_offsets,
+            nodata,
+            nodata_is_nan,
+            method,
+        )
+        outs.append(
+            _finalize_kernel(
+                acc_val,
+                acc_wt,
+                per_dim_ok,
+                bands,
+                center_row,
+                center_col,
+                coords_2d,
+                nodata,
+                nodata_is_nan,
+            )
+        )
+    out = outs[0] if len(outs) == 1 else np.concatenate(outs)
     return out, coverage
 
 
@@ -720,8 +734,9 @@ def _accumulate_2d(
 
             if nodata is not None:
                 # Pixel is valid only if all bands are non-nodata AND the
-                # tap is in-bounds.  NaN-sentinel: use `np.isnan` and
-                # zero-out NaN samples before the multiply.
+                # tap is in-bounds; the bands here share one sentinel
+                # footprint (see `_resample_kernel`).  NaN-sentinel: use
+                # `np.isnan` and zero-out NaN samples before the multiply.
                 if nodata_is_nan:
                     is_nodata = np.isnan(sample)
                     sample = np.where(is_nodata, 0.0, sample)
@@ -1092,6 +1107,16 @@ def _kernel_halo(method: ResamplingMethod, scale: float) -> int:
     if method == "nearest":
         return 0
     return math.ceil(_BASE_RADIUS[method] * max(1.0, scale))
+
+
+def _sentinel_differs_across_bands(
+    src_array: np.ndarray, nodata: int | float | None, nodata_is_nan: bool
+) -> bool:
+    """Whether the sentinel sits on different pixels in different bands."""
+    if nodata is None or src_array.shape[0] == 1:
+        return False
+    is_nodata = np.isnan(src_array) if nodata_is_nan else src_array == nodata
+    return not np.array_equal(is_nodata.any(axis=0), is_nodata.all(axis=0))
 
 
 def _and_coverage(

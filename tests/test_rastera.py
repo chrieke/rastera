@@ -26,7 +26,7 @@ from rastera.reader import (
     clear_cache,
     set_cache_size,
 )
-from rastera.resampling import resample
+from rastera.resampling import ResamplingMethod, resample
 from tests.conftest import (
     make_mock_geotiff,
     make_raster_array,
@@ -1072,6 +1072,53 @@ class TestReadCoverage:
             bbox=BBox(2.0, 2.0, 18.0, 18.0), bbox_crs=32632, target_resolution=1.0
         )
         assert arr.mask is None
+
+
+class TestPerBandNodata:
+    """A band reads the same whichever other bands the read asks for.
+
+    40x40 @1m, three bands, nodata=0, and a block of zeros in band 2 only —
+    a real zero reflectance, say, where bands 1 and 3 hold data.
+    """
+
+    @staticmethod
+    def _dataset() -> AsyncGeoTIFF:
+        gt = make_mock_geotiff(
+            width=40, height=40, scale=1.0, count=3, dtype=np.dtype("u2"), nodata=0
+        )
+        yy, xx = np.mgrid[0:40, 0:40]
+        base = 1000 + 300 * np.sin(xx / 5.0) + 200 * np.cos(yy / 4.0)
+        full = np.stack([base, base + 500, base + 1000]).astype(np.uint16)
+        full[1, 15:25, 15:25] = 0
+        gt.read = slicing_read(gt, full)
+        return AsyncGeoTIFF("s3://b/k.tif", gt)
+
+    @pytest.mark.parametrize("resampling", ["bilinear", "cubic"])
+    @pytest.mark.parametrize(
+        "kw",
+        [{"target_resolution": 1.7}, {"target_resolution": 1.7, "target_crs": 32633}],
+        ids=["resample", "reproject"],
+    )
+    async def test_a_band_reads_the_same_alone(
+        self, resampling: ResamplingMethod, kw: dict[str, Any]
+    ):
+        ds = self._dataset()
+        crs = kw.get("target_crs", 32632)
+        bbox = transform_bbox(BBox(0, 0, 40, 40), 32632, crs)
+
+        async def data(band_indices: list[int] | None) -> np.ndarray[Any, Any]:
+            arr = await ds.read(
+                bbox=bbox,
+                bbox_crs=crs,
+                band_indices=band_indices,
+                resampling=resampling,
+                **kw,
+            )
+            return arr.data  # type: ignore[reportUnknownMemberType]
+
+        full = await data(None)
+        np.testing.assert_array_equal((await data([1]))[0], full[0])
+        np.testing.assert_array_equal(await data([3, 1]), full[[2, 0]])
 
 
 class TestAlphaBand:
