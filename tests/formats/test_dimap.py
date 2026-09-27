@@ -717,6 +717,10 @@ def _mock_tile_ds(fill_fn: _TileFillFn) -> AsyncGeoTIFF:
         )
 
     ds._read_native = _read_native
+    # The header the tile check reads, agreeing with _two_group_layout's tiles.
+    ds.uri = "s3://bucket/prod/TILE.TIF"
+    ds.count = 3
+    ds._geotiff = SimpleNamespace(dtype=np.dtype("uint16"), width=400, height=500)
     return ds
 
 
@@ -978,6 +982,26 @@ class TestDIMAPRead:
             )
         assert open_count == 1  # tile (1,1) of group 0 opened exactly once
 
+    async def test_a_later_tile_is_checked_when_a_read_first_opens_it(self):
+        """Only the tile sniffed at open time was checked. A later tile wider
+        than the declared dtype was cast into the mosaic, wrapping its values."""
+        ds = _DIMAPDataset("/fake/DIM.xml", _two_group_layout())
+
+        async def fake_open(uri: str, **_: Any) -> Any:
+            tile = _fake_first_tile(dtype=np.dtype("uint32"))
+            tile.uri = uri
+            return tile
+
+        with (
+            patch.object(AsyncGeoTIFF, "open", side_effect=fake_open),
+            pytest.raises(ValueError, match=r"RGB_R2C2\.TIF.*does not fit"),
+        ):
+            # Inside tile (2, 2) of the RGB group only.
+            await ds._read_native(
+                window=Window(col_off=500, row_off=600, width=10, height=10),
+                band_indices=[0],
+            )
+
 
 def _fake_first_tile(
     nodata: int | float | None = 0,
@@ -988,7 +1012,7 @@ def _fake_first_tile(
 ) -> Any:
     """Stand-in for the pre-opened first tile supplied to ``_DIMAPDataset`` by
     ``_maybe_open_dimap``. Carries the ``_nodata`` the dataset inherits plus the
-    dtype/band-count/size ``_validate_first_tile`` checks against the
+    dtype/band-count/size ``_validate_tile`` checks against the
     descriptor. The defaults agree with both fixtures' declared tiling — 400x500
     uint16 — and with 4 bands, enough for PHR's NBANDS and PNEO's per-group 3."""
     tile = MagicMock(spec=AsyncGeoTIFF)

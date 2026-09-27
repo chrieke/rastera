@@ -296,7 +296,9 @@ class _DIMAPDataset(AsyncGeoTIFF):
     ) -> AsyncGeoTIFF:
         href = self._layout.groups[group_idx].tile_paths[(tile_row, tile_col)]
         tile_uri = _resolve_tile_uri(href, self.uri)
-        return await _open_tile_uri(tile_uri, **self._tile_open_kwargs)
+        tile = await _open_tile_uri(tile_uri, **self._tile_open_kwargs)
+        _validate_tile(self._layout, tile, (group_idx, tile_row, tile_col))
+        return tile
 
     def __repr__(self) -> str:
         return (
@@ -344,7 +346,7 @@ async def _maybe_open_dimap(
         **store_kwargs,
     }
     first_key, first_tile = await _sniff_first_tile(layout, uri, tile_open_kwargs)
-    _validate_first_tile(layout, first_tile, first_key)
+    _validate_tile(layout, first_tile, first_key)
     return _DIMAPDataset(
         uri,
         layout,
@@ -786,22 +788,17 @@ def _tile_decomposition(layout: _DIMAPLayout, window: Window) -> list[_TileRead]
     return reads
 
 
-def _validate_first_tile(
+def _validate_tile(
     layout: _DIMAPLayout, tile: AsyncGeoTIFF, key: tuple[int, int, int]
 ) -> None:
-    """Check the descriptor against the one tile that is already open.
+    """Check the descriptor against a tile as it is opened.
 
     The XML declares what the tiles hold and nothing verifies it, so a
     descriptor that disagrees with its own imagery used to surface as corrupt
     pixels or an error naming neither the tile nor the descriptor. This is
-    ``vrt.py``'s ``_validate_source_windows`` for DIMAP; only the tile
-    ``_sniff_first_tile`` already fetched is checked, so it costs no request.
-
-    Tiles disagreeing *among themselves* is out of scope — catching that means
-    opening all of them at open time, which is what the lazy tile cache exists
-    to avoid. For the same reason the band-count check only ever covers the
-    group that tile belongs to (group 0); a later group declaring more bands
-    than its own tiles carry still fails at read time.
+    ``vrt.py``'s ``_validate_source_windows`` for DIMAP. It runs on the tile
+    ``_sniff_first_tile`` fetches at open time, and on each other tile when a
+    read first reaches it, so it costs no request of its own.
     """
     group_idx, tile_row, tile_col = key
 
