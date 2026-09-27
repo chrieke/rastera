@@ -112,7 +112,7 @@ SCENARIOS = [
         "expect": {
             "max_pct_differ": 100,
             "max_rmse_pct": 2,
-            "note": "rastera warps from the 40m overview while rasterio warps from "
+            "note": "rastera warps from the 80m overview while rasterio warps from "
             "full 10m — a pinned-grid WarpedVRT leaves GDAL no window to pick an "
             "overview for. Nearly every pixel is therefore a different source "
             "sample and the percentage carries no signal; RMSE is the check.",
