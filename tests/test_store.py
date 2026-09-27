@@ -409,11 +409,20 @@ class TestStoreKwargs:
         uri = "https://s3.us-east-1.amazonaws.com/b/k"
         assert "virtual_hosted_style_request" not in _kwargs(uri)
 
-    def test_custom_credential_provider_skips_defaults(self):
+    @pytest.mark.parametrize("skip_signature", [None, False])
+    def test_custom_credential_provider_skips_defaults(
+        self, skip_signature: bool | None
+    ):
+        """Under skip_signature=False the boto3 provider used to replace it."""
         provider = MagicMock()
-        out = _kwargs("s3://bucket/key", credential_provider=provider)
-        assert "skip_signature" not in out
+        caller: dict[str, Any] = dict(credential_provider=provider)
+        if skip_signature is not None:
+            caller["skip_signature"] = skip_signature
+        with patch("rastera.store._boto3_provider") as boto3:
+            out = _kwargs("s3://bucket/key", **caller)
+        assert not out.get("skip_signature")
         assert out["credential_provider"] is provider
+        boto3.assert_not_called()
 
     def test_skip_signature_false_uses_boto3(self):
         provider = MagicMock()
@@ -429,6 +438,30 @@ class TestStoreKwargs:
             out = _kwargs("s3://bucket/key", skip_signature=False)
         assert out["skip_signature"] is True
         assert "credential_provider" not in out
+
+    @pytest.mark.parametrize(
+        "keys",
+        [
+            dict(access_key_id="AKIA", secret_access_key="s"),
+            dict(config={"aws_access_key_id": "AKIA", "aws_secret_access_key": "s"}),
+        ],
+        ids=["kwargs", "config"],
+    )
+    @pytest.mark.parametrize("skip_signature", [None, False])
+    def test_explicit_keys_sign_with_those_keys(
+        self, keys: dict[str, Any], skip_signature: bool | None
+    ):
+        """They were ignored: unsigned by default, and swapped for the boto3
+        provider under skip_signature=False, or for unsigned without a profile."""
+        caller: dict[str, Any] = dict(keys)
+        if skip_signature is not None:
+            caller["skip_signature"] = skip_signature
+        with patch("rastera.store._boto3_provider") as boto3:
+            out = _kwargs("s3://bucket/key", **caller)
+        assert not out.get("skip_signature")
+        assert "credential_provider" not in out
+        boto3.assert_not_called()
+        assert {k: v for k, v in out.items() if k in keys} == keys
 
     def test_local_strips_skip_signature(self):
         assert "skip_signature" not in _kwargs("/tmp/foo.tif", skip_signature=False)

@@ -35,7 +35,9 @@ contradicts an explicit kwarg is an error rather than a silent pick.
 
 **Credentials** default to unsigned. ``skip_signature=False`` switches to
 ``Boto3CredentialProvider`` (env vars, ``~/.aws/credentials``, SSO, IAM roles);
-if it cannot be constructed, access falls back to unsigned.
+if it cannot be constructed, access falls back to unsigned. Static keys passed
+as ``access_key_id``/``secret_access_key``/``session_token``, or in ``config``,
+sign the requests themselves.
 """
 
 from __future__ import annotations
@@ -69,6 +71,20 @@ _AWS_SUFFIX_RE = re.compile(rf"\.{_AWS_SUFFIX}$", re.IGNORECASE)
 # Rejected outright by LocalFileSystem and HTTPStore ("Cannot pass config or
 # keyword parameters for scheme ..."), so they cannot be forwarded blindly.
 _S3_ONLY_KWARGS = ("skip_signature", "region", "credential_provider")
+
+# How obstore takes static S3 keys, as kwargs or in ``config``.
+_AWS_KEY_NAMES = frozenset(
+    {
+        "access_key_id",
+        "secret_access_key",
+        "session_token",
+        "token",
+        "aws_access_key_id",
+        "aws_secret_access_key",
+        "aws_session_token",
+        "aws_token",
+    }
+)
 
 UriKind = Literal["local", "aws", "cloud", "http"]
 
@@ -372,7 +388,13 @@ def _aws_store_kwargs(parsed: ParsedURI, out: dict[str, Any]) -> dict[str, Any]:
         )
     region = parsed.region or caller_region or _env_region()
 
-    if out.get("skip_signature") is False:
+    # Credentials the caller passed, a provider or static keys, sign as given.
+    # Replacing them with unsigned access or the boto3 identity sent the
+    # request as no one, or as someone else.
+    own_credentials = "credential_provider" in out or any(
+        k.lower() in _AWS_KEY_NAMES for k in (*out, *config)
+    )
+    if not own_credentials and out.get("skip_signature") is False:
         del out["skip_signature"]
         provider = _boto3_provider()
         if provider is None:
@@ -381,7 +403,7 @@ def _aws_store_kwargs(parsed: ParsedURI, out: dict[str, Any]) -> dict[str, Any]:
             out["credential_provider"] = provider
             session_config: dict[str, Any] = provider.config or {}
             region = region or session_config.get("region")
-    elif "credential_provider" not in out:
+    elif not own_credentials:
         out.setdefault("skip_signature", True)
 
     out["region"] = region or _DEFAULT_REGION
