@@ -9,7 +9,7 @@ description = "Async raster reader with bounds/window/merge read functionality, 
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 dependencies = [
     "affine>=2.4.0",
     "async-geotiff>=0.5.1",
@@ -77,11 +77,8 @@ known-first-party = ["rastera"]
 
 [tool.pyright]
 include = ["rastera", "tests"]
-# No pythonVersion: pyright takes it from the venv's interpreter. Pinning 3.11
-# against a 3.12+ venv breaks numpy 2.5's stubs, which need 3.12: its
-# `collections.abc.Buffer` import goes Unknown and every ArrayLike parameter
-# with it. CI runs pyright on each supported Python, and the 3.11 run catches
-# 3.12+ syntax and stdlib use.
+# Lowest supported interpreter, so 3.13+ syntax and stdlib use get caught.
+pythonVersion = "3.12"
 venvPath = "."
 venv = ".venv"
 # Hand-written stubs for dependencies that ship no annotations.
