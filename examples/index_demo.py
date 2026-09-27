@@ -136,7 +136,7 @@ async def cmd_query():
         t0 = time.perf_counter()
         sources = await rastera.open_from_index(gdf, bbox=qbbox, **S3_OPTS)
         result = await rastera.merge(
-            sources, bbox=qbbox, bbox_crs=4326, target_crs=4326, target_resolution=10
+            sources, bbox=qbbox, bbox_crs=4326, target_resolution=10
         )
         dt = time.perf_counter() - t0
         t_total_idx += dt
@@ -152,7 +152,7 @@ async def cmd_query():
         matched_uris = gdf[gdf.intersects(box(*qbbox))]["uri"].tolist()
         sources = await rastera.open(matched_uris, **S3_OPTS)
         result = await rastera.merge(
-            sources, bbox=qbbox, bbox_crs=4326, target_crs=4326, target_resolution=10
+            sources, bbox=qbbox, bbox_crs=4326, target_resolution=10
         )
         dt = time.perf_counter() - t0
         t_total_net += dt

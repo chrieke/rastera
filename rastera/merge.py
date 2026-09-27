@@ -343,8 +343,9 @@ async def _gather_and_paste(
     within each contributing TIFF, so an outer fan-out here multiplies the
     in-flight HTTP request count without adding throughput on a saturated
     link. Set ``rastera.set_concurrency(merge=N>1)`` to opt into outer
-    parallelism. For ``mosaic_method="first"`` reads run in batches of N so
-    the ``filled.all()`` early exit still triggers between batches.
+    parallelism. Reads then run in batches of N, for both methods; for
+    ``mosaic_method="first"`` the ``filled.all()`` early exit runs between
+    batches.
     """
     out_array = np.full(
         (n_bands, dst_height, dst_width),

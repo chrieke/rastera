@@ -113,6 +113,7 @@ def run_once(
         cmd += ["--save-array", save_array]
     cmd += ["--snap-to-grid" if snap_to_grid else "--no-snap-to-grid"]
     cmd += ["--overviews" if use_overviews else "--no-overviews"]
+    cmd += ["--resampling", scenario.get("resampling", "nearest")]
 
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
     if result.returncode != 0:

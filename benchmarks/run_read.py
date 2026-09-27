@@ -96,6 +96,45 @@ SCENARIOS = [
             "percentage carries no signal; RMSE is the check.",
         },
     },
+    {
+        "name": "Read: same CRS, downsampled to 60m, bilinear, no overviews",
+        "mode": "read",
+        "bbox": BBOX,
+        "bbox_crs": 32633,
+        "target_resolution": 60.0,
+        "resampling": "bilinear",
+        "expect": {
+            "shape_match": False,
+            "max_pct_differ": 0.1,
+            "max_rmse_pct": 0.01,
+            "note": "Grid snaps outward onto 60m multiples, as in scenario 3. On "
+            "one grid, with GDAL held to full resolution, the widened bilinear "
+            "kernel matches gdalwarp but for rounding ties: 8 of 93,310 pixels "
+            "differ, by 1 DN.",
+        },
+    },
+    {
+        "name": "Read: cross-CRS reproject to EPSG:32632, 30m, cubic, no overviews",
+        "mode": "read",
+        "bbox": BBOX,
+        "bbox_crs": 32633,
+        "target_crs": 32632,
+        "target_resolution": 30.0,
+        "reproject_bbox": True,
+        "resampling": "cubic",
+        "expect": {
+            "shape_match": False,
+            "max_pct_differ": 50,
+            "max_rmse_pct": 0.1,
+            "note": "Grid snaps outward onto 30m multiples (reprojected bbox is "
+            "off-grid). The two UTM grids are about 4 degrees apart, so this "
+            "covers the rotated kernel footprint and the single-pass warp. About "
+            "a third of pixels differ, by up to ~60 DN at sharp edges: GDAL's "
+            "approximate transformer places source coordinates up to 0.125 px "
+            "off by default. Against gdalwarp -et 0, rastera is within 4 DN "
+            "(RMSE 0.24). RMSE is the check.",
+        },
+    },
 ]
 
 if __name__ == "__main__":

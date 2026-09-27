@@ -158,6 +158,9 @@ async def open_from_index(
     matching rows are loaded into memory — header bytes for non-matching
     files are never read.
 
+    The index pins each file's header, so rebuild it when a file is rewritten
+    in place: an old index reads the new pixels at the old georeference.
+
     Args:
         bbox_crs: When omitted, the bbox is assumed to be in the same CRS as
             the index geometry column (EPSG:4326).

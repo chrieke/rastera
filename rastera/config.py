@@ -36,12 +36,12 @@ def set_concurrency(
 
     Behavior per variant:
 
-    - ``merge``: fan-out across contributing COGs in ``rastera.merge``.
-      For ``mosaic_method="last"``, all contributors are read in one
-      bounded gather. For ``mosaic_method="first"`` (the default),
-      contributors are read in batches of ``merge`` and the early-exit
-      check (``filled.all()``) runs between batches — so n>1 may
-      over-fetch up to one batch worth of contributors compared to n=1.
+    - ``merge``: fan-out across contributing COGs in ``rastera.merge``,
+      in batches of ``merge``: a batch is read and pasted before the next
+      starts, which bounds the arrays held at once. For
+      ``mosaic_method="first"`` (the default) the early exit
+      (``filled.all()``) runs between batches, so n>1 may over-fetch up to
+      one batch worth of contributors compared to n=1.
     - ``vrt``: fan-out across distinct underlying sources for one VRT
       read. Bands are grouped by source first so each unique source is
       read once per call; n>1 reads multiple sources in parallel.

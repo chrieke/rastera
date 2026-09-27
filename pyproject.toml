@@ -19,7 +19,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-index = ["geopandas>=1.0.0", "pyarrow>=18.0.0", "shapely>=2.0.0"]
+index = ["geopandas>=1.0.0", "pyarrow>=18.0.0", "shapely>=2.0.4"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
@@ -38,7 +38,7 @@ dev = [
     # So the optional index code path is covered by the default test run.
     "geopandas>=1.0.0",
     "pyarrow>=18.0.0",
-    "shapely>=2.0.0",
+    "shapely>=2.0.4",
     "pre-commit>=4.6.1",
 ]
 
