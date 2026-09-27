@@ -1093,6 +1093,20 @@ class TestAlphaBand:
         assert not arr.as_masked().mask.any()
 
 
+class TestInternalMask:
+    @pytest.mark.parametrize(
+        "kw",
+        [{"target_resolution": 0.5}, {"target_crs": 32633}],
+        ids=["resample", "reproject"],
+    )
+    async def test_a_warp_refuses_the_file(self, kw: dict[str, Any]):
+        """The warp would read the pixels the mask hides as data."""
+        gt = make_mock_geotiff(width=4, height=4, scale=1.0, count=1)
+        gt.mask_ifd = object()
+        with pytest.raises(NotImplementedError, match="internal mask"):
+            await AsyncGeoTIFF("s3://b/k.tif", gt).read(**kw)
+
+
 # ── LRU cache behaviour ────────────────────────────────────────────────
 
 

@@ -3,7 +3,7 @@
 **Async rasterio for COGs**, built on [async-geotiff](https://github.com/developmentseed/async-geotiff), no GDAL.
 
 - `read` and `merge` (multi-file, cross-crs) with `target_crs`, `target_resolution`, `bbox`, `window`, `resampling`
-- Resampling: `nearest` (default), `bilinear`, `cubic` — GDAL-matching kernels with anti-aliasing on downsample and nodata renormalization
+- Resampling: `nearest` (default), `bilinear`, `cubic` — GDAL-matching kernels with anti-aliasing on downsample and nodata renormalization. Nodata is the only thing that marks a pixel empty: an alpha band is read as a plain band, and resampling a file with an internal mask raises `NotImplementedError`
 - Optional persisted header cache (geoparquet) for ~6x faster opens
 - Built on [async-geotiff](https://github.com/developmentseed/async-geotiff) handling GeoTIFF parsing, async tile fetching, request coalescing, and Rust-native decompression
 - Limited VRT & DIMAP support — band-stack VRTs and LUTs work, anything more exotic raises `NotImplementedError` instead of returning wrong pixels (see `rastera/vrt.py`)

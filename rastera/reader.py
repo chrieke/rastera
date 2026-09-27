@@ -275,6 +275,8 @@ class AsyncGeoTIFF:
                 kernels widen when downsampling, to anti-alias as GDAL's
                 warp does, and renormalize around nodata GDAL-style — see
                 :func:`rastera.resampling.resample` for the precise rules.
+                A file with an internal mask raises ``NotImplementedError``
+                here, since the warp would read the pixels it hides as data.
         """
         gt = self._geotiff
         band_indices = normalize_band_indices(band_indices, self.count)
@@ -520,6 +522,15 @@ class AsyncGeoTIFF:
         *dst_transform* must be north-up. *out_crs* is its EPSG; pass
         ``self._crs_epsg`` when the grid is already in this dataset's own CRS.
         """
+        # The warp takes validity from nodata alone, so it would resample the
+        # pixels an internal mask hides as data. ``getattr``: only a real
+        # ``GeoTIFF`` header has the attribute.
+        if getattr(self._geotiff, "mask_ifd", None) is not None:
+            raise NotImplementedError(
+                f"{self.uri} has an internal mask, which resampled and "
+                "reprojected reads do not support. Read it at native "
+                "resolution, where the mask comes back on RasterArray.mask."
+            )
         src_crs = self._crs_epsg
         needs_reproject = out_crs != src_crs
         # Destination pixel size, expressed in *source* units once reprojected,
