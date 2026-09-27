@@ -140,6 +140,25 @@ def _build_store(uri: str, **store_kwargs: Any) -> Any:
     return _build_store_with(uri, from_url, HTTPStore, **store_kwargs)
 
 
+def _shared_store(
+    uri: str, stores: dict[tuple[str, str | None], Any], **store_kwargs: Any
+) -> Any | None:
+    """*uri*'s async-tiff store from *stores*, built and added on first use.
+
+    For a descriptor opening its sources one by one, which otherwise built a
+    store per source: a remote one costs 80-160 ms of blocking setup, and
+    brings its own connection pool. ``None`` for a local path, whose store
+    costs nothing and is left to ``AsyncGeoTIFF.open``.
+    """
+    parsed = _parse_uri(uri)
+    if parsed.kind == "local":
+        return None
+    store = stores.get(parsed.identity)
+    if store is None:
+        store = stores[parsed.identity] = _build_store(uri, **store_kwargs)
+    return store
+
+
 def _extract_key(uri: str) -> str:
     """The object key relative to ``_parse_uri(uri).root``, percent-decoded."""
     return _parse_uri(uri).key

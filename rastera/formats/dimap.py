@@ -24,7 +24,7 @@ from pyproj import CRS
 
 from .. import config
 from ..geo import BBox, ensure_bbox, window_from_bbox
-from ..reader import AsyncGeoTIFF, MetaOverrides, _make_output_array
+from ..reader import AsyncGeoTIFF, MetaOverrides, _make_output_array, _source_store
 from ..resampling import ResamplingMethod
 from ..store import _check_source_uri, _fetch_descriptor_bytes, _join_relative_uri
 
@@ -98,6 +98,7 @@ class _DIMAPDataset(AsyncGeoTIFF):
         meta_overrides: MetaOverrides | None = None,
         first_tile: AsyncGeoTIFF | None = None,
         first_tile_key: tuple[int, int, int] | None = None,
+        stores: dict[tuple[str, str | None], Any] | None = None,
     ):
         # DIMAP XML has no canonical nodata value. When the caller hands
         # us a pre-opened tile (the normal path from ``_maybe_open_dimap``),
@@ -110,6 +111,8 @@ class _DIMAPDataset(AsyncGeoTIFF):
         self._layout = layout
         self._tile_open_kwargs: dict[str, Any] = {
             "store": store,
+            # Shared with the open that sniffed the first tile.
+            "stores": {} if stores is None else stores,
             "prefetch": prefetch,
             "cache": cache,
             **(store_kwargs or {}),
@@ -293,7 +296,7 @@ class _DIMAPDataset(AsyncGeoTIFF):
     ) -> AsyncGeoTIFF:
         href = self._layout.groups[group_idx].tile_paths[(tile_row, tile_col)]
         tile_uri = _resolve_tile_uri(href, self.uri)
-        return await AsyncGeoTIFF.open(tile_uri, **self._tile_open_kwargs)
+        return await _open_tile_uri(tile_uri, **self._tile_open_kwargs)
 
     def __repr__(self) -> str:
         return (
@@ -332,8 +335,10 @@ async def _maybe_open_dimap(
     if b"Dimap_Document" not in xml_bytes[:2048]:
         return None
     layout = _parse_dimap_xml(xml_bytes)
+    stores: dict[tuple[str, str | None], Any] = {}
     tile_open_kwargs: dict[str, Any] = {
         "store": store,
+        "stores": stores,
         "prefetch": prefetch,
         "cache": cache,
         **store_kwargs,
@@ -350,6 +355,7 @@ async def _maybe_open_dimap(
         meta_overrides=meta_overrides,
         first_tile=first_tile,
         first_tile_key=first_key,
+        stores=stores,
     )
 
 
@@ -364,7 +370,7 @@ async def _sniff_first_tile(
     (r, c) = min(layout.groups[0].tile_paths)
     href = layout.groups[0].tile_paths[(r, c)]
     tile_uri = _resolve_tile_uri(href, uri)
-    tile = await AsyncGeoTIFF.open(tile_uri, **tile_open_kwargs)
+    tile = await _open_tile_uri(tile_uri, **tile_open_kwargs)
     return (0, r, c), tile
 
 
@@ -859,3 +865,21 @@ def _resolve_tile_uri(href: str, dimap_uri: str) -> str:
         tile_uri = _join_relative_uri(dimap_uri, href)
     _check_source_uri(tile_uri, dimap_uri)
     return tile_uri
+
+
+async def _open_tile_uri(
+    tile_uri: str,
+    *,
+    store: Any,
+    stores: dict[tuple[str, str | None], Any],
+    prefetch: int,
+    cache: bool,
+    **store_kwargs: Any,
+) -> AsyncGeoTIFF:
+    """Open a tile, with the caller's store or else one per bucket shared by
+    the product's tiles (see ``_source_store``)."""
+    if store is None:
+        store = _source_store(tile_uri, stores, cache, **store_kwargs)
+    return await AsyncGeoTIFF.open(
+        tile_uri, store=store, prefetch=prefetch, cache=cache, **store_kwargs
+    )

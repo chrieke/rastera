@@ -22,7 +22,10 @@ from rastera.formats.dimap import (
     _tile_decomposition,
 )
 from rastera.geo import BBox, WindowOutOfRangeError
-from rastera.reader import AsyncGeoTIFF
+from rastera.reader import AsyncGeoTIFF, _geotiff_cache, clear_cache
+from tests.conftest import make_mock_geotiff
+
+pytestmark = pytest.mark.usefixtures("stub_shared_store")
 
 # Minimal but realistic PNEO-flavoured DIMAP: two band-groups (RGB + NED),
 # 2x2 tile grid, UTM33N. Trimmed from a real product descriptor.
@@ -972,6 +975,94 @@ def _patch_sniff(nodata: int | float | None = 0, **tile_kwargs: Any) -> Any:
         return (0, 1, 1), _fake_first_tile(nodata=nodata, **tile_kwargs)
 
     return patch("rastera.formats.dimap._sniff_first_tile", new=_fake)
+
+
+class TestTileStores:
+    """Each tile open built its own store: 80-160 ms of blocking setup apiece
+    for a remote product, and a connection pool per tile."""
+
+    async def test_a_remote_products_tiles_share_one_store(
+        self, stub_shared_store: MagicMock
+    ):
+        stores: list[Any] = []
+
+        async def fake_open(uri: str, **kwargs: Any) -> Any:
+            stores.append(kwargs["store"])
+            return _fake_first_tile()
+
+        with (
+            patch(
+                "rastera.formats.dimap._fetch_descriptor_bytes",
+                new=AsyncMock(return_value=PNEO_DIMAP),
+            ),
+            patch.object(AsyncGeoTIFF, "open", side_effect=fake_open),
+        ):
+            ds = await _maybe_open_dimap("s3://bucket/DIM_PNEO.XML")
+            assert ds is not None
+            for g, group in enumerate(ds._layout.groups):
+                for r, c in group.tile_paths:
+                    await ds._get_tile(g, r, c)
+
+        assert len(stores) == 8  # 2 groups x 2x2 tiles, the sniffed one included
+        assert all(s is stores[0] and s is not None for s in stores)
+        stub_shared_store.assert_called_once()
+
+    async def test_cached_tiles_build_no_store(self, stub_shared_store: MagicMock):
+        """A warm open returns every tile from the header cache, which needs no
+        store, so building one would cost 80-160 ms for nothing."""
+        dimap = "s3://bucket/DIM_PNEO.XML"
+        layout = _parse_dimap_xml(PNEO_DIMAP)
+        cached = [
+            _resolve_tile_uri(href, dimap)
+            for group in layout.groups
+            for href in group.tile_paths.values()
+        ]
+        for uri in cached:
+            _geotiff_cache[uri] = make_mock_geotiff()
+        seen: list[Any] = []
+
+        async def fake_open(uri: str, **kwargs: Any) -> Any:
+            seen.append(kwargs["store"])
+            return _fake_first_tile()
+
+        try:
+            with (
+                patch(
+                    "rastera.formats.dimap._fetch_descriptor_bytes",
+                    new=AsyncMock(return_value=PNEO_DIMAP),
+                ),
+                patch.object(AsyncGeoTIFF, "open", side_effect=fake_open),
+            ):
+                ds = await _maybe_open_dimap(dimap)
+                assert ds is not None
+                await ds._get_tile(1, 1, 1)
+        finally:
+            clear_cache()
+
+        assert seen == [None, None]
+        stub_shared_store.assert_not_called()
+
+    async def test_a_callers_store_is_used_as_given(self, stub_shared_store: MagicMock):
+        mine = MagicMock()
+        seen: list[Any] = []
+
+        async def fake_open(uri: str, **kwargs: Any) -> Any:
+            seen.append(kwargs["store"])
+            return _fake_first_tile()
+
+        with (
+            patch(
+                "rastera.formats.dimap._fetch_descriptor_bytes",
+                new=AsyncMock(return_value=PNEO_DIMAP),
+            ),
+            patch.object(AsyncGeoTIFF, "open", side_effect=fake_open),
+        ):
+            ds = await _maybe_open_dimap("s3://bucket/DIM_PNEO.XML", store=mine)
+            assert ds is not None
+            await ds._get_tile(1, 1, 1)
+
+        assert seen == [mine, mine]
+        stub_shared_store.assert_not_called()
 
 
 class TestDetection:

@@ -39,6 +39,7 @@ from .store import (
     _extract_key,
     _require_same_bucket,
     _resolve_local_path,
+    _shared_store,
 )
 
 # LRU cache for parsed GeoTIFF objects, keyed by URI (see ``_cache_key``).
@@ -1122,3 +1123,24 @@ def _cache_key(uri: str) -> _CacheKey | None:
     except OSError:
         return None  # the open itself says why
     return (str(path), st.st_mtime_ns, st.st_size)
+
+
+def _source_store(
+    uri: str,
+    stores: dict[tuple[str, str | None], Any],
+    cache: bool,
+    **store_kwargs: Any,
+) -> Any | None:
+    """The store a VRT or DIMAP opens one of its sources with, shared per
+    bucket across them (see ``_shared_store``).
+
+    ``None`` when the header is cached: the open then returns before it needs
+    one, and a warm descriptor open built none before stores were shared. And
+    ``None`` for a nested VRT or DIMAP, whose own URI is never in the header
+    cache: it shares stores among its sources itself, for the ones not cached.
+    """
+    if uri.lower().endswith((".vrt", ".xml")):
+        return None
+    if cache and get_cached_geotiff(uri) is not None:
+        return None
+    return _shared_store(uri, stores, **store_kwargs)

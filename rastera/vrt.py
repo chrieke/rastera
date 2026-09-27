@@ -45,6 +45,7 @@ from .reader import (
     _CrsNodata,
     _GeoTIFFLike,
     _make_output_array,
+    _source_store,
 )
 from .resampling import ResamplingMethod
 from .store import _check_source_uri, _fetch_descriptor_bytes, _join_relative_uri
@@ -179,11 +180,14 @@ async def _open_vrt_checked(
     # rest of the rastera read path (see _dispatch_source_reads and
     # rastera/formats/dimap.py) which avoids stacking concurrent fan-out.
     sources_map: dict[str, AsyncGeoTIFF] = {}
+    stores: dict[tuple[str, str | None], Any] = {}
     for u in unique_uris:
         sources_map[u] = await _open_vrt_source(
             u,
             uri,
-            store=store,
+            store=store
+            if store is not None
+            else _source_store(u, stores, cache, **store_kwargs),
             prefetch=prefetch,
             cache=cache,
             meta_overrides=meta_overrides,

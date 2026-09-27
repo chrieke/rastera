@@ -36,6 +36,16 @@ def _clear_aws_region(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.delenv("AWS_DEFAULT_REGION", raising=False)
 
 
+@pytest.fixture
+def stub_shared_store(monkeypatch: pytest.MonkeyPatch) -> MagicMock:
+    """Stand in for the store a VRT or DIMAP builds per bucket before opening
+    its sources. A real one costs 80-160 ms to build, and every module using
+    this patches the open it would serve."""
+    build = MagicMock(side_effect=lambda uri, **_: MagicMock(name=f"store:{uri}"))
+    monkeypatch.setattr("rastera.store._build_store", build)
+    return build
+
+
 @pytest.fixture(autouse=True)
 def _reset_concurrency():
     """Concurrency is process-wide, so a test that raises it would otherwise
