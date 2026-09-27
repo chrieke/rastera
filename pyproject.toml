@@ -11,7 +11,7 @@ license = "MIT"
 license-files = ["LICENSE"]
 requires-python = ">=3.12"
 dependencies = [
-    "affine>=2.4.0",
+    "affine>=3.0.1",
     "async-geotiff>=0.5.1",
     "numpy>=2.2.6",
     "obstore>=0.9.0",
@@ -81,8 +81,6 @@ include = ["rastera", "tests"]
 pythonVersion = "3.12"
 venvPath = "."
 venv = ".venv"
-# Hand-written stubs for dependencies that ship no annotations.
-stubPath = "typings"
 strictListInference = true
 strictSetInference = true
 strictDictionaryInference = true

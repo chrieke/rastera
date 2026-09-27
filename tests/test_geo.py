@@ -222,9 +222,9 @@ class TestWindow:
     def test_from_bbox_covers_every_corner_of_a_rotated_grid(self):
         """Only two corners were inverted, which on a rotated grid misses the
         other two: a 100 m bbox came back 4 rows tall instead of 14."""
-        t = Affine.translation(500000, 7000480) * Affine.rotation(-30)
-        meta = SimpleNamespace(transform=t * Affine.scale(10, -10), width=64, height=64)
-        cx, cy = meta.transform * (32, 32)
+        t = Affine.translation(500000, 7000480) @ Affine.rotation(-30)
+        meta = SimpleNamespace(transform=t @ Affine.scale(10, -10), width=64, height=64)
+        cx, cy = meta.transform @ (32, 32)
         bbox = BBox(cx - 50, cy - 50, cx + 50, cy + 50)
         w = window_from_bbox(meta, bbox)  # type: ignore[reportArgumentType]
         for x, y in (
@@ -233,7 +233,7 @@ class TestWindow:
             (bbox.minx, bbox.miny),
             (bbox.maxx, bbox.miny),
         ):
-            col, row = ~meta.transform * (x, y)
+            col, row = ~meta.transform @ (x, y)
             assert w.col_off <= col <= w.col_off + w.width
             assert w.row_off <= row <= w.row_off + w.height
 
@@ -321,7 +321,7 @@ class TestBoundsFromTransform:
     def test_rotated_takes_hull_of_four_corners(self):
         """Using only corners (0,0) and (w,h) collapsed a rotated transform to a
         degenerate box."""
-        b = bounds_from_transform(Affine.rotation(45) * Affine.scale(1, -1), 10, 10)
+        b = bounds_from_transform(Affine.rotation(45) @ Affine.scale(1, -1), 10, 10)
         assert b.width > 0 and b.height > 0
 
 
