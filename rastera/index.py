@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 from collections.abc import Sequence
 from typing import Any, cast
 
@@ -13,7 +14,7 @@ from obstore.store import HTTPStore as ObstoreHTTPStore
 from obstore.store import from_url as obstore_from_url
 from pyproj import CRS
 from shapely import ops
-from shapely.geometry import box
+from shapely.geometry import MultiPolygon, box
 
 from .geo import _transformer
 from .reader import (
@@ -431,17 +432,32 @@ _EDGE_SEGMENTS = 20
 
 
 def _reproject(geom: Any, from_crs: int | CRS, to_crs: int | CRS) -> Any:
-    """*geom* reprojected, with its edges densified first.
+    """*geom*, a box, reprojected, with its edges densified first.
 
     A straight box edge in a projected CRS is a curve in lon/lat, so
     reprojecting the corners alone cuts a strip off the footprint: about 400 m
     along the north edge of a 110 km UTM tile at 60N, 650 m at 70N. A query
     landing there missed the tile, and a merge then filled it with nodata.
+
+    Into lon/lat, a box across the antimeridian came out as a ring spanning the
+    rest of the globe, and one around a pole as a ring leaving the pole out.
+    Queries inside either matched nothing. Those get their lon/lat envelope
+    instead, split at 180 degrees, or over every longitude.
     """
+    t = _transformer(from_crs, to_crs)
+    if t.target_crs is not None and t.target_crs.is_geographic:
+        bounds = t.transform_bounds(*geom.bounds, densify_pts=_EDGE_SEGMENTS + 1)
+        minx, miny, maxx, maxy = bounds
+        if all(math.isfinite(v) for v in bounds):
+            if miny <= -90 or maxy >= 90:
+                return box(-180, miny, 180, maxy)
+            if minx > maxx:
+                east, west = box(minx, miny, 180, maxy), box(-180, miny, maxx, maxy)
+                return MultiPolygon([east, west])
     # A point or zero-height query box has no edge to bend: segmentize rejects
     # the zero step, or empties the flat polygon, which then matches nothing.
     if geom.area > 0:
         minx, miny, maxx, maxy = geom.bounds
         step = max(maxx - minx, maxy - miny) / _EDGE_SEGMENTS
         geom = shapely.segmentize(geom, step)
-    return ops.transform(_transformer(from_crs, to_crs).transform, geom)
+    return ops.transform(t.transform, geom)
