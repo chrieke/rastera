@@ -130,6 +130,11 @@ def resample(
             override it for this call (useful in tests). No effect on nearest
             (any CRS/scale), same-CRS, or upsampling.
     """
+    # A NumPy float64 sentinel compares a float32 array in float64, where
+    # -9999.9 is not the float32 the pixels hold; a Python scalar compares in
+    # the array's dtype.
+    if isinstance(nodata, np.generic):
+        nodata = nodata.item()
     out, coverage = _resample_impl(
         src_array,
         src_transform,

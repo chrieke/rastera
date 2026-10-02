@@ -326,6 +326,18 @@ class TestResampleBilinear:
         out = resample(arr, src_t, dst_t, 1, 1, nodata=float("nan"), method="bilinear")
         assert np.isnan(out[0, 0, 0]), f"expected NaN output, got {out}"
 
+    def test_numpy_float64_sentinel_on_float32(self):
+        """np.float64(-9999.9) compared a float32 array in float64, where the
+        pixels' float32 rounding of -9999.9 did not match, so the sentinel
+        pixels were averaged in as real values."""
+        arr = np.full((1, 4, 4), -9999.9, dtype=np.float32)
+        arr[0, 1, 1] = 5.0
+        src_t = Affine(1, 0, 0, 0, -1, 4)
+        dst_t = Affine(0.5, 0, 0, 0, -0.5, 4)
+        nodata = np.float64(-9999.9)
+        out = resample(arr, src_t, dst_t, 8, 8, nodata=nodata, method="bilinear")
+        assert set(np.unique(out)) == {np.float32(-9999.9), np.float32(5.0)}
+
     def test_a_scale_just_above_one_interpolates_plainly(self):
         """gdalwarp rounds a downsample factor within 0.05 of a whole one. At
         1.02 that leaves plain 2x2 interpolation, where widening the kernel by
