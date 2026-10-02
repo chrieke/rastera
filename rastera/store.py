@@ -157,7 +157,22 @@ def _build_store_with(
 
 
 def _build_store(uri: str, **store_kwargs: Any) -> Any:
-    """Build an async-tiff object store rooted at the bucket/host level."""
+    """Build the store async-tiff reads *uri* from, rooted at the bucket/host
+    level.
+
+    A local file gets obstore's store, not async-tiff's. async-tiff
+    percent-encodes the key it passes its own store, and that store looks for
+    the encoded name on disk: ``ü/f.tif`` as ``%C3%BC/f.tif``, and ``x%20y.tif``
+    as ``x%2520y.tif``. obstore's store gets the key as given.
+    """
+    if _parse_uri(uri).kind == "local":
+        return _build_store_with(
+            uri, obstore_from_url, ObstoreHTTPStore, **store_kwargs
+        )
+    # TODO: S3 keys have the same problem. async-tiff's S3Store requests the
+    # key ``ü/f.tif`` as ``%C3%BC/f.tif`` and ``a~b/f.tif`` as ``a%7Eb/f.tif``;
+    # obstore's S3Store requests both correctly. Fix once async-tiff passes the
+    # key as given, or by moving remote reads to obstore's stores as well.
     return _build_store_with(uri, from_url, HTTPStore, **store_kwargs)
 
 

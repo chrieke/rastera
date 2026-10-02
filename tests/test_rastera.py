@@ -271,7 +271,7 @@ class TestOpen:
 
     @pytest.mark.parametrize("as_list", [False, True])
     @patch("rastera.reader.GeoTIFF")
-    @patch("rastera.store.from_url")
+    @patch("rastera.store.obstore_from_url")
     async def test_open_takes_a_path(
         self, mock_from_url: Any, mock_geotiff_cls: Any, as_list: bool, tmp_path: Path
     ):
@@ -288,7 +288,7 @@ class TestOpen:
         assert src.uri == str(f)
 
     @patch("rastera.reader.GeoTIFF")
-    @patch("rastera.store.from_url")
+    @patch("rastera.store.obstore_from_url")
     async def test_open_many_accepts_local_paths_in_different_folders(
         self, mock_from_url: Any, mock_geotiff_cls: Any, tmp_path: Path
     ):
@@ -1438,7 +1438,7 @@ class TestLRUCache:
         return first, second
 
     @patch("rastera.reader.GeoTIFF")
-    @patch("rastera.store.from_url")
+    @patch("rastera.store.obstore_from_url")
     async def test_a_local_file_rewritten_in_place_is_read_again(
         self, mock_from_url: Any, mock_geotiff_cls: Any, tmp_path: Path
     ):
@@ -1454,7 +1454,7 @@ class TestLRUCache:
         assert mock_geotiff_cls.open.await_count == 2
 
     @patch("rastera.reader.GeoTIFF")
-    @patch("rastera.store.from_url")
+    @patch("rastera.store.obstore_from_url")
     async def test_a_relative_path_is_keyed_where_it_resolves(
         self,
         mock_from_url: Any,
