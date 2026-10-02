@@ -473,6 +473,38 @@ class TestMergeCogs:
         # bottom half: cog2 has valid data (77.0) which overwrites
         assert np.all(result.data[0, 5:, :] == 77.0)  # type: ignore[reportUnknownMemberType]
 
+    @pytest.mark.parametrize("mosaic_method", ["first", "last"])
+    @pytest.mark.parametrize("target_resolution", [1.0, 0.5])  # native, warp
+    async def test_nodata_skipped_per_band(
+        self, mosaic_method: Literal["first", "last"], target_resolution: float
+    ):
+        """A sentinel in one band marked the whole pixel valid, so it hid the
+        other COG's real value in that band. gdalwarp and rasterio.merge both
+        give [200, 50, 50] here."""
+        winner = _make_cog(width=10, height=10, scale=1.0, bands=3, nodata=0)
+        other = _make_cog(width=10, height=10, scale=1.0, bands=3, nodata=0)
+        winner_data = np.full((3, 10, 10), 50, dtype=np.uint16)
+        winner_data[0] = 0
+        other_data = np.empty((3, 10, 10), dtype=np.uint16)
+        other_data[:] = np.array([200, 60, 60])[:, None, None]
+        for cog, data in ((winner, winner_data), (other, other_data)):
+            cog._read_native = AsyncMock(
+                return_value=_make_array(
+                    data, Affine(1, 0, 0, 0, -1, 10), geotiff=cog._geotiff
+                )
+            )
+
+        result = await merge(
+            [winner, other] if mosaic_method == "first" else [other, winner],
+            bbox=BBox(0, 0, 10, 10),
+            bbox_crs=32632,
+            target_resolution=target_resolution,
+            mosaic_method=mosaic_method,
+        )
+        out_data: np.ndarray[Any, Any] = result.data  # type: ignore[reportUnknownMemberType]
+        assert np.all(out_data == np.array([200, 50, 50])[:, None, None])
+        assert result.mask is not None and result.mask.all()
+
     async def test_nodata_none_still_overwrites(self):
         """When nodata is None, later COGs overwrite earlier ones with method='last'."""
         cog1 = _make_cog(width=10, height=10, scale=1.0, bands=1)
