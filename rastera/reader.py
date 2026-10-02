@@ -1034,14 +1034,17 @@ def _take_picks(arr: RasterArray, rows: Picks, cols: Picks) -> RasterArray:
     """
     if (len(rows), len(cols)) == (arr.height, arr.width):
         return arr
-    data: np.ndarray[Any, Any] = arr.data  # type: ignore[reportUnknownMemberType]
-    mask = arr.mask
-    if len(rows) != arr.height:
-        data = data[:, rows]
-        mask = None if mask is None else mask[rows]
-    if len(cols) != arr.width:
-        data = data[:, :, cols]
-        mask = None if mask is None else mask[:, cols]
+    idx: tuple[Any, Any]
+    if len(rows) == arr.height:
+        idx = (slice(None), cols)
+    elif len(cols) == arr.width:
+        idx = (rows, slice(None))
+    else:
+        # One index for both axes: one axis after the other held a third
+        # full-size copy at the peak.
+        idx = (rows[:, None], cols)
+    data: np.ndarray[Any, Any] = arr.data[(slice(None), *idx)]  # type: ignore[reportUnknownMemberType]
+    mask = None if arr.mask is None else arr.mask[idx]
     return dc_replace(arr, data=data, mask=mask, height=len(rows), width=len(cols))
 
 
