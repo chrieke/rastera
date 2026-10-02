@@ -836,10 +836,9 @@ def _make_windowed_cog(
     )
     gt = cog._geotiff
 
-    async def _read_native(
-        *, bbox: Any = None, snap_to_grid: bool = True, **_: Any
-    ) -> RasterArray:
-        win = window_from_bbox(gt, bbox, snap_to_grid=snap_to_grid)
+    # merge only reads natively when snapping; snap_to_grid=False warps.
+    async def _read_native(*, bbox: Any = None, **_: Any) -> RasterArray:
+        win = window_from_bbox(gt, bbox)
         data = np.full((1, win.height, win.width), value, dtype=np.uint16)
         transform = gt.transform @ Affine.translation(win.col_off, win.row_off)
         return _make_array(data, transform, geotiff=gt)

@@ -1421,6 +1421,28 @@ class TestReadDefaults:
         # The pixel size is the layout's, on both axes.
         assert (arr.transform.a, arr.transform.e) == (0.3, -0.3)
 
+    async def test_unsnapped_read_picks_pixels_as_gdal_does(self):
+        """Columns 10.3-20.7 into 10 pixels: GDAL steps by 1.04 and drops
+        column 15. The window used to start at column 10 and run contiguous."""
+        ds = _DIMAPDataset("/fake/DIM.xml", _two_group_layout())
+
+        async def _get_tile(g: int, r: int, c: int) -> AsyncGeoTIFF:
+            # Each pixel holds its column; the bbox stays inside the first tile.
+            return _mock_tile_ds(
+                lambda bands, w: np.broadcast_to(
+                    np.arange(w.col_off, w.col_off + w.width, dtype=np.uint16),
+                    (len(bands), w.height, w.width),
+                )
+            )
+
+        ds._get_tile = _get_tile  # type: ignore[assignment]
+        x0, y1 = 369516.0 + 10.3 * 0.3, 6447186.0 - 2 * 0.3
+        bbox = (x0, y1 - 3 * 0.3, x0 + 10.4 * 0.3, y1)
+        arr = await ds._read_native(bbox=bbox, band_indices=[0], snap_to_grid=False)
+        data: np.ndarray[Any, Any] = arr.data  # type: ignore[reportUnknownMemberType]
+        assert data.shape == (1, 3, 10)
+        assert data[0, 0].tolist() == [10, 11, 12, 13, 14, 16, 17, 18, 19, 20]
+
     async def test_non_zero_nodata_fills_past_edge(self):
         """When the first tile carries a non-zero nodata (common for uint16
         Airbus products), pixels past the mosaic edge must be filled with

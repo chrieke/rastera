@@ -704,6 +704,32 @@ class TestRead:
         assert arr.transform.a == 10.0
         assert arr.transform.e == -20.0
 
+    @staticmethod
+    def _ramp_obj() -> tuple[AsyncGeoTIFF, np.ndarray[Any, Any]]:
+        """16x16 at 10 m over (0, 0)-(160, 160), each pixel ``row * 100 + col``."""
+        gt = make_mock_geotiff(width=16, height=16, scale=10.0, count=1)
+        full = (np.arange(16)[:, None] * 100 + np.arange(16))[None].astype(np.uint16)
+        gt.read = slicing_read(gt, full)
+        return AsyncGeoTIFF("s3://b/k.tif", gt), full
+
+    async def test_unsnapped_read_takes_the_pixel_under_each_label(self):
+        """The window started at floor(offset): x 6-106 is columns 0.6-10.6,
+        whose first output pixel is centred on column 1 but held column 0."""
+        obj, full = self._ramp_obj()
+        arr = await obj.read(bbox=(6, 60, 106, 160), bbox_crs=32632, snap_to_grid=False)
+        assert arr.transform.c == 6.0
+        np.testing.assert_array_equal(arr.data, full[:, 0:10, 1:11])  # type: ignore[reportUnknownMemberType]
+
+    async def test_unsnapped_read_picks_pixels_as_gdal_does(self):
+        """Off a whole-pixel span GDAL steps by span / round(span): 10.4
+        columns into 10 drops one, 9.6 rows into 10 repeats one."""
+        obj, full = self._ramp_obj()
+        arr = await obj.read(bbox=(3, 57, 107, 153), bbox_crs=32632, snap_to_grid=False)
+        rows = [1, 2, 3, 4, 5, 5, 6, 7, 8, 9]
+        cols = [0, 1, 2, 3, 4, 6, 7, 8, 9, 10]
+        assert (arr.height, arr.width) == (10, 10)
+        np.testing.assert_array_equal(arr.data, full[:, rows][:, :, cols])  # type: ignore[reportUnknownMemberType]
+
 
 # ── overview choice ─────────────────────────────────────────────────────
 
@@ -1265,9 +1291,12 @@ class TestSouthUp:
         ds, _ = self._dataset()
         assert tuple(ds.profile["bounds"]) == (500000.0, 7000000.0, 500640.0, 7000480.0)
 
-    async def test_a_full_read_keeps_the_grid(self):
+    @pytest.mark.parametrize("snap_to_grid", [True, False])
+    async def test_a_full_read_keeps_the_grid(self, snap_to_grid: bool):
+        """Unsnapped, the bbox filled in for a full read was anchored on as if
+        the caller had passed it, which labelled the rows north-up."""
         ds, full = self._dataset()
-        arr = await ds.read()
+        arr = await ds.read(snap_to_grid=snap_to_grid)
         assert arr.transform == self.T
         np.testing.assert_array_equal(arr.data, full)  # type: ignore[reportUnknownMemberType]
 

@@ -173,10 +173,10 @@ def compare_arrays(path_a: str, path_b: str, *, by_transform: bool = True) -> di
     transform: cropping from ``[0, 0]`` would compare ground a row apart as soon as
     one grid rounds north rather than south.
 
-    A native-resolution read passes ``by_transform=False``. Both sides read the same
-    source pixels from ``floor(offset)``, but an unsnapped output reports the *bbox*
-    as its origin — a sub-pixel fiction rastera mirrors from rasterio deliberately
-    (``geo.window_from_bbox``) that says nothing about the pixels.
+    A native-resolution read passes ``by_transform=False``. An unsnapped output
+    reports the *bbox* as its origin, a fraction of a pixel off the source grid, and
+    both sides hold GDAL's nearest picks behind it (``geo.unsnapped_window``), so
+    the arrays line up from ``[0, 0]``.
     """
     import rasterio
 
