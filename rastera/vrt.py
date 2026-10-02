@@ -552,8 +552,8 @@ def _declared_crs_epsg(root: ET.Element) -> int | None:
 def _rect(parent: ET.Element, tag: str) -> tuple[float, float, float, float] | None:
     """Parse a ``<SrcRect>``/``<DstRect>`` child into ``(xOff, yOff, xSize, ySize)``.
 
-    ``None`` when absent. Compared exactly downstream: a band-stack rect is
-    whole pixels, and fractional ones occur only in warped VRTs.
+    ``None`` when absent. Compared exactly downstream: a supported rect is
+    whole pixels, and a fractional one never matches, so it is rejected.
     """
     el = parent.find(tag)
     if el is None:
@@ -728,9 +728,10 @@ def _declared_nodata(bands: Sequence[_VRTBand]) -> float | None:
     It wins over the sources'. A VRT over a DIMAP declares
     ``<NoDataValue>0</NoDataValue>`` where the DIMAP declares none, and taking
     the DIMAP's None made the black corners of a rotated footprint valid zeros,
-    which ``merge`` pasted over a neighbour: 82% of a 128x128 window against
-    GDAL. Bands declaring none, or hiding theirs (``<HideNoDataValue>``), are
-    skipped. Bands declaring different values raise, since rastera carries one.
+    which ``merge`` pasted over a neighbour: 82% of a 128x128 window came back
+    zero where GDAL returned imagery. Bands declaring none, or hiding theirs
+    (``<HideNoDataValue>``), are skipped. Bands declaring different values
+    raise, since rastera carries one.
     """
     declared = {b.nodata for b in bands if b.nodata is not None and not b.hide_nodata}
     # NaN is never equal to itself, so a NaN-nodata VRT would look like a

@@ -1,7 +1,9 @@
 """Pixel resampling for resolution changes and reprojection.
 
-The readers call ``_resample_impl``, which also returns the coverage mask;
-:func:`resample` is the same without it, and documents the semantics.
+The readers call ``_resample_impl``, which also returns the coverage mask.
+:func:`resample` drops the mask and documents the semantics. Without nodata it
+also sets the pixels no source reaches to 0, where ``_resample_impl`` leaves
+copied edge values.
 
 Where rastera's kernels knowingly differ from gdalwarp's:
 
@@ -36,7 +38,7 @@ _RESAMPLING_METHODS = ("nearest", "bilinear", "cubic")
 _AUTO_SCALE_THRESHOLD = 2.0
 
 # Kernel half-width in source pixels at unit scale: bilinear samples 2x2, cubic
-# 4x4.  Downsampling widens it (see the anti-aliasing expansion below).
+# 4x4.  Downsampling widens it (see ``_resample_kernel``).
 _BASE_RADIUS = {"bilinear": 1, "cubic": 2}
 
 
@@ -1162,8 +1164,8 @@ def _on_src_centers(coord: np.ndarray, step: float) -> bool:
 def _kernel_halo(method: ResamplingMethod, scale: float) -> int:
     """Source pixels a *method* kernel reaches beyond the one it samples.
 
-    Widens with the downsample factor (see the anti-aliasing note in
-    :func:`_resample_kernel`); *scale* is ``dst_res / src_res``.
+    Widens with the downsample factor, as in :func:`_resample_kernel`; *scale*
+    is ``dst_res / src_res``.
     """
     if method == "nearest":
         return 0
