@@ -147,13 +147,11 @@ async def merge(
     res_matches_target = math.isclose(target_resolution, base_gt.res[0])
 
     # The native path is a straight block copy onto the snapped output grid,
-    # which sits on multiples of target_resolution — exact only when every
-    # source grid is on those multiples too, north-up, running east and
-    # square at that resolution (a negative -e can never isclose a positive
-    # resolution). Every input, not just the first: a later one with taller
-    # pixels, or south-up or rotated, went down the native path, which then
-    # refused it, and one running west was pasted mirrored. Anything else is
-    # resampled.
+    # which sits on multiples of target_resolution. That is exact only when
+    # every input, not just the first, is on those multiples too: north-up,
+    # running east, and square at that resolution (a negative -e can never
+    # isclose a positive resolution). With the CRS and resolution checks
+    # above, that is all the block copy needs. Anything else is resampled.
     srcs_on_res_grid = all(
         math.isclose(target_resolution, -float(t.e))
         and float(t.a) > 0
@@ -164,11 +162,8 @@ async def merge(
         for t in (cog._geotiff.transform for cog in cogs)
     )
 
-    # Note: use_overviews is intentionally NOT included here.  The native
-    # fast path is only reached when res_matches_target is True, meaning
-    # the target resolution equals the native resolution.  Since overviews
-    # are always coarser than native, _best_overview_for_resolution would
-    # return None anyway — so use_overviews is correctly a no-op here.
+    # Not use_overviews: the native path reads at the native resolution, which
+    # no overview serves.
     needs_reproject = (
         not all_same_crs
         or not all_same_res
@@ -198,8 +193,6 @@ async def merge(
     # --- Native merge fast path (no resampling needed) ---
     # Reached only when all COGs share the target CRS and resolution AND
     # snap_to_grid is True — every other case routes to _merge_reprojected.
-    _require_compatible_merge_inputs(cogs)
-
     native_crs = base._crs_epsg
     assert native_crs is not None
     native_bbox = transform_bbox(bbox, bbox_crs, native_crs)
@@ -600,49 +593,6 @@ def _require_stackable_bands(
             raise ValueError(
                 f"All GeoTIFFs must carry the requested bands; band_indices "
                 f"asks for band {highest} but {cog.uri!r} has {cog.count}"
-            )
-
-
-def _require_compatible_merge_inputs(cogs: Sequence[AsyncGeoTIFF]) -> None:
-    """
-    Validate that all inputs can be pasted onto a single shared pixel grid.
-
-    Native-path only: assumes a north-up, non-rotated Affine grid (b=d=0) and
-    that all sources are aligned to it (origins differ by whole pixels).
-    Cross-input dtype/band-count checks live in :func:`_require_stackable_bands`.
-    """
-    base = cogs[0]
-    base_t = base._geotiff.transform
-    scale_x = float(base_t.a)
-    scale_y = float(-base_t.e)
-
-    if not math.isclose(float(base_t.b), 0.0) or not math.isclose(float(base_t.d), 0.0):
-        raise NotImplementedError(
-            "merge currently requires a north-up (non-rotated) grid"
-        )
-
-    for cog in cogs[1:]:
-        t = cog._geotiff.transform
-        if cog._crs_epsg != base._crs_epsg:
-            raise ValueError("All GeoTIFFs must share the same CRS EPSG")
-        if not math.isclose(float(t.a), scale_x):
-            raise ValueError("All GeoTIFFs must share the same pixel width")
-        if not math.isclose(float(-t.e), scale_y):
-            raise ValueError("All GeoTIFFs must share the same pixel height")
-        if not math.isclose(float(t.b), 0.0) or not math.isclose(float(t.d), 0.0):
-            raise NotImplementedError(
-                "merge currently requires a north-up (non-rotated) grid"
-            )
-
-        # Ensure origins line up on the same pixel grid (integer pixel offsets).
-        off_x = (float(t.c) - float(base_t.c)) / scale_x
-        off_y = (float(base_t.f) - float(t.f)) / scale_y
-        if not math.isclose(off_x, round(off_x), abs_tol=1e-6) or not math.isclose(
-            off_y, round(off_y), abs_tol=1e-6
-        ):
-            raise ValueError(
-                "All GeoTIFFs must be aligned to the same pixel grid "
-                "(origins differ by whole pixels)"
             )
 
 

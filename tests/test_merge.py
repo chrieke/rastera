@@ -20,7 +20,6 @@ from rastera.geo import (
     window_from_bbox,
 )
 from rastera.merge import (
-    _require_compatible_merge_inputs,
     _resolve_target_crs,
     merge,
 )
@@ -137,32 +136,6 @@ class TestSnappedGridForBbox:
             BBox(9.9999999999, 0.0, 10.0000000001, 10.0), 1.0
         )
         assert (w, h) == (1, 10)
-
-
-# ── _require_compatible_merge_inputs ─────────────────────────────────────
-
-
-class TestRequireCompatibleMergeInputs:
-    def test_single_cog_passes(self):
-        _require_compatible_merge_inputs([_make_cog()])
-
-    def test_mismatched_crs_raises(self):
-        cog1 = _make_cog(crs=32632)
-        cog2 = _make_cog(crs=32633)
-        with pytest.raises(ValueError, match="same CRS"):
-            _require_compatible_merge_inputs([cog1, cog2])
-
-    def test_mismatched_resolution_raises(self):
-        cog1 = _make_cog(scale=10.0)
-        cog2 = _make_cog(scale=20.0)
-        with pytest.raises(ValueError, match="same pixel width"):
-            _require_compatible_merge_inputs([cog1, cog2])
-
-    def test_aligned_cogs_pass(self):
-        # Two COGs with different origins but aligned to the same grid
-        cog1 = _make_cog(origin_x=0.0, origin_y=1000.0)
-        cog2 = _make_cog(origin_x=1000.0, origin_y=1000.0)
-        _require_compatible_merge_inputs([cog1, cog2])
 
 
 # ── merge argument validation ────────────────────────────────────────────
