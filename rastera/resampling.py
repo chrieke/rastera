@@ -88,6 +88,10 @@ def resample(
       Can overshoot the source value range (for integer dtypes, output
       is clipped to the dtype range and rounded).
 
+    Where the destination grid is the source grid shifted by whole pixels,
+    ``"bilinear"`` and ``"cubic"`` copy the source pixels as ``"nearest"``
+    does, like gdalwarp.
+
     For ``"bilinear"`` and ``"cubic"`` with ``nodata`` set, nodata is
     handled GDAL-style: kernel weights are renormalized over valid
     samples (invalid samples are dropped from the kernel). A target
@@ -364,6 +368,24 @@ def _resample_kernel(
             np.arange(dst_height, dtype=np.float64) + 0.5
         ) + float(combined.f)
         coords_2d = False
+        # Every destination center on a source center, one source pixel apart:
+        # each kernel is a copy of that pixel, with weight 0 on its neighbours.
+        # A NaN or inf neighbour still spreads through the 0 weight, and cubic's
+        # ≥2-valid gate drops one-pixel-wide features, so copy instead, as
+        # gdalwarp's "translation-on-pixel-boundaries" optimization does.
+        if _on_src_centers(src_col_f, float(combined.a)) and _on_src_centers(
+            src_row_f, float(combined.e)
+        ):
+            return _resample_nearest(
+                src_array,
+                src_transform,
+                dst_transform,
+                dst_width,
+                dst_height,
+                nodata,
+                None,
+                src_coverage,
+            )
         # Local pixel scale = src pixels per dst pixel (= dst_res / src_res
         # along the axis-aligned same-CRS case).
         x_scale_local = _kernel_scale(abs(float(combined.a)))
@@ -1199,6 +1221,19 @@ def _pixel_index(coord: np.ndarray) -> np.ndarray:
     nearest = np.rint(coord)
     on_edge = np.abs(coord - nearest) < _DENOISE_TOL
     return np.floor(np.where(on_edge, nearest, coord)).astype(np.intp)
+
+
+def _on_src_centers(coord: np.ndarray, step: float) -> bool:
+    """Whether 1-D source pixel coordinates *coord*, *step* apart, are one
+    source pixel apart and each within ``_DENOISE_TOL`` of a pixel center.
+
+    An odd downsample factor puts every center on a source center too; *step*
+    rules it out.
+    """
+    if abs(step - 1.0) >= _DENOISE_TOL:
+        return False
+    off = coord - 0.5
+    return bool(np.all(np.abs(off - np.rint(off)) < _DENOISE_TOL))
 
 
 def _kernel_halo(method: ResamplingMethod, scale: float) -> int:
