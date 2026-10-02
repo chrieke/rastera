@@ -523,6 +523,19 @@ def _parse_regular_tiling(dims: ET.Element) -> tuple[int, int, int, int]:
                 f"DIMAP NTILES_OVERLAP=({o_cols},{o_rows}); only zero-overlap "
                 f"tilings are supported"
             )
+    # The spelling PHR descriptors use, and the only one GDAL reads.
+    for tag in ("OVERLAP_ROW", "OVERLAP_COL"):
+        text = regular.findtext(tag)
+        if text is None:
+            continue
+        try:
+            value = int(text)
+        except ValueError as e:
+            raise ValueError(f"DIMAP: non-integer <{tag}>: {e}") from e
+        if value != 0:
+            raise NotImplementedError(
+                f"DIMAP <{tag}> is {value}; only zero-overlap tilings are supported"
+            )
     tile_w = _require_positive_attr(size, "ncols")
     tile_h = _require_positive_attr(size, "nrows")
     n_cols = _require_positive_attr(count, "ntiles_C")

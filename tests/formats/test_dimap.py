@@ -340,6 +340,27 @@ class TestParseDIMAP:
         with pytest.raises(NotImplementedError, match="OVERLAP"):
             _parse_dimap_xml(xml)
 
+    @pytest.mark.parametrize("tag", ["OVERLAP_ROW", "OVERLAP_COL"])
+    def test_rejects_phr_overlap(self, tag: str):
+        """PHR descriptors declare overlap as <OVERLAP_ROW>/<OVERLAP_COL>.
+        Only NTILES_OVERLAP was checked, so a nonzero overlap placed every
+        tile after the first at the wrong offset."""
+        xml = _modified(
+            PNEO_DIMAP,
+            b'<NTILES_OVERLAP ncols="0" nrows="0" />',
+            f"<{tag}>4</{tag}>".encode(),
+        )
+        with pytest.raises(NotImplementedError, match=tag):
+            _parse_dimap_xml(xml)
+
+    def test_zero_phr_overlap_accepted(self):
+        xml = _modified(
+            PNEO_DIMAP,
+            b'<NTILES_OVERLAP ncols="0" nrows="0" />',
+            b"<OVERLAP_ROW>0</OVERLAP_ROW><OVERLAP_COL>0</OVERLAP_COL>",
+        )
+        _parse_dimap_xml(xml)
+
     def test_rejects_non_band_composite(self):
         xml = _modified(
             PNEO_DIMAP,
