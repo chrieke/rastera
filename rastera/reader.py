@@ -21,6 +21,7 @@ from .geo import (
     _is_on_res_grid,
     _normalize_crs,
     _require_north_up,
+    _transformer,
     bounds_from_transform,
     ensure_bbox,
     normalize_band_indices,
@@ -584,7 +585,7 @@ class AsyncGeoTIFF:
         transformer = None
         if needs_reproject:
             assert src_crs is not None and out_crs is not None
-            transformer = Transformer.from_crs(out_crs, src_crs, always_xy=True)
+            transformer = _transformer(out_crs, src_crs)
             spacing, reach = _src_units_per_pixel(transformer, read_bbox, spacing)
             read_bbox = transform_bbox(read_bbox, out_crs, src_crs)
 
@@ -608,8 +609,6 @@ class AsyncGeoTIFF:
         )
 
         def _warp() -> tuple[np.ndarray, np.ndarray | None]:
-            # pyproj >= 3.1 gives each thread its own handle under one
-            # Transformer, so the one built above is safe to use here.
             out, covered = _resample_impl(
                 native.data,  # type: ignore[reportUnknownMemberType]
                 src_transform=native.transform,
@@ -870,9 +869,11 @@ def clear_cache() -> None:
     """Drop all entries from the in-memory GeoTIFF header cache.
 
     Does not change the configured cache size; subsequent opens repopulate
-    it up to the current limit.
+    it up to the current limit. Also drops the cached pyproj Transformers, so
+    a later change to PROJ's network or grid settings takes effect.
     """
     _geotiff_cache.clear()
+    _transformer.cache_clear()
 
 
 def set_cache_size(n: int) -> None:
