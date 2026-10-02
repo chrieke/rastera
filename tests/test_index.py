@@ -720,3 +720,22 @@ class TestBuildIndexStore:
             )
             await open_from_index(gdf, region="eu-north-1")
         assert mock_open.call_args.kwargs["region"] == "eu-north-1"
+
+    @pytest.mark.parametrize("entry", ["build_index", "open_from_index"])
+    @patch("rastera.index.AsyncGeoTIFF.open", new_callable=AsyncMock)
+    async def test_a_local_descriptor_opens_its_sources_with_their_own_stores(
+        self, mock_open: Any, entry: str, tmp_path: Any
+    ) -> None:
+        """Its sources may be anywhere. Handed the index's local store, an
+        s3:// source was read from /key on local disk."""
+        vrt = tmp_path / "v.vrt"
+        vrt.write_bytes(b"<VRTDataset/>")
+        mock_open.return_value = _make_mock_async_geotiff(uri=str(vrt))
+        if entry == "build_index":
+            await build_index([str(vrt)])
+        else:
+            gdf = _make_index_gdf(
+                [{"uri": str(vrt), "minx": 0, "miny": 0, "maxx": 1, "maxy": 1}]
+            )
+            await open_from_index(gdf)
+        assert mock_open.call_args.kwargs["store"] is None

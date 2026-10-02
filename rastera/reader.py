@@ -46,6 +46,8 @@ from .resampling import (
 from .store import (
     _build_store,
     _extract_key,
+    _is_local_descriptor,
+    _parse_uri,
     _require_same_bucket,
     _resolve_local_path,
     _shared_store,
@@ -807,7 +809,8 @@ async def open(
     """Open one or more GeoTIFFs from any supported URI.
 
     When a list of URIs is passed, files are opened concurrently with a
-    shared object store for connection reuse.
+    shared object store for connection reuse. A URL with a query (presigned)
+    and a local VRT or DIMAP each build their own.
 
     Args:
         uri: A single URI or a list of URIs. A local path may also be a
@@ -855,8 +858,13 @@ async def _open_many(
     if not uris:
         return []
     if store is None:
-        _require_same_bucket(uris, "using a shared store")
-        store = _build_store(uris[0], **store_kwargs)
+        shared = [u for u in uris if not _needs_own_store(u)]
+        if shared:
+            _require_same_bucket(shared, "using a shared store")
+            store = _build_store(shared[0], **store_kwargs)
+        stores = [None if _needs_own_store(u) else store for u in uris]
+    else:
+        stores = [store] * len(uris)
     # store_kwargs is forwarded as well as consumed above: plain TIFF opens
     # ignore it once `store` is set, but the VRT and DIMAP branches need it to
     # build their own obstore for the descriptor fetch (the async-tiff and
@@ -866,13 +874,13 @@ async def _open_many(
             *(
                 AsyncGeoTIFF.open(
                     u,
-                    store=store,
+                    store=s,
                     prefetch=prefetch,
                     cache=cache,
                     meta_overrides=meta_overrides,
                     **store_kwargs,
                 )
-                for u in uris
+                for u, s in zip(uris, stores)
             )
         )
     )
@@ -1318,6 +1326,18 @@ def _cache_key(uri: str) -> _CacheKey | None:
     except OSError:
         return None  # the open itself says why
     return (str(path), st.st_mtime_ns, st.st_ctime_ns, st.st_ino, st.st_size)
+
+
+def _needs_own_store(uri: str) -> bool:
+    """Whether *uri* in an ``open()`` list builds its own store rather than
+    sharing the list's.
+
+    A URL with a query is its own store root (see ``_parse_http_uri``), so two
+    presigned URLs on one host were refused as two buckets, with both
+    signatures in the error. And a local VRT or DIMAP, see
+    ``_is_local_descriptor``.
+    """
+    return _is_local_descriptor(uri) or _parse_uri(uri).root == uri
 
 
 def _source_store(

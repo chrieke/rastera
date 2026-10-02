@@ -23,6 +23,7 @@ from .reader import (
 from .store import (
     _build_store_with,
     _extract_key,
+    _is_local_descriptor,
     _require_same_bucket,
     _resolve_local_path,
 )
@@ -103,7 +104,7 @@ async def build_index(
                 # them, not through the store.
                 src = await AsyncGeoTIFF.open(
                     uri,
-                    store=cached_store,
+                    store=None if _is_local_descriptor(uri) else cached_store,
                     prefetch=prefetch,
                     cache=_resolve_local_path(uri) is None,
                     **store_kwargs,
@@ -213,7 +214,7 @@ async def open_from_index(
             # the new version's cache key.
             return await AsyncGeoTIFF.open(
                 uri,
-                store=cached_store,
+                store=None if _is_local_descriptor(uri) else cached_store,
                 prefetch=prefetch,
                 cache=_resolve_local_path(uri) is None,
                 **store_kwargs,

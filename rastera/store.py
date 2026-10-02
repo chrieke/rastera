@@ -214,6 +214,15 @@ def _resolve_local_path(uri: str) -> Path | None:
     return _parse_uri(uri).local_path
 
 
+def _is_local_descriptor(uri: str) -> bool:
+    """Whether *uri* is a VRT or DIMAP on local disk. Its sources may sit in any
+    store (see ``_check_source_uri``), so it builds its own: handed a shared
+    local store, it read ``s3://bucket/key`` from ``/key`` on disk."""
+    return (
+        uri.lower().endswith((".vrt", ".xml")) and _resolve_local_path(uri) is not None
+    )
+
+
 def _require_same_bucket(uris: Sequence[str], reason: str) -> None:
     """Raise if *uris* do not all resolve to the same store.
 
