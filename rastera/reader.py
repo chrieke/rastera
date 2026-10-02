@@ -82,7 +82,11 @@ class AsyncGeoTIFF:
             if self._crs_override is not None
             else geotiff.crs.to_epsg()
         )
-        self._nodata: int | float | None = _coerce_nodata(geotiff.nodata, geotiff.dtype)
+        # The tag's text, not ``geotiff.nodata``'s float() of it (see
+        # ``_coerce_nodata``). ``getattr``: only a real ``GeoTIFF`` has ``ifd``.
+        ifd = getattr(geotiff, "ifd", None)
+        declared = ifd.gdal_nodata if ifd is not None else geotiff.nodata
+        self._nodata: int | float | None = _coerce_nodata(declared, geotiff.dtype)
 
         self.overviews: list[tuple[int, int]] = [
             (o.width, o.height) for o in geotiff.overviews
@@ -1059,9 +1063,14 @@ def _halo_bbox(
 
 
 def _coerce_nodata(
-    nodata: float | None, dtype: np.dtype[Any] | None
+    nodata: float | str | None, dtype: np.dtype[Any] | None
 ) -> int | float | None:
-    """Coerce nodata from async-geotiff (always float) to match the raster dtype.
+    """Coerce nodata, a number or the GDAL_NODATA tag's text, to match the
+    raster dtype.
+
+    The text goes through ``int()`` before ``float()``: a float rounds past
+    2**53, so uint64's maximum, 2**64 - 1, would come back as 2**64 and out
+    of range.
 
     Returns None when *dtype* cannot carry the value — NaN or a fraction on an
     integer band, or an integer outside the dtype's range. All mean "this
@@ -1075,6 +1084,11 @@ def _coerce_nodata(
     """
     if nodata is None or dtype is None:
         return None
+    if isinstance(nodata, str):
+        try:
+            nodata = int(nodata)
+        except ValueError:
+            nodata = float(nodata)
     dt = np.dtype(dtype)
     if dt.kind in ("i", "u"):
         if math.isnan(nodata) or not float(nodata).is_integer():
