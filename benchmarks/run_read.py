@@ -6,10 +6,20 @@ Usage:
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from run import run_benchmarks
 
 # UTM 33N subset over Rome, inside the B03 tile's footprint.
 BBOX = "255804.0,4626619.0,274330.0,4644625.0"
+
+# Synthetic 10-band, band-interleaved files with a predictor, written on first
+# run under the gitignored data dir.
+_DATA = Path(__file__).parent / "data"
+BAND_PRED2 = str(_DATA / "band_interleaved_int16_pred2.tif")
+BAND_PRED3 = str(_DATA / "band_interleaved_float32_pred3.tif")
+# 1800x1800 px, starting and ending mid-tile.
+BAND_BBOX = "501000.0,5001480.0,519000.0,5019480.0"
 
 SCENARIOS = [
     {
@@ -135,7 +145,57 @@ SCENARIOS = [
             "(RMSE 0.24). RMSE is the check.",
         },
     },
+    {
+        "name": "Read: band-interleaved, 10 bands int16, predictor 2, native resolution (synthetic, local)",
+        "mode": "read",
+        "uri": BAND_PRED2,
+        "bbox": BAND_BBOX,
+        "bbox_crs": 32632,
+        "expect": {"max_pct_differ": 0, "max_rmse_pct": 0},
+    },
+    {
+        "name": "Read: band-interleaved, 10 bands float32, predictor 3, native resolution (synthetic, local)",
+        "mode": "read",
+        "uri": BAND_PRED3,
+        "bbox": BAND_BBOX,
+        "bbox_crs": 32632,
+        "expect": {"max_pct_differ": 0, "max_rmse_pct": 0},
+    },
 ]
 
+
+def _write_band_interleaved(path: str, dtype: str, predictor: int) -> None:
+    """2048x2048 px of random walks along each row, in 256 px tiles."""
+    if Path(path).exists():
+        return
+    import numpy as np
+    import rasterio
+    from rasterio.transform import from_origin
+
+    steps = np.random.default_rng(0).integers(-20, 20, (10, 2048, 2048))
+    data = (np.cumsum(steps, axis=2) + 1000).astype(dtype)
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    with rasterio.open(
+        path,
+        "w",
+        driver="GTiff",
+        width=2048,
+        height=2048,
+        count=10,
+        dtype=dtype,
+        crs="EPSG:32632",
+        transform=from_origin(500000, 5020480, 10, 10),
+        tiled=True,
+        blockxsize=256,
+        blockysize=256,
+        interleave="band",
+        compress="zstd",
+        predictor=predictor,
+    ) as dst:
+        dst.write(data)
+
+
 if __name__ == "__main__":
+    _write_band_interleaved(BAND_PRED2, "int16", 2)
+    _write_band_interleaved(BAND_PRED3, "float32", 3)
     run_benchmarks(SCENARIOS)

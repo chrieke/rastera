@@ -13,6 +13,12 @@ requires-python = ">=3.12"
 dependencies = [
     "affine>=3.0.1",
     "async-geotiff>=0.5.1",
+    # TODO: rastera/predictor.py corrects this version's predictor undo, so a
+    # fixed release would be corrected twice. Once async-tiff undoes it per band
+    # (async-tiff PR 340): delete rastera/predictor.py, call
+    # readable.read(window=window) again in AsyncGeoTIFF._read_native, and drop
+    # this pin.
+    "async-tiff==0.7.2",
     "numpy>=2.2.6",
     "obstore>=0.9.0",
     "pyproj>=3.7.1",

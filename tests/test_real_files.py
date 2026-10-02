@@ -3,8 +3,8 @@
 Every other offline test stands async-geotiff in with a mock that returns
 whatever conftest says, so a change to its Overview objects, window reads,
 nodata or transform types would pass them all. These are tiny GDAL-made COGs
-with 16x16 blocks, and the references are GDAL's own reads of them;
-``data/make_fixtures.py`` rebuilds both.
+and band-interleaved GTiffs with 16x16 blocks, and the references are GDAL's
+own reads of them; ``data/make_fixtures.py`` rebuilds both.
 """
 
 import math
@@ -72,6 +72,20 @@ class TestReads:
         arr = await ds.read(bbox=(500050, 5000100, 500150, 5000200), bbox_crs=32632)
         assert arr.transform == Affine(10, 0, 500050, 0, 10, 5000100)
         np.testing.assert_array_equal(_data(arr), REF["south_up"][10:20, 5:15])
+
+    @pytest.mark.parametrize("name", ["band_pred2", "band_pred3"])
+    async def test_band_interleaved_full_read(self, name: str):
+        """async-tiff 0.7.2 undoes the predictor across the bands of a tile
+        rather than per band; ``rastera.predictor`` redoes it."""
+        arr = await (await _open(f"{name}.tif")).read()
+        np.testing.assert_array_equal(arr.data, REF[name])  # type: ignore[reportUnknownMemberType]
+
+    async def test_band_interleaved_window_read_across_edge_tiles(self):
+        ds = await _open("band_pred2.tif")
+        arr = await ds.read(
+            window=rastera.Window(col_off=5, row_off=3, width=35, height=21)
+        )
+        np.testing.assert_array_equal(arr.data, REF["band_pred2"][:, 3:, 5:])  # type: ignore[reportUnknownMemberType]
 
     async def test_an_overview_level_holds_gdals_pixels(self):
         """Level 1 is 20x40 m: the coarsest that fits a 40 m read on both axes."""

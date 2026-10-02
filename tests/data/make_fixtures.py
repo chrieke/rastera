@@ -16,7 +16,12 @@ import numpy as np
 HERE = Path(__file__).parent
 
 # GDAL's ENVI data type codes.
-_ENVI_TYPES = {np.dtype("u1"): 1, np.dtype("u2"): 12, np.dtype("f4"): 4}
+_ENVI_TYPES = {
+    np.dtype("u1"): 1,
+    np.dtype("i2"): 2,
+    np.dtype("u2"): 12,
+    np.dtype("f4"): 4,
+}
 
 
 def main() -> None:
@@ -30,6 +35,10 @@ def main() -> None:
     tile_a = np.repeat(100 + rows[:, None], 32, axis=1)
     tile_b = np.repeat(200 + rows[None, :], 32, axis=0)
     tile_b[:16, :4] = 0  # nodata where the two tiles overlap
+    # Random walks along each row, negative values included.
+    steps = np.random.default_rng(0).integers(-500, 500, (3, 24, 40))
+    band_i16 = np.cumsum(steps, axis=2).astype(np.int16)
+    band_f32 = (band_i16 / 7).astype(np.float32)
 
     # name: pixels, EPSG code, GDAL geotransform, nodata.
     fixtures: dict[str, tuple[np.ndarray[Any, Any], int, tuple[int, ...], str]] = {
@@ -63,6 +72,14 @@ def main() -> None:
         subprocess.run(["gdalbuildvrt", "-q", str(vrt), *tiles], check=True)
         refs["mosaic_last"] = _gdal(work / "mosaic", "gdal_translate", vrt)
 
+        # 40x24, so the 16x16 blocks leave edge tiles on both axes.
+        for name, pixels, predictor in (
+            ("band_pred2", band_i16, 2),
+            ("band_pred3", band_f32, 3),
+        ):
+            _write_band_interleaved(work, name, pixels, predictor)
+            refs[name] = _gdal(work / name, "gdal_translate", HERE / f"{name}.tif")
+
     np.savez_compressed(HERE / "references.npz", **refs)
 
 
@@ -87,6 +104,20 @@ def _write_cog(
     subprocess.run(command, check=True, stderr=subprocess.DEVNULL)
 
 
+def _write_band_interleaved(
+    work: Path, name: str, pixels: np.ndarray[Any, Any], predictor: int
+) -> None:
+    """Write *pixels* as a tiled, band-interleaved GTiff, not a COG."""
+    raw = _envi(pixels, work / f"{name}_src.raw")
+    options = (
+        "-q -of GTiff -a_srs EPSG:32632 -a_ullr 500000 5000240 500400 5000000 "
+        "-co TILED=YES -co BLOCKXSIZE=16 -co BLOCKYSIZE=16 -co INTERLEAVE=BAND "
+        f"-co COMPRESS=ZSTD -co PREDICTOR={predictor}"
+    ).split()
+    command = ["gdal_translate", *options, str(raw), str(HERE / f"{name}.tif")]
+    subprocess.run(command, check=True)
+
+
 def _gdal(out: Path, tool: str, src: Path, *options: str) -> np.ndarray[Any, Any]:
     """*src* as GDAL's *tool* reads it, via ENVI so that no TIFF reader is
     involved."""
@@ -97,10 +128,12 @@ def _gdal(out: Path, tool: str, src: Path, *options: str) -> np.ndarray[Any, Any
 
 
 def _envi(pixels: np.ndarray[Any, Any], path: Path) -> Path:
+    """*pixels* as (rows, cols) or (bands, rows, cols)."""
     pixels.tofile(path)
+    bands, lines, samples = pixels.reshape(-1, *pixels.shape[-2:]).shape
     path.with_suffix(".hdr").write_text(
-        f"ENVI\nsamples = {pixels.shape[1]}\nlines = {pixels.shape[0]}\n"
-        f"bands = 1\nheader offset = 0\nfile type = ENVI Standard\n"
+        f"ENVI\nsamples = {samples}\nlines = {lines}\n"
+        f"bands = {bands}\nheader offset = 0\nfile type = ENVI Standard\n"
         f"data type = {_ENVI_TYPES[pixels.dtype]}\ninterleave = bsq\n"
         f"byte order = 0\n"
     )
@@ -117,8 +150,9 @@ def _load_envi(path: Path) -> np.ndarray[Any, Any]:
         )
     }
     dtype = {v: k for k, v in _ENVI_TYPES.items()}[int(header["data type"])]
-    shape = (int(header["lines"]), int(header["samples"]))
-    return np.fromfile(path, dtype=dtype).reshape(shape)
+    shape = (int(header["bands"]), int(header["lines"]), int(header["samples"]))
+    pixels = np.fromfile(path, dtype=dtype).reshape(shape)
+    return pixels[0] if shape[0] == 1 else pixels
 
 
 if __name__ == "__main__":
