@@ -54,10 +54,7 @@ async def build_index(
     concurrency: int = 100,
     **store_kwargs: Any,
 ) -> gpd.GeoDataFrame:
-    """Build a geoparquet-ready index from a list of COG URIs.
-
-    Opens each COG to extract structured metadata and fetches the raw header
-    bytes needed for zero-network reconstruction via ``open_from_index``.
+    """Build a geoparquet-ready index of COG headers, for ``open_from_index``.
 
     Args:
         store: A pre-constructed *obstore* store for connection reuse — not the
@@ -77,13 +74,11 @@ async def build_index(
     uris = list(uris)
     if not uris:
         return _empty_geodataframe()
-    # Checked even when the caller supplies a store: the header cache below is
-    # keyed by object key, so two buckets mirroring a key path would collapse.
+    # Even with the caller's store: the header cache is keyed by object key.
     _require_same_bucket(uris, "building an index")
     obs = store if store is not None else _build_obstore(uris[0], **store_kwargs)
 
-    # Fetch header bytes once, then open COGs through cache so async-geotiff
-    # reads from memory instead of making a second network request.
+    # Fetch each header once, then open through it.
     async def _fetch_header(uri: str) -> tuple[str, str, bytes]:
         key = _extract_key(uri)
         try:
@@ -122,9 +117,6 @@ async def build_index(
     geometries: list[Any] = []
 
     for src, hdr in results:
-        # Every column but uri/header_bytes is a profile key, so read them off
-        # the profile: hand-copying them is how this came to record a
-        # band-stack VRT's first source's band count rather than the stack's.
         p = src.profile
         rows["uri"].append(src.uri)
         rows["header_bytes"].append(hdr)
@@ -139,8 +131,6 @@ async def build_index(
         rows["overviews"].append(json.dumps(p["overviews"]))
         b = p["bounds"]
         geom = box(b.minx, b.miny, b.maxx, b.maxy)
-        # Without an EPSG code, the CRS object. Skipping the reprojection for
-        # those files stored their native metres as degrees.
         crs = p["crs_epsg"] if p["crs_epsg"] is not None else p["crs"]
         if crs != 4326:
             geom = _reproject(geom, crs, 4326)
@@ -192,9 +182,8 @@ async def open_from_index(
     uris: list[str] = gdf["uri"].tolist()  # type: ignore[reportUnknownMemberType]
     headers: list[bytes] = gdf["header_bytes"].tolist()  # type: ignore[reportUnknownMemberType]
 
-    # An index may legitimately span buckets (rows concatenated from several
-    # builds), but a single open pass cannot: one store, and a header cache
-    # keyed by object key. Reject rather than serve one file's bytes as another's.
+    # One store and a cache keyed by object key, though an index may span
+    # buckets.
     _require_same_bucket(uris, "opening from an index")
 
     shared_store = (
@@ -231,12 +220,8 @@ async def open_from_index(
 
 
 class HeaderCacheStore:
-    """Obspec-compatible store wrapper that serves pre-fetched header bytes from cache.
-
-    For byte ranges that fall within the cached region, data is served from memory.
-    For ranges beyond the cache (tile data), requests are delegated to the inner store
-    via ``obstore`` (which can call both native Rust stores and Python stores).
-    """
+    """An obspec store serving byte ranges inside a cached header from memory,
+    and the rest from *inner*."""
 
     def __init__(self, inner: Any, cache: dict[str, bytes]):
         self._inner = inner
@@ -321,26 +306,17 @@ def _read_geoparquet(
     bbox: tuple[float, float, float, float] | None = None,
     bbox_crs: int | None = None,
 ) -> gpd.GeoDataFrame:
-    """Read a geoparquet index, optionally filtering spatially.
+    """Read a geoparquet index, optionally only the rows meeting *bbox*.
 
-    When *bbox* is provided, the metadata columns are read and filtered first,
-    then ``header_bytes`` is streamed in batches and only the matched rows are
-    kept. That column dominates the file — one prefetch window per COG, 32 KiB
-    by default — so materializing it whole costs roughly its own size on top of
-    the result, however few rows the bbox selects. Measured on a 131 MB header
-    column selecting 2 rows: 429 MB peak RSS reading the column at once against
-    307 MB streaming it, so the saving tracks the column and reaches GBs on a
-    100k-COG index.
-
-    The bytes still have to come off disk. geopandas writes a single row group
-    at any realistic index size, so there is no row-group boundary to skip past;
-    this bounds what is resident, not what is read.
+    With a bbox, the metadata columns are filtered first and ``header_bytes``,
+    one prefetch window per COG, is streamed in batches keeping only the
+    matched rows: 307 MB peak RSS against 429 MB for a 131 MB column. That
+    bounds what is resident, not what is read, since geopandas writes one row
+    group.
     """
     if bbox is None:
         return gpd.read_parquet(path)  # type: ignore[reportUnknownMemberType]
 
-    # Closed rather than left to the GC: a process opening index after index
-    # would otherwise sit on a file handle per call until collection.
     with pq.ParquetFile(path) as pf:
         all_names: list[str] = pf.schema_arrow.names  # type: ignore[reportUnknownMemberType]
         meta_cols = [c for c in all_names if c != "header_bytes"]
@@ -359,20 +335,13 @@ def _read_geoparquet(
     return filtered
 
 
-# Rows of ``header_bytes`` held in memory at once while picking out the matched
-# ones. pyarrow's own default is 65536, which at a 32 KiB prefetch window is 2 GB
-# a batch — the thing this streaming exists to avoid. 1024 puts a batch at ~32 MB.
+# ~32 MB a batch at the default prefetch; pyarrow's 65536 rows would be 2 GB.
 _HEADER_BATCH_ROWS = 1024
 
 
 def _take_header_bytes(pf: pq.ParquetFile, row_indices: Sequence[int]) -> list[bytes]:
-    """The ``header_bytes`` of *row_indices*, in that order, read in batches.
-
-    *row_indices* are positions into the file's row order, which is what
-    ``_read_geoparquet``'s ``reset_index(drop=True)`` makes the filtered frame's
-    index. Batches arrive in that same order, so each one covers a contiguous
-    span of positions and only the wanted rows are retained.
-    """
+    """The ``header_bytes`` of *row_indices*, positions in the file's row
+    order, read in batches."""
     wanted = set(row_indices)
     found: dict[int, bytes] = {}
     offset = 0
@@ -432,17 +401,13 @@ _EDGE_SEGMENTS = 20
 
 
 def _reproject(geom: Any, from_crs: int | CRS, to_crs: int | CRS) -> Any:
-    """*geom*, a box, reprojected, with its edges densified first.
+    """*geom*, a box, reprojected with its edges densified, since a straight
+    UTM edge is a curve in lon/lat: corners alone cut ~400 m off a 110 km tile
+    at 60N.
 
-    A straight box edge in a projected CRS is a curve in lon/lat, so
-    reprojecting the corners alone cuts a strip off the footprint: about 400 m
-    along the north edge of a 110 km UTM tile at 60N, 650 m at 70N. A query
-    landing there missed the tile, and a merge then filled it with nodata.
-
-    Into lon/lat, a box across the antimeridian came out as a ring spanning the
-    rest of the globe, and one around a pole as a ring leaving the pole out.
-    Queries inside either matched nothing. Those get their lon/lat envelope
-    instead, split at 180 degrees, or over every longitude.
+    Into lon/lat, a box across the antimeridian or around a pole gets its
+    envelope instead, split at 180° or over every longitude; reprojected as a
+    ring it matched no query inside it.
     """
     t = _transformer(from_crs, to_crs)
     if t.target_crs is not None and t.target_crs.is_geographic:

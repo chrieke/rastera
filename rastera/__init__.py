@@ -26,10 +26,8 @@ __all__ = [
     "ResamplingMethod",
     "S3Store",
     "Window",
-    # Raised by read() when a bbox misses the image, which is ordinary when
-    # walking an AOI over a tile set — exported so that case can be caught
-    # without a bare `except ValueError` swallowing the argument-validation
-    # errors alongside it.
+    # A bbox missing the image is ordinary over a tile set, so it can be caught
+    # apart from the argument errors, which are ValueErrors too.
     "WindowOutOfRangeError",
     "clear_cache",
     "set_cache_size",
@@ -42,21 +40,18 @@ __all__ = [
 
 _INDEX_EXPORTS = ("build_index", "open_from_index")
 
-# Hidden from type checkers on purpose: a visible module-level __getattr__ makes
-# them accept *any* rastera attribute, which would cost every downstream caller
-# typo detection on the public namespace. The TYPE_CHECKING import above already
-# declares the lazy names statically.
+# The index extra imports geopandas and pyarrow, which cost more than the rest
+# of rastera, so those names resolve on first access. Hidden from type checkers,
+# which would otherwise accept any rastera attribute.
 if not TYPE_CHECKING:
-    # The index extra drags in geopandas/pyarrow, which cost more to import than
-    # the rest of rastera put together. Resolve them on first attribute access
-    # so reader-only callers never pay for them.
+
     def __getattr__(name: str) -> Any:
         if name in _INDEX_EXPORTS:
             try:
                 from . import index
             except ImportError as exc:
-                # ImportError over AttributeError: a missing extra is an
-                # install problem. Trade-off: `hasattr` propagates it, not False.
+                # An install problem, so not AttributeError, though `hasattr`
+                # then raises rather than returning False.
                 raise ImportError(
                     f"rastera.{name} requires the optional index dependencies; "
                     'install them with `pip install "rastera[index]"`.'

@@ -52,18 +52,13 @@ class BBox:
 
 
 def ensure_bbox(bbox: BBox | tuple[float, float, float, float]) -> BBox:
-    """Normalize a caller-supplied bbox argument to a validated BBox instance.
-
-    Only for bboxes that came from outside the library — the internal
-    constructions (dataset bounds, intersections, transformed envelopes) are
-    already known-good and some are legitimately degenerate.
-    """
+    """A caller's bbox as a validated BBox. Not for internal ones, some of
+    which are legitimately degenerate."""
     box = bbox if isinstance(bbox, BBox) else BBox(*bbox)
     if not all(math.isfinite(v) for v in box):
         raise ValueError(f"BBox must be finite, got {tuple(box)}")
-    # Every consumer takes min()/max() of the corners, so an inverted box is
-    # silently swapped rather than rejected.  For a GeoJSON antimeridian bbox
-    # like (170, -10, -170, 10) that swap spans the complementary 340 degrees.
+    # Consumers take min()/max() of the corners, which turned a GeoJSON
+    # antimeridian bbox like (170, -10, -170, 10) into the other 340 degrees.
     if box.minx >= box.maxx or box.miny >= box.maxy:
         raise ValueError(
             f"BBox must have minx < maxx and miny < maxy, got {tuple(box)}. "
@@ -76,11 +71,7 @@ def ensure_bbox(bbox: BBox | tuple[float, float, float, float]) -> BBox:
 def normalize_band_indices(
     band_indices: Sequence[int] | None, n_bands: int
 ) -> list[int]:
-    """Return a concrete list of 0-based band indices for internal use.
-
-    *band_indices* is 1-based, matching the rasterio convention; ``None``
-    selects all bands.
-    """
+    """1-based *band_indices*, as in rasterio, as 0-based; None for all."""
     if band_indices is None:
         return list(range(n_bands))
     if len(band_indices) == 0:
@@ -104,12 +95,8 @@ def normalize_band_indices(
 
 
 def validate_resolution(target_resolution: float) -> None:
-    """Reject a target resolution the grid math cannot use.
-
-    ``0`` divides by zero, a negative value yields a 1x1 array with a mirrored
-    transform, and nan/inf die inside ``round``/``ceil`` — all of them several
-    frames from the caller's mistake.
-    """
+    """Reject a target resolution the grid math cannot use, before it fails
+    several frames deep."""
     if not isinstance(target_resolution, int | float | np.number) or isinstance(
         target_resolution, bool
     ):
@@ -152,9 +139,8 @@ def snapped_grid_for_bbox(
     """
     bbox = ensure_bbox(bbox)
     validate_resolution(res)
-    # _denoise sees coordinate/res magnitudes here (~6e7 px for a UTM northing
-    # at sub-metre resolution), where the division error is ~1e-8 px — inside
-    # its 1e-6 tolerance with two orders of magnitude to spare.
+    # At ~6e7 px (a UTM northing at sub-metre resolution) the division error
+    # is ~1e-8 px, well inside _denoise's 1e-6.
     col_min = math.floor(_denoise(bbox.minx / res))
     col_max = math.ceil(_denoise(bbox.maxx / res))
     row_min = math.floor(_denoise(bbox.miny / res))
@@ -235,13 +221,8 @@ def compute_paste_slices(
     dst_width: int,
     dst_height: int,
 ) -> tuple[slice, slice, slice, slice] | None:
-    """Compute aligned source/target slices for pasting a read window into a mosaic.
-
-    For a window already read (described by *src*) that is to be pasted into a
-    destination array whose grid is *dst_transform*. Returns
-    ``(dst_rows, dst_cols, src_rows, src_cols)``, or ``None`` when clipping to
-    the destination leaves no overlap.
-    """
+    """``(dst_rows, dst_cols, src_rows, src_cols)`` pasting the read *src*
+    into the grid *dst_transform*, or None when they do not overlap."""
     dst_inv_transform = ~dst_transform
 
     wx0, wy0 = _affine_apply(src.transform, 0, 0)
@@ -253,9 +234,7 @@ def compute_paste_slices(
     dst_c1 = dst_c0 + src.width
     dst_r1 = dst_r0 + src.height
 
-    # Clip to destination bounds. NumPy will silently clip slice endpoints that
-    # exceed the array shape; we clip explicitly so we can also crop the source
-    # window to keep source/target shapes aligned.
+    # Clipped here, not by NumPy, so the source crops to match.
     clipped_dst_c0 = max(0, dst_c0)
     clipped_dst_r0 = max(0, dst_r0)
     clipped_dst_c1 = min(dst_width, dst_c1)

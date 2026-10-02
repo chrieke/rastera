@@ -57,39 +57,25 @@ async def merge(
     Args:
         bbox_crs: The bbox is transformed to the COGs' native CRS automatically.
         band_indices: 1-based.
-        nodata: The value that means "no data" in the output: merge fills
-            every uncovered pixel with it and reports it as ``arr.nodata``,
-            so a file written from the result can be tagged with it.
-            Defaults to the first input's nodata, like
-            ``rasterio.merge.merge``; if that input has none, gaps get 0 and
-            ``arr.nodata`` stays ``None``, since 0 is usually real data.
-            The inputs are unaffected — each is still read through its own
-            nodata — and real pixels can hold this value too, so
-            ``RasterArray.mask`` is what actually marks the gaps.
+        nodata: Fills the uncovered pixels, and is reported as ``arr.nodata``.
+            Defaults to the first input's, as in ``rasterio.merge.merge``;
+            without one, gaps get 0 and ``arr.nodata`` is None. Each input is
+            still read through its own nodata. Real pixels can hold this value
+            too, so ``RasterArray.mask`` is what marks the gaps.
         target_crs: Each COG is reprojected into this CRS before merging when
             it differs from the source. When ``None``, inferred from the
             inputs using *crs_method*.
-        mosaic_method: Overlap strategy when multiple COGs cover the same pixel.
-            ``"first"`` keeps the first valid value in each band (matching
-            rasterio.merge default). ``"last"`` lets later COGs overwrite
-            earlier ones.
+        mosaic_method: ``"first"`` keeps the first valid value in each band, as
+            ``rasterio.merge`` does; ``"last"`` lets later inputs overwrite.
         crs_method: How to choose the output CRS when *target_crs* is ``None``.
             ``"most_common"`` picks the CRS shared by the most inputs;
             ``"first"`` uses the CRS of the first input.
-        snap_to_grid: When True (default), the output grid is rounded
-            outward onto multiples of ``target_resolution`` (GDAL's
-            ``-tap``), on both merge paths. The output transform and shape
-            are then a pure function of the bbox and resolution — never of
-            source grid phase, tile count, or tile order — and each edge not
-            already on that grid grows by less than one pixel. The inputs
-            are copied 1:1 (no resampling) only when *every* one of them is
-            already on that grid at the target CRS and resolution; a single
-            off-grid input sends them all through ``resampling``. When
-            False, the output grid is anchored at the requested
-            ``(minx, maxy)`` with width/height rounded to whole pixels (so
-            the max edges can drift by <0.5 px), matching rasterio/GDAL
-            merge behaviour. Each input is always read on its own pixel
-            grid; this flag does not change that.
+        snap_to_grid: Round the output grid outward onto multiples of
+            ``target_resolution`` (GDAL's ``-tap``), so it depends only on the
+            bbox and resolution. Inputs are copied without resampling only
+            when every one is on that grid. When False, the grid is anchored
+            at the bbox's ``(minx, maxy)`` with rounded pixel counts, as
+            ``rasterio.merge`` does.
         use_overviews: Trades accuracy for bandwidth; see
             :meth:`rastera.AsyncGeoTIFF.read` for what overview pixels cost.
         resampling: Used when reprojecting or changing resolution; see
@@ -98,9 +84,7 @@ async def merge(
     if not cogs:
         raise ValueError("merge requires at least one AsyncGeoTIFF")
 
-    # Up front, and before any read: a misspelled method silently selected the
-    # other branch's semantics, and the grid arguments failed several frames
-    # deep with an error naming neither the argument nor this call.
+    # Before any read, and naming the argument.
     if mosaic_method not in ("first", "last"):
         raise ValueError(
             f"mosaic_method must be 'first' or 'last', got {mosaic_method!r}"
@@ -113,8 +97,6 @@ async def merge(
     validate_resolution(target_resolution)
     for cog in cogs:
         _require_epsg(cog)  # every input is placed by its EPSG code
-    # Before any read: an unusable sentinel should fail here rather than
-    # several frames deep in np.full.
     fill_value, out_nodata = _resolve_output_nodata(nodata, cogs[0])
 
     bbox_crs = _normalize_crs(bbox_crs)
@@ -323,24 +305,12 @@ async def _gather_and_paste(
     read_fn: Callable[[AsyncGeoTIFF, BBox], Awaitable[RasterArray]],
     mosaic_method: Literal["first", "last"] = "first",
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Read contributing COGs and paste into a single output array.
+    """Read the contributors and paste them, in input order and each masked
+    by its own nodata per band, into one array.
 
-    Returns the array and the ``(dst_height, dst_width)`` coverage it was
-    pasted under: True where an output pixel holds a real source value in at
-    least one band, False where it is still *fill_value* because no contributor
-    reached it or every one that did was its own nodata there.
-
-    Results are pasted in input order, each masked by its own nodata per band.
-    Overlap is resolved by ``mosaic_method``: ``"first"`` keeps the first valid
-    value, ``"last"`` lets later COGs overwrite earlier ones.
-
-    Sequential by default: async-geotiff already parallelizes COG-block reads
-    within each contributing TIFF, so an outer fan-out here multiplies the
-    in-flight HTTP request count without adding throughput on a saturated
-    link. Set ``rastera.set_concurrency(merge=N>1)`` to opt into outer
-    parallelism. Reads then run in batches of N, for both methods; for
-    ``mosaic_method="first"`` the ``filled.all()`` early exit, and the skip of
-    contributors whose cells are all filled, run between batches.
+    Returns the array and its ``(dst_height, dst_width)`` coverage: True where
+    some band holds a real source value. Reads run in batches of
+    ``set_concurrency(merge=N)``.
     """
     out_array = np.full(
         (n_bands, dst_height, dst_width),
@@ -451,13 +421,8 @@ async def _gather_and_paste(
 def _output_subgrid(
     out_transform: Affine, out_w: int, out_h: int, sub_bbox: BBox
 ) -> tuple[Affine, int, int] | None:
-    """Compute the portion of the output grid covering *sub_bbox*.
-
-    Returns ``(sub_transform, sub_width, sub_height)`` where
-    *sub_transform* is an integer-pixel-offset window of *out_transform*,
-    guaranteeing pixel-perfect alignment with the output grid.
-    Returns ``None`` if the sub-bbox doesn't overlap.
-    """
+    """The whole-pixel window of the output grid *sub_bbox* reaches, as
+    ``(transform, width, height)``, or None."""
     cells = _output_cells(out_transform, out_w, out_h, sub_bbox)
     if cells is None:
         return None
@@ -509,18 +474,10 @@ def _cells_filled(filled: np.ndarray, dst_transform: Affine, sub_bbox: BBox) -> 
 def _resolve_output_nodata(
     nodata: int | float | None, base: AsyncGeoTIFF
 ) -> tuple[int | float, int | float | None]:
-    """The value the gaps hold, and the sentinel the output reports.
-
-    One value in two roles, so a file written from the result can be tagged
-    with what its own pixels use. Taken from *nodata*, else from the first
-    input's own declaration — ``base._nodata``, not ``base._geotiff.nodata``:
-    the two differ for a VRT, whose declared <NoDataValue> overrides its
-    source's, and the compositing already keys off the former. With neither,
-    the gaps hold 0 but the output reports nothing, because 0 is a real
-    measurement in most rasters and claiming it would blank them.
-
-    An inherited sentinel needs no validation: ``_coerce_nodata`` already
-    dropped it if this dtype could not carry it.
+    """The value the gaps hold, and the sentinel the output reports: *nodata*,
+    else the first input's resolved one (a VRT's ``<NoDataValue>``, not its
+    source's). With neither, gaps hold 0 and the output reports none, since 0
+    is real data in most rasters.
     """
     if nodata is None:
         return (0, None) if base._nodata is None else (base._nodata, base._nodata)
@@ -529,13 +486,8 @@ def _resolve_output_nodata(
 
 
 def _validate_nodata(nodata: int | float, dtype: np.dtype[Any] | None) -> None:
-    """Reject a sentinel the output dtype cannot carry.
-
-    ``np.full`` is inconsistent about these: out-of-range integers raise a bare
-    ``OverflowError`` naming neither the argument nor the dtype, while a
-    fractional or NaN fill is truncated to something the caller never asked for
-    (0.5 and NaN both land on 0 in an integer mosaic).
-    """
+    """Reject a sentinel the output dtype cannot carry, which ``np.full``
+    would raise on unhelpfully or truncate (0.5 and NaN both to 0)."""
     if dtype is None:
         return
     if not isinstance(nodata, int | float | np.number) or isinstance(nodata, bool):
@@ -565,15 +517,9 @@ def _validate_nodata(nodata: int | float, dtype: np.dtype[Any] | None) -> None:
 def _require_stackable_bands(
     cogs: Sequence[AsyncGeoTIFF], band_indices: Sequence[int] | None
 ) -> None:
-    """Validate dtype and band availability across inputs.
-
-    Applies to both merge paths: without this, a mismatched dtype surfaces as an
-    opaque ``TypeError`` from ``np.copyto`` (or truncates silently when the cast
-    is narrowing), and a missing band as a broadcast error.
-
-    With explicit *band_indices* the counts need not agree — each read resolves
-    the indices against its own COG, so only the requested bands have to exist.
-    """
+    """Require one dtype across the inputs, and the requested bands in each,
+    or one band count when *band_indices* is None. A mismatch otherwise
+    surfaces deep in ``np.copyto``, or truncates silently."""
     base = cogs[0]
     base_dtype = base._geotiff.dtype
     highest = max(band_indices) if band_indices else None
@@ -648,10 +594,7 @@ async def _read_or_skip(
     cog: AsyncGeoTIFF,
     sub_bbox: BBox,
 ) -> RasterArray | None:
-    """Run *read_fn* and return ``None`` on the sub-pixel sliver case
-    (BBox.intersect accepted the overlap but the rounded read window
-    is zero), so callers can filter rather than wrap each call in
-    try/except."""
+    """*read_fn*, or None for a sub-pixel sliver that rounds to no window."""
     try:
         return await read_fn(cog, sub_bbox)
     except WindowOutOfRangeError:

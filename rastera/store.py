@@ -121,9 +121,7 @@ def _parse_uri(uri: str) -> ParsedURI:
     if scheme in ("", "file"):
         raw = unquote(parsed.path) if scheme == "file" else uri
         path = Path(raw).resolve()
-        # Rooted at the filesystem root, not the file's folder: rooted there,
-        # files in two folders read as two buckets, and open(list), merge and
-        # build_index refused them.
+        # At the filesystem root, so files in two folders share one store.
         anchor = Path(path.anchor)
         key = path.relative_to(anchor).as_posix()
         return ParsedURI(uri, "local", anchor.as_uri(), key, local_path=path)
@@ -191,13 +189,10 @@ def _build_store(uri: str, **store_kwargs: Any) -> Any:
 def _shared_store(
     uri: str, stores: dict[tuple[str, str | None], Any], **store_kwargs: Any
 ) -> Any | None:
-    """*uri*'s async-tiff store from *stores*, built and added on first use.
-
-    For a descriptor opening its sources one by one, which otherwise built a
-    store per source: a remote one costs 80-160 ms of blocking setup, and
-    brings its own connection pool. ``None`` for a local path, whose store
-    costs nothing and is left to ``AsyncGeoTIFF.open``.
-    """
+    """*uri*'s async-tiff store from *stores*, built and added on first use,
+    so a descriptor's sources share one per bucket: a remote store costs
+    80-160 ms of blocking setup. ``None`` for a local path, whose store costs
+    nothing."""
     parsed = _parse_uri(uri)
     if parsed.kind == "local":
         return None
@@ -218,8 +213,8 @@ def _resolve_local_path(uri: str) -> Path | None:
 
 def _is_local_descriptor(uri: str) -> bool:
     """Whether *uri* is a VRT or DIMAP on local disk. Its sources may sit in any
-    store (see ``_check_source_uri``), so it builds its own: handed a shared
-    local store, it read ``s3://bucket/key`` from ``/key`` on disk."""
+    store (see ``_check_source_uri``), so it must not get a shared local one,
+    which read ``s3://bucket/key`` from ``/key`` on disk."""
     return (
         uri.lower().endswith((".vrt", ".xml")) and _resolve_local_path(uri) is not None
     )
@@ -244,9 +239,7 @@ def _require_same_bucket(uris: Sequence[str], reason: str) -> None:
 
 
 async def _fetch_descriptor_bytes(uri: str, **store_kwargs: Any) -> bytes:
-    """Fetch a full XML descriptor object (VRT or DIMAP) via obstore,
-    with a filesystem fast-path for local paths. Shared by the VRT and
-    DIMAP readers — both just GET the whole document once at open time."""
+    """Fetch a whole VRT or DIMAP document, through obstore when remote."""
     parsed = _parse_uri(uri)
     if parsed.local_path is not None:
         return parsed.local_path.read_bytes()
@@ -258,23 +251,13 @@ async def _fetch_descriptor_bytes(uri: str, **store_kwargs: Any) -> bytes:
 def _check_source_uri(source_uri: str, descriptor_uri: str) -> None:
     """Raise unless *descriptor_uri* may reference *source_uri*.
 
-    A descriptor fetched from a store may only reference that same store. Both
-    readers forward one ``store`` / ``store_kwargs`` to every source they open
-    (see ``_open_vrt_checked``), so a reference elsewhere was never supported:
-    it would be fetched with the descriptor's region and credentials rather
-    than its own. Checking it here turns that into a clear error instead of a
-    misdirected request, and keeps the set of objects an ``open()`` touches to
-    the store the caller named rather than one a document picked. Real
-    deliveries stay well inside: Airbus VRTs and DIMAPs name tiles relative to
-    the descriptor or absolutely within the same bucket. It composes — a
-    same-store source is itself checked here — so nothing reachable from a
-    remote descriptor leaves its store.
-
-    A *local* descriptor is unconstrained: its path came from the caller rather
-    than from a document, and confining it would reject a local VRT over remote
-    sources (``gdalbuildvrt out.vrt /vsis3/bucket/*.tif``). A descriptor whose
-    contents you did not produce is better read from object storage, where this
-    applies.
+    A remote descriptor may only reference its own store. Its sources are
+    opened with the descriptor's ``store`` and ``store_kwargs``, so elsewhere
+    they would get the wrong credentials, and an ``open()`` stays within the
+    store the caller named rather than one a document picked. Airbus VRTs and
+    DIMAPs stay inside. A local descriptor is unconstrained: its path came from
+    the caller, and ``gdalbuildvrt out.vrt /vsis3/bucket/*.tif`` writes one
+    over remote sources.
     """
     descriptor = _parse_uri(descriptor_uri)
     if descriptor.local_path is not None:
@@ -304,13 +287,8 @@ def _source_store_kwargs(
 
 
 def _join_relative_uri(base_uri: str, relative: str) -> str:
-    """Resolve *relative* against *base_uri*'s parent directory. Local
-    paths are joined via pathlib; remote URIs via posix path normalization.
-
-    Callers that need to recognize absolute paths or URIs should do that
-    check themselves before invoking — this helper always treats its
-    input as relative.
-    """
+    """Resolve *relative*, always taken as relative, against *base_uri*'s
+    parent directory."""
     local = _resolve_local_path(base_uri)
     if local is not None:
         return str((local.parent / relative).resolve())

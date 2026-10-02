@@ -1,12 +1,9 @@
-"""Internal DIMAP (Dimap_Document) support.
+"""DIMAP (Dimap_Document) support.
 
-DIMAP is the descriptor format used by Airbus Pléiades / PNEO / SPOT
-deliveries. One ``DIM_*.XML`` file declares a virtual raster whose pixels
-live across many sibling TIFF tiles, grouped by band-group (e.g. RGB and
-NED) and laid out on a regular row/column tile grid. GDAL's DIMAP driver
-presents all those files as one dataset; this module does the same for
-rastera, transparently, so callers can open a DIMAP (or a VRT that wraps
-one) through the normal ``AsyncGeoTIFF.open`` entry point.
+Airbus Pléiades, PNEO and SPOT deliveries describe one raster in a
+``DIM_*.XML`` whose pixels live in TIFF tiles on a regular grid, one set per
+band group (e.g. RGB and NED). This opens it as one dataset, as GDAL's DIMAP
+driver does.
 """
 
 from __future__ import annotations
@@ -94,14 +91,8 @@ class _DIMAPLayout:
 
 
 class _DIMAPDataset(AsyncGeoTIFF):
-    """Read adapter for a DIMAP descriptor.
-
-    Presents as an ``AsyncGeoTIFF`` with synthesized metadata derived
-    from the DIMAP XML; individual tile TIFFs are opened lazily on
-    first read. Overview reads are rejected because each tile TIFF
-    carries its own overview pyramid and those pyramids cannot safely
-    mix across tiles (same constraint as ``_VRTDataset``).
-    """
+    """A DIMAP descriptor as an ``AsyncGeoTIFF``, with tiles opened on first
+    read. It lists no overviews, since each tile carries its own pyramid."""
 
     def __init__(
         self,
@@ -117,11 +108,8 @@ class _DIMAPDataset(AsyncGeoTIFF):
         first_tile_key: tuple[int, int, int] | None = None,
         stores: dict[tuple[str, str | None], Any] | None = None,
     ):
-        # DIMAP XML has no canonical nodata value. When the caller hands
-        # us a pre-opened tile (the normal path from ``_maybe_open_dimap``),
-        # inherit that tile's TIFF-level nodata so the mosaic pre-fill
-        # and per-tile reads agree on the sentinel. Otherwise fall back
-        # to 0 — the Airbus convention for integer products.
+        # The XML declares no nodata, so take the first tile's, which the
+        # mosaic's fill then agrees with. Without one, 0, as Airbus uses.
         nodata: int | float | None = first_tile._nodata if first_tile is not None else 0
         virtual = _virtual_geotiff_for(layout, nodata=nodata)
         super().__init__(uri, virtual, meta_overrides=meta_overrides)
@@ -155,14 +143,8 @@ class _DIMAPDataset(AsyncGeoTIFF):
         overview: Any | None = None,
         snap_to_grid: bool = True,
     ) -> RasterArray:
-        """Stitch the requested window from per-tile, per-group TIFF reads.
-
-        Tiles are read sequentially; async-geotiff handles concurrency at
-        the COG-block level inside each tile read. Output bands are written
-        back in the *caller's* requested order, so non-contiguous selections
-        like ``[5, 0]`` round-trip correctly instead of getting sorted
-        into group order.
-        """
+        """Stitch the window from per-tile reads, one per band group, with the
+        bands in the caller's order (``[5, 0]`` stays unsorted)."""
         if overview is not None:
             raise NotImplementedError(
                 "overview reads on DIMAP datasets are not supported"
@@ -187,8 +169,7 @@ class _DIMAPDataset(AsyncGeoTIFF):
         else:
             indices_0 = list(band_indices)
 
-        # Pre-fill with nodata so pixels past the mosaic edge — or any tile
-        # that legitimately returned no data — stay at the sentinel value.
+        # Pixels no tile covers keep the sentinel.
         nodata = self._nodata if self._nodata is not None else 0
         out = np.full(
             (len(indices_0), window.height, window.width),
@@ -196,9 +177,7 @@ class _DIMAPDataset(AsyncGeoTIFF):
             dtype=layout.dtype,
         )
 
-        # Group the requested output bands by their source band-group, so
-        # each tile is read at most once per call even when several output
-        # bands share the same group.
+        # Each tile read once per call, for all of its group's bands.
         per_group: dict[int, list[tuple[int, int]]] = {}
         for out_pos, bi in enumerate(indices_0):
             b = layout.bands[bi]
@@ -206,13 +185,7 @@ class _DIMAPDataset(AsyncGeoTIFF):
 
         tile_reads = _tile_decomposition(layout, window)
 
-        # Sequential by default: async-geotiff already parallelizes COG-block
-        # range requests inside each tile read, so an outer fan-out across
-        # (group, tile) pairs multiplies the HTTP burst by N_tiles × N_groups
-        # — which saturated pools and tripped cloud rate limits on large
-        # reads. Set ``rastera.set_concurrency(dimap=N>1)`` to opt into
-        # outer fan-out. Each (group, tile) job writes to a disjoint slice
-        # of ``out`` so completion order doesn't matter.
+        # Sequential unless set_concurrency(dimap=N) says otherwise.
         async def _read_one(
             group_idx: int, tr: _TileRead, src_bands_0: list[int]
         ) -> RasterArray:
@@ -322,21 +295,11 @@ async def _maybe_open_dimap(
     meta_overrides: MetaOverrides | None = None,
     **store_kwargs: Any,
 ) -> _DIMAPDataset | None:
-    """Return a ``_DIMAPDataset`` when *uri* is a DIMAP XML, else ``None``.
-
-    Used by ``AsyncGeoTIFF.open``'s ``.xml``-suffix branch. On a miss
-    (any other XML flavour) returns ``None`` so the caller can fall
-    through to the normal TIFF open path — whose magic-bytes error then
-    surfaces the real "this isn't a TIFF" explanation.
-
-    On a hit, eagerly opens the first tile (lowest tile_R/tile_C of
-    band-group 0) to learn the real TIFF nodata value and prime the
-    tile cache. The DIMAP XML itself carries no nodata value.
-    """
+    """A ``_DIMAPDataset`` when *uri* is a DIMAP, else None, so the TIFF open
+    reports what else it is. Opens the first tile to learn the nodata, which
+    the XML does not carry."""
     xml_bytes = await _fetch_descriptor_bytes(uri, **store_kwargs)
-    # Cheap structural sniff. DIMAPs put the root element in the first
-    # kilobyte; scanning the whole document here would waste CPU on
-    # large non-DIMAP XMLs that happen to share the extension.
+    # The root element sits in the first kilobyte.
     if b"Dimap_Document" not in xml_bytes[:2048]:
         return None
     layout = _parse_dimap_xml(xml_bytes)
@@ -370,9 +333,8 @@ async def _sniff_first_tile(
     uri: str,
     tile_open_kwargs: dict[str, Any],
 ) -> tuple[tuple[int, int, int], AsyncGeoTIFF]:
-    """Open the lowest-indexed tile of band-group 0. Factored out so
-    tests can patch tile-level I/O at open time without stubbing the
-    whole ``AsyncGeoTIFF.open`` classmethod."""
+    """Open the lowest-indexed tile of band group 0. Apart, for tests to
+    patch."""
     (r, c) = min(layout.groups[0].tile_paths)
     href = layout.groups[0].tile_paths[(r, c)]
     tile_uri = _resolve_tile_uri(href, uri)
@@ -384,18 +346,9 @@ async def _sniff_first_tile(
 
 
 def _parse_dimap_xml(xml_bytes: bytes) -> _DIMAPLayout:
-    """Parse a DIMAP ``Dimap_Document`` into a ``_DIMAPLayout``.
-
-    Only the subset used for read dispatch is extracted. The MVP scope is:
-
-    - ``DATA_FILE_ORGANISATION = BAND_COMPOSITE`` (one TIFF per tile per
-      band-group; bands packed inside the TIFF).
-    - ``DATA_FILE_FORMAT = image/tiff``.
-    - ``Regular_Tiling`` with zero overlap.
-
-    Anything else raises ``NotImplementedError`` so callers get a clear
-    error instead of silent misreads.
-    """
+    """Parse a ``Dimap_Document``. Only ``BAND_COMPOSITE`` TIFF tiles on a
+    regular grid without overlap; anything else raises
+    ``NotImplementedError``."""
     root = ET.fromstring(xml_bytes)
     if root.tag != "Dimap_Document":
         raise ValueError(f"Not a DIMAP file (root tag {root.tag!r})")
@@ -678,15 +631,8 @@ def _parse_crs_epsg(crs_root: ET.Element) -> int:
 
 @dataclass(frozen=True, slots=True)
 class _VirtualGeoTIFF:
-    """Metadata-only stand-in for an ``async_geotiff.GeoTIFF``.
-
-    Exposes just the attribute surface that ``AsyncGeoTIFF.__init__`` and
-    its reproject/resample helpers read off ``self._geotiff`` — nothing
-    more. This lets a synthesized dataset (``_DIMAPDataset``) pass
-    ``super().__init__`` and reuse the full read dispatch without
-    holding a real TIFF. Never participates in actual I/O; the dataset
-    overrides ``_read_native`` before any read path would try to.
-    """
+    """Header metadata standing in for an ``async_geotiff.GeoTIFF``
+    (``reader._GeoTIFFLike``), for datasets that override ``_read_native``."""
 
     crs: CRS
     nodata: int | float | None
@@ -703,14 +649,7 @@ class _VirtualGeoTIFF:
 def _virtual_geotiff_for(
     layout: _DIMAPLayout, *, nodata: int | float | None = 0
 ) -> _VirtualGeoTIFF:
-    """Project a parsed layout into the ``_geotiff``-shaped metadata that
-    ``AsyncGeoTIFF.__init__`` expects.
-
-    ``nodata`` is supplied by the caller — normally the first tile TIFF's
-    own nodata value, since DIMAP XML itself carries no nodata value
-    (only a ``Special_Value`` *count*). Falls back to 0 when no tile is
-    available (Airbus convention for integer products).
-    """
+    """The layout as ``_geotiff`` metadata."""
     t = layout.transform
     xres = t.a
     yres = -t.e
@@ -733,14 +672,9 @@ def _virtual_geotiff_for(
 
 @dataclass(frozen=True, slots=True)
 class _TileRead:
-    """One (tile, src_window, dst_slice) triple for the mosaic stitcher.
-
-    All coordinates are in *pixel* units. ``tile_row``/``tile_col`` are
-    1-based so they key directly into ``_DIMAPBandGroup.tile_paths``;
-    ``src_window`` is relative to the tile's own origin; ``dst_rows``
-    and ``dst_cols`` slice into an output array shaped to the caller's
-    requested mosaic window.
-    """
+    """One tile's part of a mosaic window, in pixels: ``tile_row``/``tile_col``
+    1-based as in ``tile_paths``, ``src_window`` in the tile, and the
+    ``dst_*`` slices in the window."""
 
     tile_row: int
     tile_col: int
@@ -750,15 +684,8 @@ class _TileRead:
 
 
 def _tile_decomposition(layout: _DIMAPLayout, window: Window) -> list[_TileRead]:
-    """Decompose a mosaic window into per-tile read instructions.
-
-    Tiles that do not intersect the window are omitted. The window may
-    extend past the mosaic's right/bottom edges; those pixels are simply
-    not listed here and the caller leaves them at the pre-filled nodata
-    value. Edge tiles that are smaller than ``tile_width``/``tile_height``
-    (possible when dims aren't exact multiples) are clipped to the
-    mosaic extent so src_window never references out-of-bounds pixels.
-    """
+    """The tiles a mosaic window reaches, each clipped to the mosaic, so an
+    edge tile narrower than ``tile_width`` is read only where it exists."""
     tw = layout.tile_width
     th = layout.tile_height
     w_x0 = window.col_off
@@ -766,8 +693,6 @@ def _tile_decomposition(layout: _DIMAPLayout, window: Window) -> list[_TileRead]
     w_x1 = w_x0 + window.width
     w_y1 = w_y0 + window.height
 
-    # Only iterate the tile band that the window touches — cheap index
-    # math, avoids scanning all tiles for tiny AOIs on big mosaics.
     c_min = max(1, w_x0 // tw + 1)
     c_max = min(layout.tile_cols, (w_x1 - 1) // tw + 1)
     r_min = max(1, w_y0 // th + 1)
@@ -808,15 +733,8 @@ def _tile_decomposition(layout: _DIMAPLayout, window: Window) -> list[_TileRead]
 def _validate_tile(
     layout: _DIMAPLayout, tile: AsyncGeoTIFF, key: tuple[int, int, int]
 ) -> None:
-    """Check the descriptor against a tile as it is opened.
-
-    The XML declares what the tiles hold and nothing verifies it, so a
-    descriptor that disagrees with its own imagery used to surface as corrupt
-    pixels or an error naming neither the tile nor the descriptor. This is
-    ``vrt.py``'s ``_validate_source_windows`` for DIMAP. It runs on the tile
-    ``_sniff_first_tile`` fetches at open time, and on each other tile when a
-    read first reaches it, so it costs no request of its own.
-    """
+    """Check the descriptor against a tile as it opens, so a disagreement
+    names both rather than surfacing as corrupt pixels. Costs no request."""
     group_idx, tile_row, tile_col = key
 
     tile_dtype = tile._geotiff.dtype
@@ -825,10 +743,7 @@ def _validate_tile(
             f"DIMAP tile {tile.uri!r} has a sample format async-geotiff cannot "
             f"type, so it cannot be checked against the declared {layout.dtype}."
         )
-    # ``can_cast`` rather than ``!=``: the harm is truncation, and a tile
-    # narrower than the declaration assigns into the mosaic losslessly. Same
-    # reasoning as the tile-size lower bound below — a declaration the imagery
-    # fits inside is not grounds to turn a readable product away.
+    # ``can_cast``, not ``!=``: a narrower tile fits the mosaic losslessly.
     if not np.can_cast(tile_dtype, layout.dtype):
         raise ValueError(
             f"DIMAP declares {layout.dtype} (<DATA_TYPE>/<NBITS>/<SIGN>) but tile "
@@ -869,13 +784,8 @@ def _validate_tile(
 
 
 def _resolve_tile_uri(href: str, dimap_uri: str) -> str:
-    """Resolve a DIMAP ``DATA_FILE_PATH@href`` against the DIMAP URI.
-
-    DIMAP tile paths are always written relative to the XML's parent
-    directory (unlike VRT, no absolute or /vsi… variants are observed
-    in Airbus deliveries). We still treat absolute paths / URIs as
-    pass-through in case a delivery ever uses them.
-    """
+    """Resolve a ``DATA_FILE_PATH@href``, relative to the XML in every
+    delivery seen, against the DIMAP URI."""
     if "://" in href or href.startswith("/"):
         tile_uri = href
     else:

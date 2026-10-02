@@ -16,26 +16,19 @@ if TYPE_CHECKING:
 class RasterProfile(TypedDict):
     """Everything a dataset's header says about it, in one dict.
 
-    Describes the dataset; it is not a set of writer creation options. Key
-    names follow rasterio's where there is an equivalent, but splatting this
-    into ``rasterio.open(path, "w", **profile)`` only *appears* to work:
-    ``bounds``, ``res``, ``crs_epsg`` and ``overviews`` have no
-    creation-option meaning, and GDAL drops unknown creation options with
-    nothing but a logged warning. Select the keys a writer needs.
+    Key names follow rasterio's, but this is not a set of creation options:
+    passed to ``rasterio.open(path, "w", **profile)``, ``bounds``, ``res``,
+    ``crs_epsg`` and ``overviews`` are dropped with only a logged warning.
 
-    Two keys are not what the file literally declares, deliberately:
+    - ``crs`` is the file's own CRS object, or the ``meta_overrides`` one.
+    - ``nodata`` is the sentinel the pixels use: None where the dtype cannot
+      carry the declared value, and a VRT's ``<NoDataValue>`` over its
+      source's.
+    - ``dtype`` is None only for a sample format async-geotiff cannot map,
+      which cannot be read either.
 
-    - ``crs`` is the file's own CRS object, not one rebuilt from ``crs_epsg``,
-      and a ``meta_overrides`` CRS replaces both.
-    - ``nodata`` is the sentinel this dataset's *pixels* use. It is None where
-      the dtype cannot carry the declared value, and a VRT's ``<NoDataValue>``
-      replaces its source's.
-
-    ``dtype`` is None only when async-geotiff cannot map the file's sample
-    format — but such a file cannot be read either.
-
-    How the pixels are *stored* (compression, tiling, interleave) and per-band
-    metadata (colormap, scales, offsets) are absent.
+    Storage (compression, tiling, interleave) and per-band metadata (colormap,
+    scales, offsets) are absent.
     """
 
     width: int
@@ -52,9 +45,7 @@ class RasterProfile(TypedDict):
 
 
 def _build_profile(src: AsyncGeoTIFF) -> RasterProfile:
-    # Read through ``_geotiff`` except where this dataset resolved something
-    # different: ``count`` is a property a band-stack VRT overrides, and crs
-    # and nodata are resolved at construction.
+    # Off ``_geotiff``, except what the dataset resolves itself.
     gt = src._geotiff
     res = gt.res
     return {

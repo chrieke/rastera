@@ -1,29 +1,16 @@
 """Pixel resampling for resolution changes and reprojection.
 
-:func:`resample` is the entry point, dispatching on ``method`` to one of three
-implementations. :func:`validate_resampling` is public alongside it so callers
-with a fast path that never reaches :func:`resample` — ``AsyncGeoTIFF.read``'s
-native read, ``merge`` — can still reject an unknown method at their own
-boundary rather than silently ignoring it.
+The readers call ``_resample_impl``, which also returns the coverage mask;
+:func:`resample` is the same without it, and documents the semantics.
 
-- ``"nearest"`` — nearest-neighbor, memory-tight 1D/2D index path.
-- ``"bilinear"`` — separable linear kernel; 2×2 at upsampling/identity,
-  widened proportionally when downsampling to act as an anti-aliasing
-  low-pass filter (matches GDAL's warp behaviour).
-- ``"cubic"`` — Keys cubic convolution (a = -0.5); 4×4 at
-  upsampling/identity, similarly widened when downsampling.
+Where rastera's kernels knowingly differ from gdalwarp's:
 
-Bilinear and cubic use GDAL-style nodata handling: kernel weights are
-renormalized over valid samples, with a center-pixel nodata gate.  Cubic adds
-a per-dimension ≥2-valid gate of rastera's own against overshoot from
-negative weights at data/nodata boundaries; where gdalwarp samples cubic 4x4,
-it instead falls back to bilinear for any pixel whose taps touch nodata or
-the source edge, so the two differ there.  As in gdalwarp, each band's kernel
-is judged on its own: a sentinel in one band leaves the others' kernels alone.
-The center gate is per band as well.  gdalwarp gates a pixel only where the
-center is nodata in every band, and fills a band that is nodata there on its
-own from the valid neighbours.  So a multi-band read differs from gdalwarp at
-those pixels; a single-band read does not.
+- Cubic's ≥2-valid gate is rastera's own. Where gdalwarp samples 4x4, it
+  instead falls back to bilinear for any pixel whose taps touch nodata or the
+  source edge.
+- The center gate is per band. gdalwarp gates a pixel only where the center is
+  nodata in every band, and fills a band that is nodata there on its own from
+  the valid neighbours, so multi-band reads differ at those pixels.
 """
 
 from __future__ import annotations
@@ -43,14 +30,9 @@ from .geo import _DENOISE_TOL
 ResamplingMethod = Literal["nearest", "bilinear", "cubic"]
 _RESAMPLING_METHODS = ("nearest", "bilinear", "cubic")
 
-# Local downsample scale above which the ``"auto"`` strategy takes the two-pass
-# cross-CRS route.  Set conservatively: benchmarking cross-CRS warps across
-# image sizes (512²–4096²) and both kernels, scale 2.0 is the lowest threshold
-# that is a speed win everywhere; below it two-pass is erratic and often slower
-# (its fixed intermediate-allocation + near-unit reproject cost is not repaid —
-# worst for cheap-kernel bilinear at large sizes, where it can run ~1.5x
-# slower).  Below the threshold (and at scale <= 1 — upsampling — where the
-# two-pass split has no benefit) the single-pass warp is used.
+# Downsample scale above which ``"auto"`` warps in two passes: the lowest that
+# was a speed win at every size from 512² to 4096² for both kernels. Below it
+# two-pass ran up to 1.5x slower.
 _AUTO_SCALE_THRESHOLD = 2.0
 
 # Kernel half-width in source pixels at unit scale: bilinear samples 2x2, cubic
@@ -70,66 +52,34 @@ def resample(
     *,
     warp_strategy: WarpStrategy | None = None,
 ) -> np.ndarray:
-    """Resample src_array to a target grid.
+    """Resample src_array to a target grid, as gdalwarp does.
 
-    Three methods are supported, matching GDAL / rasterio conventions:
+    - ``"nearest"`` (default): exact, no smoothing.
+    - ``"bilinear"``: 2×2, widened to ``2·⌈scale⌉`` taps per axis when
+      downsampling, so it anti-aliases. ``scale = dst_res / src_res``, rounded
+      to a whole factor within 0.05 of one, and 1 on both axes while neither
+      exceeds 1/0.95. No overshoot.
+    - ``"cubic"``: Keys (a = -0.5), 4×4, widened to ``2·⌈2·scale⌉`` taps.
+      Can overshoot; integer output is clipped to the dtype and rounded.
 
-    - ``"nearest"`` (default): nearest-neighbor. Fast, exact, no smoothing.
-      Matches ``Resampling.nearest`` in rasterio.
-    - ``"bilinear"``: separable linear kernel. 2×2 at upsampling and
-      identity; expanded to ``2·⌈scale⌉ × 2·⌈scale⌉`` when downsampling
-      so the kernel acts as a low-pass anti-aliasing filter (where
-      ``scale = max(1, dst_res / src_res)``, rounded to a whole factor
-      within 0.05 of one, and 1 on both axes while neither exceeds
-      1/0.95, as gdalwarp does).  Matches
-      ``Resampling.bilinear`` / ``gdalwarp -r bilinear``. No overshoot.
-    - ``"cubic"``: Keys cubic convolution (a = -0.5). 4×4 at
-      upsampling/identity; expanded to ``2·⌈2·scale⌉ × 2·⌈2·scale⌉`` when
-      downsampling.  Matches ``Resampling.cubic`` / ``gdalwarp -r cubic``.
-      Can overshoot the source value range (for integer dtypes, output
-      is clipped to the dtype range and rounded).
+    A destination grid shifted from the source's by whole pixels is copied, as
+    gdalwarp does.
 
-    Where the destination grid is the source grid shifted by whole pixels,
-    ``"bilinear"`` and ``"cubic"`` copy the source pixels as ``"nearest"``
-    does, like gdalwarp.
+    With ``nodata`` set (a finite value or NaN), bilinear and cubic drop
+    nodata taps and renormalize the rest. A pixel becomes nodata when the
+    source pixel under its center is nodata, when every tap is, or, for cubic,
+    when an axis has fewer than 2 valid taps (negative weights overshoot where
+    valid and nodata alternate). All per band. A real value rounded or clipped
+    onto the sentinel is moved one step off it, as gdalwarp does.
 
-    For ``"bilinear"`` and ``"cubic"`` with ``nodata`` set, nodata is
-    handled GDAL-style: kernel weights are renormalized over valid
-    samples (invalid samples are dropped from the kernel). A target
-    pixel is set to ``nodata`` when the source pixel under the target
-    center is nodata, when every kernel sample is nodata, or — for
-    cubic only, and rastera's own rule — when fewer than 2 valid samples
-    exist along each axis of the kernel window (negative cubic weights
-    cause severe overshoot when valid/invalid samples alternate).  All of
-    this is per band: a band comes out the same whether or not it is
-    resampled together with others.  gdalwarp renormalizes per band too,
-    but its center gate is not per band (see the module docstring).
-
-    ``nodata`` may be a finite sentinel (e.g. -9999, 0) or NaN; NaN is
-    detected via ``np.isnan`` so the center gate and renormalization
-    behave identically across sentinel types.  A real value the kernel
-    rounds or clips onto the sentinel is moved one step off it, as
-    gdalwarp does, so it does not read as missing.
-
-    A destination pixel with no source pixel under its center is blanked
-    regardless of ``nodata`` — to the sentinel when one is declared, to zero
-    when none is, which is what GDAL leaves where its warper never writes.
-    ``AsyncGeoTIFF.read`` also reports which pixels those were, on
-    ``RasterArray.mask``.
+    A pixel with no source pixel under its center gets the sentinel, or 0
+    without one, which is what gdalwarp leaves there.
 
     Args:
         src_array: ``(bands, h, w)``.
-        src_transform: Pixel→world for the source; *dst_transform* likewise for
-            the destination.
-        nodata: The sentinel for invalid pixels; the bilinear/cubic
-            renormalization keys off it, and it fills out-of-bounds pixels
-            (which are zeroed when no sentinel is declared).
         transformer: Target CRS → source CRS; ``None`` if same CRS.
-        warp_strategy: How a cross-CRS bilinear/cubic warp is carried out.
-            ``None`` (default) reads the process-wide setting from
-            :func:`rastera.set_warp_strategy`; pass an explicit value to
-            override it for this call (useful in tests). No effect on nearest
-            (any CRS/scale), same-CRS, or upsampling.
+        warp_strategy: Overrides :func:`rastera.set_warp_strategy` for this
+            call.
     """
     # A NumPy float64 sentinel compares a float32 array in float64, where
     # -9999.9 is not the float32 the pixels hold; a Python scalar compares in
@@ -316,56 +266,28 @@ def _resample_kernel(
     warp_strategy: WarpStrategy,
     src_coverage: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray | None]:
-    """Bilinear or cubic resampling with GDAL-style nodata renormalization
-    and anti-aliasing kernel expansion for downsampling.
+    """Bilinear or cubic, as :func:`resample` describes.
 
-    See :func:`resample` for the user-facing semantics summary.
-    Implementation notes:
-
-    - Same-CRS reads use a separable two-pass accumulation
-      (:func:`_accumulate_separable`): ``O(taps_x + taps_y)`` instead of
-      ``O(taps_x · taps_y)``.  Cross-CRS warps are not separable (the
-      source sampling grid is not axis-aligned with the output) so they
-      keep the non-separable 2-D loop.  The two paths are numerically
-      equivalent: the separable reorder changes float summation only at
-      the ULP level, so integer output may differ by at most 1 LSB at
-      rounding boundaries.
-    - Kernel half-width per axis is
-      ``base_radius · max(1, _kernel_scale(|dst_res / src_res|))`` (rounded
-      up), where ``base_radius`` is 1 for bilinear and 2 for cubic.
-      Upsampling and identity reads use the default radii, and so do reads
-      that downsample neither axis by more than 1/0.95; downsampling
-      expands.
-    - Weights are separable and computed once outside the loop, then
-      pre-normalized along the tap axis so the kernel sums to 1.
-    - Out-of-bounds taps (kernel reach beyond the source extent for
-      output pixels near an edge) are treated as nodata for
-      renormalization when ``nodata`` is set, and clamped (edge
-      replicated) otherwise.  Either way the returned coverage mask marks
-      the destination pixels whose *center* fell outside the source.
-    - Accumulation is in float64; integer output dtypes are
-      clip+round-cast at the end (cubic can overshoot the source range).
+    Same-CRS reads accumulate separably (:func:`_accumulate_separable`), in
+    ``O(taps_x + taps_y)``; a cross-CRS grid is not axis-aligned with the
+    source, so it takes the 2-D loop. Taps past the source edge count as
+    nodata when there is a sentinel and repeat the edge pixel when there is
+    not. Sums are float64, cast back at the end.
     """
-    # Only the kernels do arithmetic on samples; nearest is a pure gather and
-    # copies complex values through unharmed, so the rejection lives here
-    # rather than in `resample`.
+    # Here, not in `resample`: nearest only gathers, and copies complex values
+    # through unharmed.
     if np.issubdtype(src_array.dtype, np.complexfloating):
         raise NotImplementedError(
             f"{method} resampling does not support complex dtype {src_array.dtype}"
         )
 
-    # NaN-sentinel nodata needs `np.isnan` for detection (NaN != NaN means
-    # `==` and `!=` both miss it) and zeroing-out before multiply (NaN * 0
-    # propagates NaN into the accumulator).  This mirrors the NaN path in
-    # `merge.py`'s paste loop.
+    # A NaN sentinel needs `np.isnan` to find, and zeroing before the multiply,
+    # since NaN * 0 is NaN.
     nodata_is_nan = nodata is not None and nodata != nodata
 
-    # --- Compute float source coordinates for every destination pixel.
-    # Same-CRS: keep coords 1D ``(W,)`` / ``(H,)`` — base/frac/center and
-    # the separable kernel weights stay 1D, with the kernel loop forming
-    # 2D arrays only on demand.  For 4K×4K cubic this avoids materialising
-    # ``(4, H, W)`` weight tensors (~4 GB).  Cross-CRS reprojection is
-    # not separable, so the coarse-grid path returns full 2D coords.
+    # Source coordinates of every destination pixel. Same-CRS they stay 1-D
+    # per axis, and so do the weights: a 4K×4K cubic read would otherwise hold
+    # (4, H, W) weight tensors, ~4 GB.
     if transformer is None:
         combined = ~src_transform * dst_transform
         src_col_f = float(combined.a) * (
@@ -393,8 +315,7 @@ def _resample_kernel(
                 None,
                 src_coverage,
             )
-        # Local pixel scale = src pixels per dst pixel (= dst_res / src_res
-        # along the axis-aligned same-CRS case).
+        # Source pixels per destination pixel.
         x_scale_local = _kernel_scale(abs(float(combined.a)))
         y_scale_local = _kernel_scale(abs(float(combined.e)))
     else:
@@ -417,11 +338,10 @@ def _resample_kernel(
         x_scale_local = _kernel_scale(_footprint(probe_col))
         y_scale_local = _kernel_scale(_footprint(probe_row))
 
-        # Cross-CRS downsample: optionally split into a same-CRS downsample
-        # (fast separable path) + a near-unit-scale reproject.  Gated on the
-        # local scale we just computed, so no extra coarse-grid work.
-        threshold = _two_pass_threshold(warp_strategy)
-        if threshold is not None and max(x_scale_local, y_scale_local) > threshold:
+        if (
+            warp_strategy == "auto"
+            and max(x_scale_local, y_scale_local) > _AUTO_SCALE_THRESHOLD
+        ):
             return _resample_two_pass(
                 src_array,
                 src_transform,
@@ -443,10 +363,8 @@ def _resample_kernel(
     if max(x_scale_local, y_scale_local) <= 1 / 0.95:
         x_scale_local = y_scale_local = 1.0
 
-    # --- Anti-aliasing: GDAL expands the kernel radius when downsampling
-    # (scale > 1) so that bilinear/cubic act as proper low-pass filters
-    # over the wider source footprint covered by each dst pixel.  When
-    # upsampling (scale < 1) the kernel keeps its default radius.
+    # Downsampling widens the kernel, so it low-passes the wider footprint
+    # each destination pixel covers.
     x_filter = max(1.0, x_scale_local)
     y_filter = max(1.0, y_scale_local)
     n_x_radius = math.ceil(_BASE_RADIUS[method] * x_filter)
@@ -495,11 +413,7 @@ def _resample_kernel(
                 else src_coverage[safe_row[:, np.newaxis], safe_col[np.newaxis, :]]
             )
 
-        # Kernel base/frac: shift by -0.5 so the kernel interpolates between
-        # source pixel CENTERS (at integer + 0.5 in src pixel-corner space).
-        # Without this shift, a dst pixel landing exactly on a src pixel
-        # center would be a 50/50 blend with the neighbour instead of the
-        # exact src value.
+        # Shifted by -0.5 to interpolate between source pixel centers.
         shifted_col = col_f - 0.5
         shifted_row = row_f - 0.5
         base_col = np.floor(shifted_col).astype(np.intp)
@@ -574,12 +488,8 @@ def _validate_grids(
 
 
 def _validate_dtype_nodata(dtype: np.dtype, nodata: int | float | None) -> None:
-    """Reject nodata sentinels the dtype cannot carry.
-
-    Such a sentinel used to behave differently per method within one call:
-    ``nearest`` raised ``OverflowError`` while bilinear/cubic clipped it into
-    the valid range, making nodata indistinguishable from real data.
-    """
+    """Reject a nodata sentinel the dtype cannot carry, which nearest and the
+    kernels would each mangle differently."""
     if nodata is None or dtype.kind not in ("i", "u", "b"):
         return
     if math.isnan(nodata):
@@ -778,18 +688,8 @@ def _any_per_cell(flags: np.ndarray) -> np.ndarray:
 def _bilinear_weights(
     frac: np.ndarray, offsets: Sequence[int], scale: float
 ) -> np.ndarray:
-    """Bilinear (tent) weights, GDAL-style anti-aliased.
-
-    For each tap at offset ``k``, the distance from the sample point is
-    ``k - frac``.  Weight = ``max(0, 1 - |k - frac| / scale)``.  When
-    ``scale = 1`` and ``offsets = (0, 1)`` this reduces to the standard
-    2-tap tent ``(1 - frac, frac)``; with ``scale > 1`` it widens to act
-    as an anti-aliasing low-pass filter for downsampling.
-
-    Returns shape ``(len(offsets), *frac.shape)``, normalized so weights
-    sum to 1 along the first axis (handles the kernel-truncation case
-    where the support extends beyond the integer offsets).
-    """
+    """Tent weights ``max(0, 1 - |k - frac| / scale)`` per tap offset ``k``,
+    ``(len(offsets), *frac.shape)``, normalized to sum to 1 over the taps."""
     weights = np.stack(
         [np.maximum(0.0, 1.0 - np.abs(k - frac) / scale) for k in offsets]
     )
@@ -799,20 +699,9 @@ def _bilinear_weights(
 def _cubic_weights(
     frac: np.ndarray, offsets: Sequence[int], scale: float
 ) -> np.ndarray:
-    """Keys cubic (a = -0.5) weights, GDAL-style anti-aliased.
-
-    Like :func:`_bilinear_weights` but evaluated against the Keys cubic
-    function (matching GDAL's ``GWKCubic``):
-
-    - ``|d| < 1``: ``1.5|d|³ - 2.5|d|² + 1``
-    - ``1 ≤ |d| < 2``: ``-0.5|d|³ + 2.5|d|² - 4|d| + 2``
-    - ``|d| ≥ 2``: 0
-
-    with ``d = (k - frac) / scale``.  At ``scale = 1`` and standard
-    4-tap offsets ``{-1, 0, 1, 2}`` this is the partition-of-unity Keys
-    kernel.  Normalization handles the rare case where summed weights
-    drift from 1 due to scaling.
-    """
+    """Keys cubic (a = -0.5) weights, as GDAL's ``GWKCubic``, at
+    ``d = (k - frac) / scale``; laid out and normalized as
+    :func:`_bilinear_weights`."""
     weights: list[np.ndarray] = []
     for k in offsets:
         d = np.abs(k - frac) / scale
@@ -837,15 +726,7 @@ def _accumulate_2d(
     nodata_is_nan: bool,
     method: Literal["bilinear", "cubic"],
 ) -> tuple[np.ndarray, np.ndarray | None, np.ndarray | None]:
-    """Non-separable 2-D kernel accumulation for the cross-CRS warp.
-
-    The source sampling grid is not axis-aligned with the output, so weights
-    and indices are full 2-D and cannot be reused across rows or columns —
-    hence ``O(taps_x · taps_y)`` here against :func:`_accumulate_separable`'s
-    ``O(taps_x + taps_y)``.
-
-    ``base_col``/``base_row`` and ``wx``/``wy`` are 2-D over the output grid,
-    unlike the 1-D per-axis arrays the separable path takes.
+    """The cross-CRS kernel sums, over 2-D ``base_*`` and ``w*`` arrays.
 
     Returns ``(acc_val, acc_wt, per_dim_ok)`` for :func:`_finalize_kernel`.
     """
@@ -931,21 +812,9 @@ def _accumulate_separable(
     nodata_is_nan: bool,
     method: Literal["bilinear", "cubic"],
 ) -> tuple[np.ndarray, np.ndarray | None, np.ndarray | None]:
-    """Separable two-pass kernel accumulation for the same-CRS path.
-
-    Equivalent to the non-separable 2-D loop in :func:`_accumulate_2d`, but
-    ``O(taps_x + taps_y)`` instead of ``O(taps_x · taps_y)``: convolve along
-    columns into a ``(bands, src_rows, dst_w)`` intermediate, then along rows.
-    Handed one block of destination rows at a time, it reads only the source
-    rows their taps reach.
-
-    ``base_col``/``base_row`` are 1-D ``(dst_w,)``/``(dst_h,)`` and ``wx``/``wy``
-    are ``(taps, dst_w)``/``(taps, dst_h)`` (separable, same-CRS only).
-
-    With ``nodata`` set, GDAL-style renormalization is two separable
-    convolutions: a masked-value numerator and a valid-weight denominator
-    over the per-source-pixel validity mask.  Without ``nodata``, samples are
-    edge-replicated (clamped) with no renormalization.
+    """The same-CRS kernel sums, along columns into a ``(bands, src_rows,
+    dst_w)`` intermediate and then along rows. ``base_*`` are 1-D and ``w*``
+    ``(taps, n)``. With nodata, the weights of valid taps are summed alongside.
 
     Returns ``(acc_val, acc_wt, per_dim_ok)`` for :func:`_finalize_kernel`.
     """
@@ -1123,26 +992,9 @@ def _finalize_kernel(
     return out
 
 
-def _two_pass_threshold(strategy: WarpStrategy) -> float | None:
-    """Local downsample scale above which two-pass applies, or None to disable.
-
-    ``"auto"`` triggers only on the stronger downsamples where the
-    widened-kernel cost clearly dominates; ``"single_pass"`` never triggers.
-    """
-    if strategy == "auto":
-        return _AUTO_SCALE_THRESHOLD
-    return None
-
-
 def _two_pass_work_dtype(dtype: np.dtype) -> np.dtype:
-    """Float dtype for the two-pass intermediate that avoids double rounding.
-
-    Running both passes in float (the intermediate is never cast back to an
-    integer dtype between them) means a single clip+round at the end instead
-    of one per pass.  float32 is used only when it represents the source
-    integer range exactly (mantissa is 24 bits); otherwise float64.  Float
-    sources keep their own width (kernel accumulation is float64 regardless).
-    """
+    """The float dtype both passes run in, so integers are rounded once.
+    float32 where it holds the integer range exactly, else float64."""
     if np.issubdtype(dtype, np.floating):
         return dtype
     if dtype.kind == "b":
@@ -1168,24 +1020,14 @@ def _resample_two_pass(
 ) -> tuple[np.ndarray, np.ndarray | None]:
     """Cross-CRS downsample as two cheap passes instead of one wide warp.
 
-    Pass A downsamples ``src_array`` in its own CRS to an intermediate grid at
-    ~target resolution (``transformer=None`` → fast separable path).  Pass B
-    reprojects that smaller intermediate to the final grid at near-unit scale
-    (a narrow kernel).  Both passes run in float so the integer clip+round
-    happens once, at the end.
+    Pass A downsamples in the source CRS (the separable path) to about the
+    target resolution. Pass B reprojects that at near-unit scale. See
+    :func:`rastera.set_warp_strategy` for how the result differs.
 
-    The intermediate is built with a halo beyond the source extent: Pass A's
-    widened kernel and (for cubic) the ≥2-valid gate erode the outermost
-    intermediate pixels under nodata, so the halo keeps that erosion off the
-    region Pass B samples — avoiding an edge fringe single-pass would not have.
-
-    Coverage composes across the passes: Pass A reports the halo ring as
-    uncovered and Pass B takes that as its ``src_coverage``.  Both go through
-    ``_resample_impl``, which does not fill — blanking the halo would leave
-    Pass B's kernel averaging real data against the fill value.
-
-    See :func:`resample` / :func:`rastera.set_warp_strategy` for when this
-    runs and how its output relates to the single-pass warp.
+    The intermediate reaches past the source extent: Pass A's kernel erodes
+    its outermost pixels under nodata, and the halo keeps that off what Pass B
+    samples. Pass A reports the halo as uncovered, and Pass B takes that as
+    its ``src_coverage`` rather than a fill value it would average in.
     """
     n_bands, h, w = src_array.shape
 
