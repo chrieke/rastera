@@ -1054,8 +1054,8 @@ class TestWarpSeam:
         )
 
     async def test_reproject_without_target_resolution_skips_overviews(self):
-        """Overviews are all coarser than native, so a density-preserving
-        reprojection must not silently read one."""
+        """Overviews are all coarser than native, so a reprojection at
+        gdalwarp's default resolution must not silently read one."""
         obj, gt = self._utm_obj()
         ov = make_mock_geotiff(
             width=200, height=200, scale=20.0, count=1, tile_width=200, crs_epsg=32633
@@ -1075,6 +1075,26 @@ class TestWarpSeam:
 
         assert len(calls) == 1
         assert calls[0]["overview"] is None
+
+    async def test_a_polar_grid_takes_gdalwarps_resolution(self):
+        """Its first and last corner sit at one latitude in EPSG:4326, so
+        gdalwarp takes the extent's diagonal. This was 0.046 degrees, 700x
+        the pixels."""
+        gt = make_mock_geotiff(
+            width=200,
+            height=200,
+            scale=10000.0,
+            count=1,
+            tile_width=200,
+            crs_epsg=3413,
+            origin_x=-1e6,
+            origin_y=1e6,
+        )
+        gt.read = slicing_read(gt, np.zeros((1, 200, 200), np.uint16))
+        arr = await AsyncGeoTIFF("s3://b/k.tif", gt).read(target_crs=4326)
+        # gdalwarp -t_srs EPSG:4326 gives this y resolution, and shrinks x by
+        # 0.1% to fit the right edge.
+        assert arr.transform.a == pytest.approx(1.273621955279407, rel=1e-9)
 
     async def test_same_crs_resample_reports_source_geotiff(self):
         """Not a _CrsNodata stub: RasterArray.crs/.nodata read straight off

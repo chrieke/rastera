@@ -17,6 +17,7 @@ from pyproj import CRS, Transformer
 from .geo import (
     BBox,
     WindowOutOfRangeError,
+    _affine_apply,
     _denoise,
     _grid_bounds,
     _is_on_res_grid,
@@ -270,6 +271,9 @@ class AsyncGeoTIFF:
                 unlike *bbox*, which clips. A window is an exact pixel range,
                 so overhanging one is a mistake and not a partial request.
             band_indices: 1-based.
+            target_resolution: Without it, a reprojecting read takes the
+                resolution gdalwarp picks: ``gdalwarp -te`` with a bbox, and
+                ``gdalwarp -t_srs`` for the whole dataset without one.
             snap_to_grid: When True (default) and *target_resolution* is
                 given with a bbox, the output grid is rounded outward onto
                 multiples of ``target_resolution`` — see
@@ -523,13 +527,12 @@ class AsyncGeoTIFF:
         if target_resolution is not None:
             res = target_resolution
         elif needs_reproject:
-            # Preserve native pixel density across the CRS change.
             assert src_crs is not None and out_crs is not None
-            src_bbox = transform_bbox(target_bbox, out_crs, src_crs)
-            native_res = gt.res[0]
-            n_cols = max(1, round(src_bbox.width / native_res))
-            n_rows = max(1, round(src_bbox.height / native_res))
-            res = min(target_bbox.width / n_cols, target_bbox.height / n_rows)
+            res = (
+                _default_resolution(gt, src_crs, out_crs)
+                if bbox is None
+                else _default_resolution_for_bbox(gt, target_bbox, src_crs, out_crs)
+            )
         else:
             res = gt.res[0]
 
@@ -545,7 +548,7 @@ class AsyncGeoTIFF:
             out_crs=out_crs,
             band_indices=band_indices,
             resampling=resampling,
-            # Density-preserving *res* is not a resolution anyone asked for.
+            # gdalwarp's default *res* is not a resolution anyone asked for.
             use_overviews=use_overviews and needs_resample,
         )
 
@@ -1037,6 +1040,55 @@ def _src_units_per_pixel(
         abs(ys[1] - ys[0]) + abs(ys[2] - ys[0]) or ry,
     )
     return spacing, reach
+
+
+def _default_resolution(gt: _GeoTIFFLike, src_crs: int, dst_crs: int) -> float:
+    """What ``gdalwarp -t_srs`` picks for *gt* in *dst_crs* without ``-te``.
+
+    GDAL's ``GDALSuggestedWarpOutput2``: the distance in *dst_crs* between the
+    grid's first and last corner, over the same diagonal in pixels. When the
+    corners share an x or a y, as on a grid centred on a pole in EPSG:4326, the
+    transformed extent's diagonal instead.
+    """
+    t = gt.transform
+    x1, y1 = _affine_apply(t, gt.width, gt.height)
+    xs, ys = _transformer(src_crs, dst_crs).transform([t.c, x1], [t.f, y1])
+    dx, dy = xs[1] - xs[0], ys[1] - ys[0]
+    if dx == 0 or dy == 0 or not math.isfinite(dx + dy):
+        extent = transform_bbox(_grid_bounds(gt), src_crs, dst_crs)
+        dx, dy = extent.width, extent.height
+    return math.hypot(dx, dy) / math.hypot(gt.width, gt.height)
+
+
+def _default_resolution_for_bbox(
+    gt: _GeoTIFFLike, bbox: BBox, src_crs: int, dst_crs: int
+) -> float:
+    """What ``gdalwarp -t_srs -te`` picks for *gt* in *dst_crs* over *bbox*.
+
+    The finest local scale on a 10x10 grid of points across *bbox*: at each,
+    a small step in x and one in y, each over the source pixels it spans,
+    averaged. GDAL also drops points under a tenth of the median, which no
+    ordinary grid has, and falls back to ``_default_resolution`` when no point
+    transforms.
+    """
+    n = 10
+    eps = min(bbox.width, bbox.height) / 1000
+    x, y = np.meshgrid(
+        np.linspace(bbox.minx, bbox.maxx, n), np.linspace(bbox.miny, bbox.maxy, n)
+    )
+    step = np.where(np.arange(n) == n - 1, -eps, eps)  # inward at the far edge
+    sx, sy = _transformer(dst_crs, src_crs).transform(
+        np.stack([x, x + step, x]), np.stack([y, y, y + step[:, None]])
+    )
+    inv = ~gt.transform
+    col = inv.a * sx + inv.b * sy + inv.c
+    row = inv.d * sx + inv.e * sy + inv.f
+    with np.errstate(divide="ignore", invalid="ignore"):
+        res = (eps / np.hypot(col[1:] - col[0], row[1:] - row[0])).mean(axis=0)
+    res = res[np.isfinite(res)]
+    if not res.size:
+        return _default_resolution(gt, src_crs, dst_crs)
+    return float(res.min())
 
 
 def _halo_bbox(

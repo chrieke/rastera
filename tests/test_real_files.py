@@ -106,6 +106,20 @@ class TestReads:
         )
         np.testing.assert_array_equal(_data(arr), REF["f32_20m"])
 
+    async def test_a_reprojecting_read_takes_gdalwarps_resolution(self):
+        """It was 0.00009 degrees, 2.6x gdalwarp's pixels for the full read
+        and 2.9x for the bbox."""
+        ds = await _open("u16.tif")
+        # gdalwarp -t_srs EPSG:4326 u16.tif
+        full = await ds.read(target_crs=4326)
+        assert full.transform.a == pytest.approx(0.0001455295488904, rel=1e-12)
+        # gdalwarp -t_srs EPSG:4326 -te <bbox> u16.tif makes 65 columns: it
+        # fits its resolution to a whole number of them, where rastera rounds
+        # the grid out.
+        bbox = (9.001, 45.155, 9.011, 45.164)
+        part = await ds.read(bbox=bbox, bbox_crs=4326, target_crs=4326)
+        assert round((bbox[2] - bbox[0]) / part.transform.a) == 65
+
     async def test_merge_matches_gdalbuildvrt(self):
         """gdalbuildvrt takes each pixel from the last file valid there, which
         is mosaic_method="last"."""
