@@ -457,3 +457,42 @@ def _transformer(from_crs: int | CRS, to_crs: int | CRS) -> Transformer:
     threads can share it.
     """
     return Transformer.from_crs(from_crs, to_crs, always_xy=True)
+
+
+# gdalwarp's clamp latitude: where EPSG:3857's square extent ends.
+_MERCATOR_MAX_LAT = 85.0511287798066
+# Pseudo Mercator and Mercator (variant A), the two gdalwarp's Mercator_1SP
+# check matches.
+_MERCATOR_METHOD_CODES = frozenset({"1024", "9804"})
+
+
+def _mercator_clamped_bounds(bounds: BBox, from_crs: int, to_crs: int) -> BBox | None:
+    """*bounds* clamped to ±85.0511° and ±180° where gdalwarp clamps them,
+    else None.
+
+    Mercator sends the poles to infinity: PROJ puts lat 90 at y = 2.4e8 m.
+    Reading a geographic source into Mercator without ``-te``, gdalwarp reads
+    as if ``-te`` named the clamped extent (``GDALWarpCreateOutput``). It does
+    so only when the source crosses ±85.0511°, lies within ±180°, and the
+    Mercator's central meridian is 0.
+    """
+    t = _transformer(from_crs, to_crs)
+    op = t.target_crs.coordinate_operation if t.target_crs else None
+    if (
+        not (t.source_crs and t.source_crs.is_geographic)
+        or op is None
+        or op.method_code not in _MERCATOR_METHOD_CODES
+        or any(p.code == "8802" and p.value != 0 for p in op.params)
+        or bounds.minx < -180 - 1e-3
+        or bounds.maxx > 180 + 1e-3
+    ):
+        return None
+    lat = _MERCATOR_MAX_LAT
+    if not (bounds.miny < lat < bounds.maxy or bounds.miny < -lat < bounds.maxy):
+        return None
+    return BBox(
+        max(bounds.minx, -180),
+        max(bounds.miny, -lat),
+        min(bounds.maxx, 180),
+        min(bounds.maxy, lat),
+    )

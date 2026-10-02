@@ -22,6 +22,7 @@ from .geo import (
     _denoise,
     _grid_bounds,
     _is_on_res_grid,
+    _mercator_clamped_bounds,
     _normalize_crs,
     _require_north_up,
     _transformer,
@@ -265,7 +266,9 @@ class AsyncGeoTIFF:
 
         Args:
             bbox: Must be in *bbox_crs*, which must equal *target_crs* if set,
-                else the dataset CRS.
+                else the dataset CRS. Defaults to the dataset's extent,
+                clamped to ±85.0511° when reprojecting a geographic dataset to
+                Mercator, as gdalwarp does.
             window: In full-resolution pixels. Combines with
                 *target_resolution* but not with *target_crs*. Naming pixels
                 the dataset does not have raises
@@ -518,7 +521,13 @@ class AsyncGeoTIFF:
         elif needs_reproject:
             # needs_reproject implies target_crs was given, so out_crs is set.
             assert src_crs is not None and out_crs is not None
-            target_bbox = transform_bbox(_grid_bounds(gt), src_crs, out_crs)
+            src_bounds = _grid_bounds(gt)
+            clamped = _mercator_clamped_bounds(src_bounds, src_crs, out_crs)
+            target_bbox = transform_bbox(clamped or src_bounds, src_crs, out_crs)
+            if clamped is not None:
+                # gdalwarp then reads as if -te named the clamped extent, which
+                # also picks the -te resolution below.
+                bbox = target_bbox
         else:
             target_bbox = _grid_bounds(gt)
 

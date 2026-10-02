@@ -1026,6 +1026,29 @@ class TestReadGridInvariance:
             assert data.shape == (1, 40, 40), minx
             assert (data == 7).all(), minx
 
+    async def test_default_mercator_read_is_a_read_of_the_clamped_extent(self):
+        """PROJ puts lat 90 at y = 2.4e8 m, so a global source came out 34x402
+        px at 1.2e6 m. gdalwarp gives 349x349, as if -te named the extent
+        clamped to ±85.0511°; rastera rounds that grid out to 350."""
+        gt = make_mock_geotiff(
+            width=360,
+            height=180,
+            scale=1.0,
+            count=1,
+            crs_epsg=4326,
+            origin_x=-180,
+            origin_y=90,
+        )
+        gt.read = slicing_read(gt, np.full((1, 180, 360), 7, np.uint16))
+        obj = AsyncGeoTIFF("s3://b/k.tif", gt)
+
+        result = await obj.read(target_crs=3857)
+        m = 20037508.342789244
+        te = await obj.read(bbox=(-m, -m, m, m), bbox_crs=3857, target_crs=3857)
+        assert (result.width, result.height) == (350, 350)
+        assert result.bounds.top == pytest.approx(m)
+        assert result.transform.a == pytest.approx(te.transform.a, rel=1e-9)
+
     async def test_disjoint_bbox_raises_on_both_paths(self):
         obj = self._obj()
         for res in (1.0, 2.0):
