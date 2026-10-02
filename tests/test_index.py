@@ -443,6 +443,71 @@ class TestFootprintEdges:
         minx, miny, maxx, maxy = gdf.geometry.iloc[0].bounds  # type: ignore[reportUnknownMemberType]
         assert 9.9 < minx < maxx < 10.2 and 49.9 < miny < maxy < 50.1
 
+    @pytest.mark.parametrize(
+        ("epsg", "origin", "inside"),
+        [
+            # 200 km around the south pole.
+            (3031, (-100000.0, 100000.0), (0.0, -89.9)),
+            # 200 km of UTM 60N reaching past 180 degrees.
+            (32660, (700000.0, 6000000.0), (-178.5, 53.0)),
+        ],
+        ids=["pole", "antimeridian"],
+    )
+    @patch("rastera.index._build_obstore")
+    @patch("rastera.index.AsyncGeoTIFF.open", new_callable=AsyncMock)
+    @patch("rastera.index.obstore.get_range_async", new_callable=AsyncMock)
+    async def test_a_tile_around_a_pole_or_across_180_is_found(
+        self,
+        mock_get_range: Any,
+        mock_open: Any,
+        mock_build_obs: Any,
+        epsg: int,
+        origin: tuple[float, float],
+        inside: tuple[float, float],
+    ) -> None:
+        """Reprojected as a ring, the first left the pole out and the second
+        spanned the rest of the globe: a query inside either matched nothing,
+        and one at longitude 0 matched the second."""
+        mock_build_obs.return_value = MagicMock()
+        mock_get_range.return_value = b"\x00" * 100
+        gt = make_mock_geotiff(
+            width=200,
+            height=200,
+            scale=1000.0,
+            crs_epsg=epsg,
+            origin_x=origin[0],
+            origin_y=origin[1],
+        )
+        mock_open.return_value = AsyncGeoTIFF("s3://bucket/t.tif", gt)
+
+        gdf = await build_index(["s3://bucket/t.tif"])
+
+        x, y = inside
+        assert (
+            len(_filter_gdf(gdf, (x - 0.01, y - 0.01, x + 0.01, y + 0.01), 4326)) == 1
+        )
+        assert len(_filter_gdf(gdf, (0.0, 53.0, 0.1, 53.1), 4326)) == 0
+
+    def test_a_projected_query_box_across_180_finds_tiles_on_both_sides(
+        self,
+    ) -> None:
+        """Into lon/lat, the box came out spanning the rest of the globe and
+        matched the tile at longitude 0 instead."""
+        gdf = _make_index_gdf(
+            [
+                {
+                    "uri": f"s3://b/{name}.tif",
+                    "minx": x,
+                    "miny": 53,
+                    "maxx": x + 0.5,
+                    "maxy": 54,
+                }
+                for name, x in (("east", 179.0), ("west", -179.5), ("zero", 0.0))
+            ]
+        )
+        found = _filter_gdf(gdf, (600000.0, 5800000.0, 900000.0, 6000000.0), 32660)
+        assert sorted(found["uri"]) == ["s3://b/east.tif", "s3://b/west.tif"]
+
 
 class TestOpenFromIndex:
     @patch("rastera.index._build_obstore")
@@ -720,3 +785,22 @@ class TestBuildIndexStore:
             )
             await open_from_index(gdf, region="eu-north-1")
         assert mock_open.call_args.kwargs["region"] == "eu-north-1"
+
+    @pytest.mark.parametrize("entry", ["build_index", "open_from_index"])
+    @patch("rastera.index.AsyncGeoTIFF.open", new_callable=AsyncMock)
+    async def test_a_local_descriptor_opens_its_sources_with_their_own_stores(
+        self, mock_open: Any, entry: str, tmp_path: Any
+    ) -> None:
+        """Its sources may be anywhere. Handed the index's local store, an
+        s3:// source was read from /key on local disk."""
+        vrt = tmp_path / "v.vrt"
+        vrt.write_bytes(b"<VRTDataset/>")
+        mock_open.return_value = _make_mock_async_geotiff(uri=str(vrt))
+        if entry == "build_index":
+            await build_index([str(vrt)])
+        else:
+            gdf = _make_index_gdf(
+                [{"uri": str(vrt), "minx": 0, "miny": 0, "maxx": 1, "maxy": 1}]
+            )
+            await open_from_index(gdf)
+        assert mock_open.call_args.kwargs["store"] is None

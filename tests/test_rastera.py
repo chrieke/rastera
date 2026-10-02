@@ -318,6 +318,38 @@ class TestOpen:
         keys = [c.args[0] for c in mock_geotiff_cls.open.call_args_list]
         assert keys == [p.resolve().relative_to(anchor).as_posix() for p in (a, b)]
 
+    @staticmethod
+    async def _stores_opened_with(uris: list[str]) -> dict[str, Any]:
+        stores: dict[str, Any] = {}
+
+        async def fake_open(uri: str, **kwargs: Any) -> AsyncGeoTIFF:
+            stores[uri] = kwargs["store"]
+            return AsyncGeoTIFF(uri, make_mock_geotiff())
+
+        with patch.object(AsyncGeoTIFF, "open", side_effect=fake_open):
+            await rastera.open(uris, cache=False)
+        return stores
+
+    async def test_open_many_gives_each_presigned_url_its_own_store(self):
+        """A URL with a query is its own store root, so two on one host were
+        refused as two buckets, and the error printed both signatures."""
+        signed = [
+            f"https://b.s3.eu-north-1.amazonaws.com/{k}.tif?X-Amz-Signature={k}"
+            for k in "ab"
+        ]
+        stores = await self._stores_opened_with([*signed, "s3://b/c.tif"])
+        assert [stores[u] for u in signed] == [None, None]
+        assert stores["s3://b/c.tif"] is not None
+
+    async def test_open_many_leaves_a_local_vrt_to_build_its_own_stores(
+        self, tmp_path: Path
+    ):
+        """Its sources may be anywhere. Handed the list's local store, an
+        s3:// source was read from /key on local disk."""
+        vrt, tif = str(tmp_path / "a.vrt"), str(tmp_path / "b.tif")
+        stores = await self._stores_opened_with([vrt, tif])
+        assert stores[vrt] is None and stores[tif] is not None
+
 
 # ── meta_overrides ──────────────────────────────────────────────────────
 
