@@ -111,10 +111,12 @@ async def build_index(
         except Exception as exc:
             raise RuntimeError(f"Failed to index {uri!r}") from exc
 
-    results = await _gather_bounded(
-        concurrency, [_open_one(u, hdr) for u, _, hdr in fetched]
-    )
-    cache.clear()  # see open_from_index
+    try:
+        results = await _gather_bounded(
+            concurrency, [_open_one(u, hdr) for u, _, hdr in fetched]
+        )
+    finally:
+        cache.clear()  # see open_from_index
 
     rows: dict[str, list[Any]] = {c: [] for c in _INDEX_COLUMNS}
     geometries: list[Any] = []
@@ -218,12 +220,14 @@ async def open_from_index(
             **store_kwargs,
         )
 
-    opened = await _gather_bounded(concurrency, [_open_one(u) for u in uris])
-    # Parsed now, and later reads fall through to the inner store. Left in
-    # place, every header the reader's LRU keeps held this store, and with it
-    # every row's bytes: about 3 GB for 100k rows at the default prefetch.
-    cache.clear()
-    return opened
+    try:
+        return await _gather_bounded(concurrency, [_open_one(u) for u in uris])
+    finally:
+        # Parsed now, and later reads fall through to the inner store. Left in
+        # place, every header the reader's LRU keeps held this store, and with
+        # it every row's bytes: about 3 GB for 100k rows at the default
+        # prefetch. On a failed open too, as the opens before it are cached.
+        cache.clear()
 
 
 class HeaderCacheStore:
