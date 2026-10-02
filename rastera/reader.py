@@ -17,6 +17,7 @@ from pyproj import CRS, Transformer
 from .geo import (
     BBox,
     WindowOutOfRangeError,
+    _denoise,
     _grid_bounds,
     _is_on_res_grid,
     _normalize_crs,
@@ -964,11 +965,13 @@ def _grid_for_bbox(
 
     Uses ``round()`` by default to match rasterio/GDAL merge behaviour.
     When *use_ceil* is True, uses ``math.ceil()`` to match rasterio read
-    behaviour (always covers the full bbox).
+    behaviour (always covers the full bbox). Denoised first: on a degree grid,
+    600 pixels of 0.0001 divide by 0.0002 to 300.00000000000244, which ceil
+    alone makes 301.
     """
     fn = math.ceil if use_ceil else round
-    width = max(1, fn(bbox.width / res))
-    height = max(1, fn(bbox.height / res))
+    width = max(1, fn(_denoise(bbox.width / res)))
+    height = max(1, fn(_denoise(bbox.height / res)))
     transform = Affine(res, 0, bbox.minx, 0, -res, bbox.maxy)
     return transform, width, height
 
