@@ -265,7 +265,7 @@ class _DIMAPDataset(AsyncGeoTIFF):
 
         result = _make_output_array(
             out,
-            layout.transform @ Affine.translation(window.col_off, window.row_off),
+            layout.transform * Affine.translation(window.col_off, window.row_off),
             window.width,
             window.height,
             self._output_geotiff_ref(self._crs_epsg),

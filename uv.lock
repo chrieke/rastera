@@ -707,7 +707,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "affine", specifier = ">=3.0.1" },
+    { name = "affine", specifier = ">=2.4.0" },
     { name = "async-geotiff", specifier = ">=0.5.1" },
     { name = "async-tiff", specifier = "==0.7.2" },
     { name = "geopandas", marker = "extra == 'index'", specifier = ">=1.0.0" },

@@ -242,7 +242,7 @@ def _resample_nearest(
 
     if transformer is None:
         # Same CRS: compose affines and use 1D index arrays (no meshgrid).
-        combined = ~src_transform @ dst_transform
+        combined = ~src_transform * dst_transform
         src_col_1d = _pixel_index(
             float(combined.a) * (np.arange(dst_width, dtype=np.float64) + 0.5)
             + float(combined.c)
@@ -367,7 +367,7 @@ def _resample_kernel(
     # ``(4, H, W)`` weight tensors (~4 GB).  Cross-CRS reprojection is
     # not separable, so the coarse-grid path returns full 2D coords.
     if transformer is None:
-        combined = ~src_transform @ dst_transform
+        combined = ~src_transform * dst_transform
         src_col_f = float(combined.a) * (
             np.arange(dst_width, dtype=np.float64) + 0.5
         ) + float(combined.c)

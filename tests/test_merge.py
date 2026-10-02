@@ -840,7 +840,7 @@ def _make_windowed_cog(
     async def _read_native(*, bbox: Any = None, **_: Any) -> RasterArray:
         win = window_from_bbox(gt, bbox)
         data = np.full((1, win.height, win.width), value, dtype=np.uint16)
-        transform = gt.transform @ Affine.translation(win.col_off, win.row_off)
+        transform = gt.transform * Affine.translation(win.col_off, win.row_off)
         return _make_array(data, transform, geotiff=gt)
 
     cog._read_native = _read_native  # type: ignore[method-assign]

@@ -364,7 +364,7 @@ def _nearest_picks(lo: float, hi: float) -> Picks:
 
 def _affine_apply(t: Affine, x: float, y: float) -> tuple[float, float]:
     """Apply an affine transform to a point, with correct typing."""
-    rx, ry = t @ (x, y)
+    rx, ry = t * (x, y)
     return float(rx), float(ry)
 
 

@@ -480,7 +480,7 @@ class AsyncGeoTIFF:
         """
         gt = self._geotiff
         target_bbox = bounds_from_transform(
-            gt.transform @ Affine.translation(window.col_off, window.row_off),
+            gt.transform * Affine.translation(window.col_off, window.row_off),
             window.width,
             window.height,
         )

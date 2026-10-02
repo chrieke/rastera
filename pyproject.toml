@@ -11,7 +11,7 @@ license = "MIT"
 license-files = ["LICENSE"]
 requires-python = ">=3.12"
 dependencies = [
-    "affine>=3.0.1",
+    "affine>=2.4.0",
     "async-geotiff>=0.5.1",
     # TODO: rastera/predictor.py corrects this version's predictor undo, so a
     # fixed release would be corrected twice. Once async-tiff undoes it per band
