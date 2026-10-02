@@ -106,6 +106,20 @@ class TestReads:
         )
         np.testing.assert_array_equal(_data(arr), REF["f32_20m"])
 
+    @pytest.mark.parametrize("method", ["bilinear", "cubic"])
+    @pytest.mark.parametrize("res", [20, 5], ids=["downsample", "upsample"])
+    async def test_a_kernel_read_matches_gdalwarp(self, method: str, res: int):
+        """Clear of the NaN block and the edges, where the two treat cubic
+        taps on nodata differently. Within float32 rounding: they sum in
+        another order."""
+        arr = await (await _open("f32.tif")).read(
+            bbox=(400080, 6000080, 400340, 6000400),
+            bbox_crs=32633,
+            target_resolution=res,
+            resampling=method,  # type: ignore[arg-type]
+        )
+        np.testing.assert_allclose(_data(arr), REF[f"f32_{method}_{res}m"], rtol=1e-6)
+
     async def test_a_reprojecting_read_takes_gdalwarps_resolution(self):
         """It was 0.00009 degrees, 2.6x gdalwarp's pixels for the full read
         and 2.9x for the bbox."""
@@ -134,6 +148,22 @@ class TestReads:
             mosaic_method="last",
         )
         np.testing.assert_array_equal(_data(arr), REF["mosaic_last"])
+
+
+class TestInternalMask:
+    """The guard that turns away a resampled read of a masked file reads
+    async-geotiff's ``mask_ifd`` by name, which no mock pins."""
+
+    async def test_a_native_read_returns_the_mask(self):
+        arr = await (await _open("masked.tif")).read()
+        np.testing.assert_array_equal(_data(arr), REF["masked"])
+        assert arr.mask is not None
+        np.testing.assert_array_equal(arr.mask, REF["masked_mask"] != 0)
+
+    async def test_a_resampled_read_raises(self):
+        ds = await _open("masked.tif")
+        with pytest.raises(NotImplementedError, match="internal mask"):
+            await ds.read(target_resolution=20)
 
 
 class TestLocalPaths:

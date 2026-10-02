@@ -35,6 +35,8 @@ def main() -> None:
     tile_a = np.repeat(100 + rows[:, None], 32, axis=1)
     tile_b = np.repeat(200 + rows[None, :], 32, axis=0)
     tile_b[:16, :4] = 0  # nodata where the two tiles overlap
+    mask = np.full((32, 32), 255, dtype=np.uint8)
+    mask[:8, :12] = 0  # what the internal mask hides
     # Random walks along each row, negative values included.
     steps = np.random.default_rng(0).integers(-500, 500, (3, 24, 40))
     band_i16 = np.cumsum(steps, axis=2).astype(np.int16)
@@ -59,6 +61,22 @@ def main() -> None:
             _write_cog(work, name, pixels, epsg, geotransform, nodata)
             refs[name] = _gdal(work / name, "gdal_translate", HERE / f"{name}.tif")
 
+        # An internal (PER_DATASET) mask, from a second band.
+        _write_cog(
+            work,
+            "masked",
+            np.stack([south, mask]),
+            32632,
+            (500000, 10, 0, 5000320, 0, -10),
+            "none",
+            extra="-b 1 -mask 2",
+        )
+        masked = HERE / "masked.tif"
+        refs["masked"] = _gdal(work / "masked", "gdal_translate", masked)
+        refs["masked_mask"] = _gdal(
+            work / "mask", "gdal_translate", masked, "-b", "mask"
+        )
+
         refs["u16_level1"] = _gdal(
             work / "u16_level1", "gdal_translate", HERE / "u16.tif", "-ovr", "0"
         )
@@ -66,6 +84,20 @@ def main() -> None:
         refs["f32_20m"] = _gdal(
             work / "f32_20m", "gdalwarp", HERE / "f32.tif", *warp.split()
         )
+        # Clear of the NaN block and the edges, where gdalwarp and rastera
+        # treat cubic taps on nodata differently.
+        for method in ("bilinear", "cubic"):
+            for res in (20, 5):
+                name = f"f32_{method}_{res}m"
+                warp = f"-r {method} -tr {res} {res} -te 400080 6000080 400340 6000400"
+                refs[name] = _gdal(
+                    work / name,
+                    "gdalwarp",
+                    HERE / "f32.tif",
+                    *warp.split(),
+                    "-ovr",
+                    "NONE",
+                )
         # gdalbuildvrt takes each pixel from the last file that is valid there.
         vrt = work / "ab.vrt"
         tiles = [str(HERE / "tile_a.tif"), str(HERE / "tile_b.tif")]
@@ -90,13 +122,14 @@ def _write_cog(
     epsg: int,
     geotransform: tuple[int, ...],
     nodata: str,
+    extra: str = "",
 ) -> None:
     """Write *pixels* as a COG with 16x16 blocks, so a tiny file still has
     several tiles. GDAL warns that COG blocks should be 128 or more, and then
     honours the size anyway."""
     raw = _envi(pixels, work / f"{name}_src.raw")
     options = (
-        f"-q -of COG -a_srs EPSG:{epsg} -a_nodata {nodata} "
+        f"-q -of COG -a_srs EPSG:{epsg} -a_nodata {nodata} {extra} "
         f"-co BLOCKSIZE=16 -co COMPRESS=DEFLATE -co PREDICTOR=YES -a_gt"
     ).split() + [str(v) for v in geotransform]
     out = str(HERE / f"{name}.tif")
