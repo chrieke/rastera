@@ -207,6 +207,25 @@ def test_profile_is_reachable_on_synthesized_datasets(flavour: str) -> None:
     assert set(RasterProfile.__required_keys__) <= set(profile)
 
 
+@pytest.mark.parametrize("flavour", ["vrt", "processed", "dimap"])
+async def test_use_overviews_raises_on_synthesized_datasets(flavour: str) -> None:
+    """Their sources' pyramids need not match. merge() skipped read()'s check
+    and read a DIMAP at full resolution without saying so."""
+    ds = _synthesized_datasets()[flavour]
+    p = ds.profile
+    assert p["crs_epsg"] is not None
+    with pytest.raises(NotImplementedError, match="use_overviews"):
+        await ds.read(use_overviews=True)
+    with pytest.raises(NotImplementedError, match="use_overviews"):
+        await rastera.merge(
+            [ds],
+            bbox=p["bounds"],
+            bbox_crs=p["crs_epsg"],
+            target_resolution=p["res"][0] * 4,
+            use_overviews=True,
+        )
+
+
 # ── the public namespace ────────────────────────────────────────────────
 
 

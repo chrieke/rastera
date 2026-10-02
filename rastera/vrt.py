@@ -47,7 +47,6 @@ from .reader import (
     _make_output_array,
     _source_store,
 )
-from .resampling import ResamplingMethod
 from .store import (
     _check_source_uri,
     _fetch_descriptor_bytes,
@@ -188,6 +187,8 @@ class _VRTDataset(AsyncGeoTIFF):
     that share a source into a single call. ``read()`` resamples that stack.
     """
 
+    _use_overviews_unsupported = "VRT"
+
     def __init__(
         self,
         uri: str,
@@ -240,36 +241,6 @@ class _VRTDataset(AsyncGeoTIFF):
                 return uri
         return None
 
-    async def read(
-        self,
-        bbox: BBox | tuple[float, float, float, float] | None = None,
-        bbox_crs: int | CRS | None = None,
-        window: Window | None = None,
-        band_indices: Sequence[int] | None = None,
-        target_crs: int | CRS | None = None,
-        target_resolution: float | None = None,
-        snap_to_grid: bool = True,
-        use_overviews: bool = False,
-        resampling: ResamplingMethod = "nearest",
-    ) -> RasterArray:
-        if use_overviews:
-            # Each source would pick its own overview level independently,
-            # which can yield mismatched output shapes across sources.
-            raise NotImplementedError("use_overviews is not supported on VRT datasets")
-        # Not forwarded to each source: GDAL resamples the VRT's pixels with
-        # the VRT's nodata, which is what the base read does with our stack.
-        return await super().read(
-            bbox=bbox,
-            bbox_crs=bbox_crs,
-            window=window,
-            band_indices=band_indices,
-            target_crs=target_crs,
-            target_resolution=target_resolution,
-            snap_to_grid=snap_to_grid,
-            use_overviews=False,
-            resampling=resampling,
-        )
-
     async def _read_native(
         self,
         bbox: BBox | tuple[float, float, float, float] | None = None,
@@ -314,6 +285,8 @@ class _VRTProcessedDataset(AsyncGeoTIFF):
     LUTs matching the selected bands. ``read()`` resamples the LUT's output.
     """
 
+    _use_overviews_unsupported = "processed VRT"
+
     def __init__(
         self,
         uri: str,
@@ -341,38 +314,6 @@ class _VRTProcessedDataset(AsyncGeoTIFF):
     def _internal_mask_uri(self) -> str | None:
         # ``_geotiff`` is synthesized; the source's header is the real one.
         return self._source._internal_mask_uri()
-
-    async def read(
-        self,
-        bbox: BBox | tuple[float, float, float, float] | None = None,
-        bbox_crs: int | CRS | None = None,
-        window: Window | None = None,
-        band_indices: Sequence[int] | None = None,
-        target_crs: int | CRS | None = None,
-        target_resolution: float | None = None,
-        snap_to_grid: bool = True,
-        use_overviews: bool = False,
-        resampling: ResamplingMethod = "nearest",
-    ) -> RasterArray:
-        if use_overviews:
-            # Overview reads through the LUT aren't tested yet; same
-            # consistency stance as ``_VRTDataset``.
-            raise NotImplementedError(
-                "use_overviews is not supported on processed VRT datasets"
-            )
-        # Not forwarded to the source: GDAL applies the LUT, then resamples its
-        # output with ``dst_nodata``, which is what the base read does here.
-        return await super().read(
-            bbox=bbox,
-            bbox_crs=bbox_crs,
-            window=window,
-            band_indices=band_indices,
-            target_crs=target_crs,
-            target_resolution=target_resolution,
-            snap_to_grid=snap_to_grid,
-            use_overviews=False,
-            resampling=resampling,
-        )
 
     async def _read_native(
         self,

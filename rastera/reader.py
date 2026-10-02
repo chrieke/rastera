@@ -69,6 +69,10 @@ class AsyncGeoTIFF:
     resampling, and overview selection.
     """
 
+    # The dataset kind ``use_overviews`` raises on, set by the VRT and DIMAP
+    # datasets: their sources' pyramids need not match.
+    _use_overviews_unsupported: str | None = None
+
     def __init__(
         self,
         uri: str,
@@ -293,6 +297,8 @@ class AsyncGeoTIFF:
                 mask raises ``NotImplementedError`` here, since the warp would
                 read the pixels it hides as data.
         """
+        if use_overviews:
+            _require_overview_support(self)
         gt = self._geotiff
         band_indices = normalize_band_indices(band_indices, self.count)
         if window is not None and bbox is not None:
@@ -1185,6 +1191,16 @@ def _validate_window(gt: _GeoTIFFLike, window: Window) -> None:
             f"cols={window.col_off}:{window.col_off + window.width}, "
             f"rows={window.row_off}:{window.row_off + window.height}. "
             f"Image: {gt.width}x{gt.height}."
+        )
+
+
+def _require_overview_support(ds: AsyncGeoTIFF) -> None:
+    """Raise for a VRT or DIMAP rather than read it at full resolution when the
+    caller asked for overviews to save bandwidth."""
+    if ds._use_overviews_unsupported is not None:
+        raise NotImplementedError(
+            f"use_overviews is not supported on {ds._use_overviews_unsupported} "
+            f"datasets"
         )
 
 

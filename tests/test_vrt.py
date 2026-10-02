@@ -1558,13 +1558,6 @@ class TestVRTRead:
         with pytest.raises(NotImplementedError, match="overview"):
             await ds._read_native(overview=MagicMock())
 
-    async def test_read_rejects_use_overviews(self):
-        """Public read() refuses use_overviews=True — independent overview
-        selection across sources can yield mismatched shapes."""
-        ds = _make_rgbnir_ds()
-        with pytest.raises(NotImplementedError, match="use_overviews"):
-            await ds.read(use_overviews=True)
-
     def test_count_reflects_vrt_band_count(self):
         """cog.count on a VRT must return the VRT's logical band count, not
         the first source's. merge() relies on this for input validation."""
@@ -1708,49 +1701,6 @@ class TestMergeOnVRT:
             snap_to_grid=True,
         )
         assert result.nodata == 0
-
-    async def test_merge_vrt_with_use_overviews_raises(self):
-        """use_overviews=True passes an `overview` object to `_read_native`,
-        which VRTs can't support across multiple sources."""
-        from rastera.geo import BBox
-        from rastera.merge import merge
-
-        # Natively 1.0 m/px, request 10.0 m/px to trigger the reprojected
-        # path, and give each source a coarse overview so merge selects it.
-        vrt_a = _vrt_with_one_source(
-            "s3://b/a.vrt",
-            "s3://b/a.tif",
-            origin_x=0.0,
-            width=10,
-            height=10,
-            scale=1.0,
-            fill=1,
-        )
-        vrt_b = _vrt_with_one_source(
-            "s3://b/b.vrt",
-            "s3://b/b.tif",
-            origin_x=5.0,
-            width=10,
-            height=10,
-            scale=1.0,
-            fill=2,
-        )
-        for vrt in (vrt_a, vrt_b):
-            ov = MagicMock()
-            ov.width = 1  # overview_res = native_res * (10/1) = 10.0
-            ov.height = 1
-            # overviews is a read-only property on the real GeoTIFF.
-            vrt._band_sources[0][0]._geotiff.overviews = [ov]  # type: ignore[reportAttributeAccessIssue]
-
-        with pytest.raises(NotImplementedError, match="overview"):
-            await merge(
-                [vrt_a, vrt_b],
-                bbox=BBox(0, 0, 15, 10),
-                bbox_crs=32632,
-                target_crs=32632,
-                target_resolution=10.0,
-                use_overviews=True,
-            )
 
 
 # ── dispatch from rastera.open ──────────────────────────────────────────────

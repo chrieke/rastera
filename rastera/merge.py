@@ -33,6 +33,7 @@ from .reader import (
     _grid_for_bbox,
     _make_output_array,
     _require_epsg,
+    _require_overview_support,
 )
 from .resampling import ResamplingMethod, validate_resampling
 
@@ -77,7 +78,8 @@ async def merge(
             at the bbox's ``(minx, maxy)`` with rounded pixel counts, as
             ``rasterio.merge`` does.
         use_overviews: Trades accuracy for bandwidth; see
-            :meth:`rastera.AsyncGeoTIFF.read` for what overview pixels cost.
+            :meth:`rastera.AsyncGeoTIFF.read`. A VRT or DIMAP among the inputs
+            raises ``NotImplementedError``.
         resampling: Used when reprojecting or changing resolution; see
             :meth:`rastera.AsyncGeoTIFF.read` for the per-method trade-offs.
     """
@@ -97,6 +99,8 @@ async def merge(
     validate_resolution(target_resolution)
     for cog in cogs:
         _require_epsg(cog)  # every input is placed by its EPSG code
+        if use_overviews:
+            _require_overview_support(cog)
     fill_value, out_nodata = _resolve_output_nodata(nodata, cogs[0])
 
     bbox_crs = _normalize_crs(bbox_crs)
