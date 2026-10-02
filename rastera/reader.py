@@ -280,7 +280,11 @@ class AsyncGeoTIFF:
                 (``INTERLEAVE=BAND``); the subset is taken afterwards.
             target_resolution: Without it, a reprojecting read takes the
                 resolution gdalwarp picks: ``gdalwarp -te`` with a bbox, and
-                ``gdalwarp -t_srs`` for the whole dataset without one.
+                ``gdalwarp -t_srs`` for the whole dataset without one. The
+                grid is then laid out as for a given resolution, square and
+                rounded out, so it can have a row or column more than
+                gdalwarp's, which rounds the pixel count and stretches each
+                axis's pixel size to fit.
             snap_to_grid: When True (default) and *target_resolution* is
                 given with a bbox, the output grid is rounded outward onto
                 multiples of ``target_resolution`` — see
