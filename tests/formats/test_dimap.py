@@ -798,6 +798,10 @@ class TestDIMAPRead:
         data: np.ndarray[Any, Any] = arr.data  # type: ignore[reportUnknownMemberType]
         assert data.shape == (3, 40, 50)
         assert opened == [(0, 1, 1)]
+        # 10 columns east and 20 rows south of the mosaic's origin.
+        assert tuple(arr.transform)[:6] == pytest.approx(
+            (0.3, 0, 369516 + 3, 0, -0.3, 6447186 - 6), rel=0, abs=1e-6
+        )
 
     async def test_cross_group_band_order_preserved(self):
         """band_indices=[5, 0] selects band 6 (group 1, src_band 3) then
