@@ -597,7 +597,7 @@ class TestMergeReprojected:
         native_result = _make_array(native_arr, Affine(1, 0, 0, 0, -1, 10))
         cog._read_native = AsyncMock(return_value=native_result)
 
-        await merge(
+        result = await merge(
             [cog],
             bbox=BBox(0, 0, 10, 10),
             bbox_crs=32632,
@@ -606,6 +606,7 @@ class TestMergeReprojected:
             target_resolution=1.0,
         )
         cog._read_native.assert_called()
+        assert result.crs is not None and result.crs.to_epsg() == 4326
 
     async def test_merge_with_target_resolution(self):
         """target_resolution != native triggers reprojected path."""
