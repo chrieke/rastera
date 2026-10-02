@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import json
 import math
 from collections.abc import Sequence
@@ -16,6 +15,7 @@ from pyproj import CRS
 from shapely import ops
 from shapely.geometry import MultiPolygon, box
 
+from .config import _gather_bounded
 from .geo import _transformer
 from .reader import (
     AsyncGeoTIFF,
@@ -81,40 +81,39 @@ async def build_index(
     # keyed by object key, so two buckets mirroring a key path would collapse.
     _require_same_bucket(uris, "building an index")
     obs = store if store is not None else _build_obstore(uris[0], **store_kwargs)
-    sem = asyncio.Semaphore(concurrency)
 
     # Fetch header bytes once, then open COGs through cache so async-geotiff
     # reads from memory instead of making a second network request.
     async def _fetch_header(uri: str) -> tuple[str, str, bytes]:
-        async with sem:
-            key = _extract_key(uri)
-            try:
-                hdr = await obstore.get_range_async(obs, key, start=0, end=prefetch)
-            except Exception as exc:
-                raise RuntimeError(f"Failed to index {uri!r}") from exc
-            return uri, key, bytes(hdr)
+        key = _extract_key(uri)
+        try:
+            hdr = await obstore.get_range_async(obs, key, start=0, end=prefetch)
+        except Exception as exc:
+            raise RuntimeError(f"Failed to index {uri!r}") from exc
+        return uri, key, bytes(hdr)
 
-    fetched = await asyncio.gather(*(_fetch_header(u) for u in uris))
+    fetched = await _gather_bounded(concurrency, [_fetch_header(u) for u in uris])
     cache = {key: hdr for _, key, hdr in fetched}
     cached_store = HeaderCacheStore(obs, cache)
 
     async def _open_one(uri: str, hdr: bytes) -> tuple[AsyncGeoTIFF, bytes]:
-        async with sem:
-            try:
-                # store_kwargs too: a VRT or DIMAP fetches its descriptor with
-                # them, not through the store.
-                src = await AsyncGeoTIFF.open(
-                    uri,
-                    store=None if _is_local_descriptor(uri) else cached_store,
-                    prefetch=prefetch,
-                    cache=_resolve_local_path(uri) is None,
-                    **store_kwargs,
-                )
-                return src, hdr
-            except Exception as exc:
-                raise RuntimeError(f"Failed to index {uri!r}") from exc
+        try:
+            # store_kwargs too: a VRT or DIMAP fetches its descriptor with
+            # them, not through the store.
+            src = await AsyncGeoTIFF.open(
+                uri,
+                store=None if _is_local_descriptor(uri) else cached_store,
+                prefetch=prefetch,
+                cache=_resolve_local_path(uri) is None,
+                **store_kwargs,
+            )
+            return src, hdr
+        except Exception as exc:
+            raise RuntimeError(f"Failed to index {uri!r}") from exc
 
-    results = await asyncio.gather(*(_open_one(u, hdr) for u, _, hdr in fetched))
+    results = await _gather_bounded(
+        concurrency, [_open_one(u, hdr) for u, _, hdr in fetched]
+    )
     cache.clear()  # see open_from_index
 
     rows: dict[str, list[Any]] = {c: [] for c in _INDEX_COLUMNS}
@@ -203,25 +202,23 @@ async def open_from_index(
 
     cache = dict(zip(keys, headers))
     cached_store = HeaderCacheStore(shared_store, cache)
-    sem = asyncio.Semaphore(concurrency)
 
     async def _open_one(uri: str) -> AsyncGeoTIFF:
-        async with sem:
-            cached_gt = get_cached_geotiff(uri)
-            if cached_gt is not None:
-                return AsyncGeoTIFF(uri, cached_gt)
-            # Not cached for a local file: the header comes from the index, and
-            # the file may have been rewritten since, so it would land under
-            # the new version's cache key.
-            return await AsyncGeoTIFF.open(
-                uri,
-                store=None if _is_local_descriptor(uri) else cached_store,
-                prefetch=prefetch,
-                cache=_resolve_local_path(uri) is None,
-                **store_kwargs,
-            )
+        cached_gt = get_cached_geotiff(uri)
+        if cached_gt is not None:
+            return AsyncGeoTIFF(uri, cached_gt)
+        # Not cached for a local file: the header comes from the index, and
+        # the file may have been rewritten since, so it would land under
+        # the new version's cache key.
+        return await AsyncGeoTIFF.open(
+            uri,
+            store=None if _is_local_descriptor(uri) else cached_store,
+            prefetch=prefetch,
+            cache=_resolve_local_path(uri) is None,
+            **store_kwargs,
+        )
 
-    opened = list(await asyncio.gather(*(_open_one(u) for u in uris)))
+    opened = await _gather_bounded(concurrency, [_open_one(u) for u in uris])
     # Parsed now, and later reads fall through to the inner store. Left in
     # place, every header the reader's LRU keeps held this store, and with it
     # every row's bytes: about 3 GB for 100k rows at the default prefetch.
@@ -406,7 +403,6 @@ def _filter_gdf(
 
 
 def _check_concurrency(concurrency: int) -> None:
-    # asyncio.Semaphore(0) lets nothing through, so the call hung.
     if (
         not isinstance(concurrency, int)
         or isinstance(concurrency, bool)

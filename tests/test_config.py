@@ -99,3 +99,23 @@ class TestGatherBounded:
             await config._gather_bounded(1, coros)
         # Closed coroutines are inert; awaiting one would raise RuntimeError.
         assert all(c.cr_frame is None for c in coros[1:])  # type: ignore[reportAttributeAccessIssue]
+
+    @pytest.mark.filterwarnings("error::RuntimeWarning")
+    async def test_concurrent_failure_cancels_the_rest(self):
+        """asyncio.gather left them running after the caller had its error."""
+        finished: list[int] = []
+
+        async def boom() -> int:
+            raise ValueError("boom")
+
+        async def slow(i: int) -> int:
+            await asyncio.sleep(0.05)
+            finished.append(i)
+            return i
+
+        # n=2: slow(0) is in flight when boom fails, slow(1..3) still queued.
+        coros: list[Awaitable[int]] = [boom(), *(slow(i) for i in range(4))]
+        with pytest.raises(ValueError, match="boom"):
+            await config._gather_bounded(2, coros)
+        await asyncio.sleep(0.1)
+        assert finished == []

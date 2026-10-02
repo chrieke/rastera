@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Coroutine
-from typing import Literal
+from typing import Any, Literal
 
 _merge_concurrency: int = 1
 _vrt_concurrency: int = 1
@@ -98,18 +98,19 @@ def set_warp_strategy(strategy: WarpStrategy) -> None:
 
 
 async def _gather_bounded[T](n: int, coros: list[Awaitable[T]]) -> list[T]:
-    """Run *coros* with at most n in flight. Returns results in input order."""
+    """Run *coros* with at most n in flight. Returns results in input order.
+
+    The first failure cancels the rest before it propagates. ``asyncio.gather``
+    leaves them running: a ``build_index`` that hit one missing file kept
+    issuing every other GET after the caller had its error.
+    """
     if n <= 1 or len(coros) <= 1:
         results: list[T] = []
         try:
             for c in coros:
                 results.append(await c)
         except BaseException:
-            # The caller built every coroutine up front; abandoning the ones
-            # after the failure would emit "never awaited" warnings.
-            for pending in coros[len(results) + 1 :]:
-                if isinstance(pending, Coroutine):
-                    pending.close()
+            _close_unstarted(coros[len(results) + 1 :])
             raise
         return results
     sem = asyncio.Semaphore(n)
@@ -118,4 +119,20 @@ async def _gather_bounded[T](n: int, coros: list[Awaitable[T]]) -> list[T]:
         async with sem:
             return await c
 
-    return await asyncio.gather(*(_run(c) for c in coros))
+    tasks = [asyncio.ensure_future(_run(c)) for c in coros]
+    try:
+        return await asyncio.gather(*tasks)
+    except BaseException:
+        for t in tasks:
+            t.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        _close_unstarted(coros)
+        raise
+
+
+def _close_unstarted(coros: list[Awaitable[Any]]) -> None:
+    """Close the coroutines a failure left unawaited. The caller built every
+    one up front, so Python would warn that they were never awaited."""
+    for c in coros:
+        if isinstance(c, Coroutine):
+            c.close()

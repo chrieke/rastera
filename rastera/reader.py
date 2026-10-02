@@ -14,6 +14,7 @@ from affine import Affine
 from async_geotiff import GeoTIFF, Overview, RasterArray, Window
 from pyproj import CRS, Transformer
 
+from .config import _gather_bounded
 from .geo import (
     BBox,
     Picks,
@@ -887,20 +888,19 @@ async def _open_many(
     # branches need them to build their own obstore for the descriptor fetch
     # (the async-tiff and obstore store types are not interchangeable). Plain
     # TIFF opens on the shared store ignore them.
-    return list(
-        await asyncio.gather(
-            *(
-                AsyncGeoTIFF.open(
-                    u,
-                    store=s,
-                    prefetch=prefetch,
-                    cache=cache,
-                    meta_overrides=meta_overrides,
-                    **store_kwargs,
-                )
-                for u, s in zip(uris, stores)
+    return await _gather_bounded(
+        len(uris),
+        [
+            AsyncGeoTIFF.open(
+                u,
+                store=s,
+                prefetch=prefetch,
+                cache=cache,
+                meta_overrides=meta_overrides,
+                **store_kwargs,
             )
-        )
+            for u, s in zip(uris, stores)
+        ],
     )
 
 
