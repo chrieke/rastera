@@ -583,6 +583,9 @@ def _validate_dtype_nodata(dtype: np.dtype, nodata: int | float | None) -> None:
 
 
 _WARP_GRID_STEP = 16
+# The interpolation error, in source pixels summed over both axes, above which
+# a coarse-grid cell is transformed per pixel. gdalwarp's default ``-et``.
+_WARP_MAX_ERROR = 0.125
 
 # Destination rows the kernels handle at a time.  Bounds the separable
 # accumulator's (bands, src_rows, dst_w) intermediate and the cross-CRS
@@ -601,32 +604,35 @@ def _coarse_grid_transform(
 
     Instead of transforming every destination pixel through pyproj, transforms a
     coarse grid (every ``_WARP_GRID_STEP`` pixels) and bilinearly interpolates
-    the rest.
+    the rest.  Where the grid bends, near a pole or across the source CRS's 180°
+    seam, each cell is also transformed at its centre and edge midpoints, and
+    per pixel if any of them is off by more than ``_WARP_MAX_ERROR``.  The
+    centre alone misses the bend around a pole, where the errors along the two
+    axes cancel out.
     """
-    # The last pixel is always a node, so interpolation never extrapolates.
-    coarse_cols = np.arange(0, dst_width, _WARP_GRID_STEP, dtype=np.float64)
-    if coarse_cols[-1] < dst_width - 1:
-        coarse_cols = np.append(coarse_cols, dst_width - 1)
-    coarse_rows = np.arange(0, dst_height, _WARP_GRID_STEP, dtype=np.float64)
-    if coarse_rows[-1] < dst_height - 1:
-        coarse_rows = np.append(coarse_rows, dst_height - 1)
+    src_inv = ~src_transform
 
-    cc, cr = np.meshgrid(coarse_cols + 0.5, coarse_rows + 0.5)
-    cwx = float(dst_transform.a) * cc + float(dst_transform.c)
-    cwy = float(dst_transform.e) * cr + float(dst_transform.f)
-    cwx, cwy = transformer.transform(cwx, cwy)
-    # PROJ returns inf for out-of-domain input.  np.interp below would smear a
-    # single inf node across a whole `step`-wide cell as NaN, and the index
-    # casts after that are undefined — so fail loudly instead.
-    if not (np.all(np.isfinite(cwx)) and np.all(np.isfinite(cwy))):
-        raise ValueError(
-            "Reprojecting the destination grid produced inf/nan coordinates; "
-            "it reaches outside the source CRS's area of use."
+    def _to_src(cols: np.ndarray, rows: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        wx = float(dst_transform.a) * (cols + 0.5) + float(dst_transform.c)
+        wy = float(dst_transform.e) * (rows + 0.5) + float(dst_transform.f)
+        wx, wy = transformer.transform(wx, wy)
+        # PROJ returns inf for out-of-domain input.  np.interp below would smear
+        # a single inf node across a whole `step`-wide cell as NaN, and the index
+        # casts after that are undefined — so fail loudly instead.
+        if not (np.all(np.isfinite(wx)) and np.all(np.isfinite(wy))):
+            raise ValueError(
+                "Reprojecting the destination grid produced inf/nan coordinates; "
+                "it reaches outside the source CRS's area of use."
+            )
+        return (
+            float(src_inv.a) * wx + float(src_inv.c),
+            float(src_inv.e) * wy + float(src_inv.f),
         )
 
-    src_inv = ~src_transform
-    coarse_src_col = float(src_inv.a) * cwx + float(src_inv.c)
-    coarse_src_row = float(src_inv.e) * cwy + float(src_inv.f)
+    probe_cols = _probe_positions(dst_width)
+    probe_rows = _probe_positions(dst_height)
+    coarse_cols, coarse_rows = probe_cols[::2], probe_rows[::2]
+    coarse_src_col, coarse_src_row = _to_src(*np.meshgrid(coarse_cols, coarse_rows))
 
     n_coarse_rows = len(coarse_rows)
     coarse_col_centers = coarse_cols + 0.5
@@ -658,7 +664,85 @@ def _coarse_grid_transform(
         out += step
         return out
 
-    return _along_rows(temp_col), _along_rows(temp_row)
+    src_col, src_row = _along_rows(temp_col), _along_rows(temp_row)
+
+    # Measuring costs four times the nodes' transforms, so only where the
+    # nodes' curvature says it may be needed.  On random CRS pairs and grids the
+    # measured error came within 1.25x of that estimate, hence the margin.  It
+    # misses where PROJ switches datum transformation at an area-of-use edge
+    # (e.g. around EPSG:27700 or 2056): a jump of J px reads as J/8, so jumps
+    # under about 0.5 px stay interpolated.
+    bend = _bend(coarse_cols, coarse_rows, coarse_src_col, coarse_src_row)
+    if bend <= _WARP_MAX_ERROR / 2:
+        return src_col, src_row
+
+    probe_src_col, probe_src_row = _to_src(*np.meshgrid(probe_cols, probe_rows))
+    probes = np.ix_(probe_rows, probe_cols)
+    off = (
+        np.abs(src_col[probes] - probe_src_col)
+        + np.abs(src_row[probes] - probe_src_row)
+    ) > _WARP_MAX_ERROR
+    # Per cell, whether any of its nodes, edge midpoints or centre is off.
+    bent = _any_per_cell(_any_per_cell(off).T).T
+    # One row of cells at a time, so a grid bent throughout holds at most one
+    # row of cells' exact coordinates at once.
+    cell_of_row = np.minimum(
+        np.arange(dst_height) // _WARP_GRID_STEP, bent.shape[0] - 1
+    )
+    cell_of_col = np.minimum(np.arange(dst_width) // _WARP_GRID_STEP, bent.shape[1] - 1)
+    for i in np.flatnonzero(bent.any(axis=1)):
+        rows = np.flatnonzero(cell_of_row == i)
+        cols = np.flatnonzero(bent[i, cell_of_col])
+        cells = np.ix_(rows, cols)
+        src_col[cells], src_row[cells] = _to_src(*np.meshgrid(cols, rows))
+
+    return src_col, src_row
+
+
+def _probe_positions(n: int) -> np.ndarray:
+    """Pixel indices along one axis, alternating coarse-grid node and the probe
+    midway to the next one.  Nodes sit every ``_WARP_GRID_STEP`` pixels and on
+    the last pixel, so interpolation never extrapolates."""
+    nodes = np.arange(0, n, _WARP_GRID_STEP)
+    if nodes[-1] < n - 1:
+        nodes = np.append(nodes, n - 1)
+    out = np.empty(2 * len(nodes) - 1, dtype=nodes.dtype)
+    out[::2] = nodes
+    out[1::2] = (nodes[:-1] + nodes[1:]) // 2
+    return out
+
+
+def _bend(
+    coarse_cols: np.ndarray,
+    coarse_rows: np.ndarray,
+    coarse_src_col: np.ndarray,
+    coarse_src_row: np.ndarray,
+) -> float:
+    """The interpolation error the coarse grid's own curvature implies, in
+    source pixels summed over both axes: a parabola through three nodes misses
+    the chord at its midpoint by f''·h²/8.  Infinite along an axis with two
+    nodes, which has no curvature to read."""
+    total = 0.0
+    for axis, nodes in ((1, coarse_cols), (0, coarse_rows)):
+        if len(nodes) == 1:
+            continue  # nothing is interpolated along this axis
+        if len(nodes) == 2:
+            return math.inf
+        h = np.diff(nodes).astype(np.float64)
+        shape = (1, -1) if axis == 1 else (-1, 1)
+        for coord in (coarse_src_col, coarse_src_row):
+            slope = np.diff(coord, axis=axis) / h.reshape(shape)
+            curvature = 2 * np.diff(slope, axis=axis) / (h[:-1] + h[1:]).reshape(shape)
+            total += float(np.abs(curvature).max())
+    return total * _WARP_GRID_STEP**2 / 8
+
+
+def _any_per_cell(flags: np.ndarray) -> np.ndarray:
+    """Per cell along axis 0 of *flags* (laid out as :func:`_probe_positions`),
+    whether its two nodes or its midpoint are set.  A one-node axis is one cell."""
+    if len(flags) == 1:
+        return flags
+    return flags[:-1:2] | flags[1::2] | flags[2::2]
 
 
 def _bilinear_weights(
