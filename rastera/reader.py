@@ -617,6 +617,7 @@ class AsyncGeoTIFF:
             method=resampling,
             dst_res=reach,
             src_res=(float(readable.res[0]), float(readable.res[1])),
+            reprojecting=needs_reproject,
         )
 
         native = await self._read_native(
@@ -1106,18 +1107,22 @@ def _halo_bbox(
     method: ResamplingMethod,
     dst_res: tuple[float, float],
     src_res: tuple[float, float],
+    reprojecting: bool,
 ) -> BBox:
     """Widen a source-read bbox by the reach of the resampling kernel.
 
     Sized to the output extent alone, the outermost pixels come out of a
     truncated, renormalised kernel — a biased ring, and two adjacent AOIs
     disagreeing along their shared edge. Per axis, because a kernel widened for
-    a 10x downsample in x is not wide enough for a 2x one in y. One pixel is the
-    floor: nearest needs no kernel halo, but a cross-CRS ``read_bbox`` is a
-    densified envelope, so the slack absorbs any curvature it under-states.
+    a 10x downsample in x is not wide enough for a 2x one in y. Reprojecting,
+    one pixel is the floor: nearest needs no kernel halo, but a cross-CRS
+    ``read_bbox`` is a densified envelope, so the slack absorbs any curvature
+    it under-states. In one CRS that pixel only reached into the neighbouring
+    tiles.
     """
-    pad_x = max(1, _kernel_halo(method, dst_res[0] / src_res[0])) * src_res[0]
-    pad_y = max(1, _kernel_halo(method, dst_res[1] / src_res[1])) * src_res[1]
+    floor = 1 if reprojecting else 0
+    pad_x = max(floor, _kernel_halo(method, dst_res[0] / src_res[0])) * src_res[0]
+    pad_y = max(floor, _kernel_halo(method, dst_res[1] / src_res[1])) * src_res[1]
     return BBox(
         bbox.minx - pad_x, bbox.miny - pad_y, bbox.maxx + pad_x, bbox.maxy + pad_y
     )

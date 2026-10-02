@@ -1008,9 +1008,9 @@ class TestWarpSeam:
         ("method", "pad"),
         [
             # bilinear at 2x downsample reaches 2 source px; nearest needs no
-            # kernel halo and falls back to the 1 px floor.
+            # halo in one CRS.
             ("bilinear", 20.0),
-            ("nearest", 10.0),
+            ("nearest", 0.0),
         ],
     )
     async def test_same_crs_halo_is_kernel_sized(self, method: str, pad: float):
