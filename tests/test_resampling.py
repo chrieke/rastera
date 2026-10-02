@@ -716,6 +716,33 @@ class TestRowBlocks:
             tracemalloc.stop()
         assert peak < 12 * out.nbytes
 
+    def test_a_same_crs_read_peaks_at_a_few_times_its_output(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """The float64 sums used to span the whole grid: a cubic read peaked at
+        9.6x its output."""
+        import tracemalloc
+
+        import rastera.resampling as r
+
+        monkeypatch.setattr(r, "_ROW_BLOCK", 32)
+        src = np.random.default_rng(0).integers(1, 4000, (3, 512, 512), np.uint16)
+        tracemalloc.start()
+        try:
+            out = resample(
+                src,
+                Affine(10, 0, 500000, 0, -10, 5000000),
+                Affine(9, 0, 500004.5, 0, -9, 4999997.5),
+                512,
+                512,
+                nodata=0,
+                method="cubic",
+            )
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        assert peak < 4 * out.nbytes
+
 
 class TestTwoPassReproject:
     """The two-pass cross-CRS strategy (downsample in source CRS, then
