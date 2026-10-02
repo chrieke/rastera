@@ -875,6 +875,9 @@ async def _open_many(
         shared = [u for u in uris if not _needs_own_store(u)]
         if shared:
             _require_same_bucket(shared, "using a shared store")
+        # Only when some header is not cached: the opens of cached ones never
+        # touch the store, and building it blocks for 80-160 ms.
+        if any(not cache or get_cached_geotiff(u) is None for u in shared):
             store = _build_store(shared[0], **store_kwargs)
         stores = [None if _needs_own_store(u) else store for u in uris]
     else:

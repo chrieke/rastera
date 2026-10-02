@@ -350,6 +350,20 @@ class TestOpen:
         stores = await self._stores_opened_with([vrt, tif])
         assert stores[vrt] is None and stores[tif] is not None
 
+    async def test_open_many_of_cached_headers_builds_no_store(self):
+        """Those opens never touch it, and building it blocked for 80-160 ms."""
+        uris = ["s3://b/a.tif", "s3://b/c.tif"]
+        clear_cache()
+        try:
+            for u in uris:
+                _geotiff_cache[u] = make_mock_geotiff()
+            with patch("rastera.reader._build_store") as build:
+                srcs = await rastera.open(uris)
+        finally:
+            clear_cache()
+        assert [s.uri for s in srcs] == uris
+        build.assert_not_called()
+
 
 # ── meta_overrides ──────────────────────────────────────────────────────
 
