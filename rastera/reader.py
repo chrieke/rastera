@@ -200,10 +200,7 @@ class AsyncGeoTIFF:
                 URI is cached with the store it was first opened through, so
                 a later open with another store or other credentials reads
                 through that first one; pass ``cache=False`` where it matters.
-            meta_overrides: Optional header overrides applied at construction.
-                Currently supports ``{"crs": int | CRS}`` for TIFFs missing
-                or carrying incorrect georeferencing. Overrides always
-                replace the file's reported value.
+            meta_overrides: Optional header overrides, see ``MetaOverrides``.
             **store_kwargs: Extra keyword arguments forwarded to ``from_url``
                 (e.g. ``region``, ``skip_signature``, ``request_payer``).
         """
@@ -835,9 +832,8 @@ async def open(
         prefetch: Number of bytes to prefetch when opening the TIFF.
         cache: When True, cache parsed TIFF headers in memory so that
             subsequent opens of the same URI skip the header fetch.
-        meta_overrides: Optional header overrides (e.g. ``{"crs": 3006}``)
-            for TIFFs missing or carrying incorrect georeferencing. The
-            same override is applied to every URI when a list is passed.
+        meta_overrides: Optional header overrides (e.g. ``{"crs": 3006}``),
+            see ``MetaOverrides``. A list applies the same one to every URI.
         **store_kwargs: Extra kwargs forwarded to ``async_tiff.store.from_url``
             (e.g. ``skip_signature``, ``region``, ``request_payer``).
     """
@@ -1235,19 +1231,14 @@ def _same_nodata(resolved: int | float | None, declared: float | None) -> bool:
 
 
 class MetaOverrides(TypedDict, total=False):
-    """Header metadata overrides for ``open()``.
-
-    Values replace what the GeoTIFF reports, even when already set.
-    Useful when a TIFF is missing georeferencing that you know
-    out-of-band (e.g. a sidecar-less file known to be EPSG:3006).
+    """Header metadata overrides for ``open()``. Each replaces what the file
+    states, even when it states one.
 
     Fields:
-        crs: EPSG code (``int``) or ``pyproj.CRS`` declaring the
-            dataset's coordinate reference system. Always *replaces*
-            the file's reported CRS — there is no fallback semantics.
-            Only relabels the data; it does not reproject. The override
-            is what subsequent ``read()`` calls see as ``bbox_crs`` /
-            ``target_crs`` source.
+        crs: EPSG code or ``pyproj.CRS``, for a file whose CRS is wrong or has
+            no EPSG code. It relabels the pixels and does not reproject them.
+            A TIFF without any GeoTIFF keys still fails to open: async-geotiff
+            raises before the override applies.
     """
 
     crs: int | CRS
