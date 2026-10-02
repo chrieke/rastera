@@ -83,7 +83,7 @@ def resample(
       within 0.05 of one, as gdalwarp does).  Matches
       ``Resampling.bilinear`` / ``gdalwarp -r bilinear``. No overshoot.
     - ``"cubic"``: Keys cubic convolution (a = -0.5). 4×4 at
-      upsampling/identity; expanded to ``4·⌈scale⌉ × 4·⌈scale⌉`` when
+      upsampling/identity; expanded to ``2·⌈2·scale⌉ × 2·⌈2·scale⌉`` when
       downsampling.  Matches ``Resampling.cubic`` / ``gdalwarp -r cubic``.
       Can overshoot the source value range (for integer dtypes, output
       is clipped to the dtype range and rounded).
@@ -926,7 +926,7 @@ def _accumulate_separable(
 ) -> tuple[np.ndarray, np.ndarray | None, np.ndarray | None]:
     """Separable two-pass kernel accumulation for the same-CRS path.
 
-    Equivalent to the non-separable 2-D loop in :func:`_resample_kernel`, but
+    Equivalent to the non-separable 2-D loop in :func:`_accumulate_2d`, but
     ``O(taps_x + taps_y)`` instead of ``O(taps_x · taps_y)``: convolve along
     columns into a ``(bands, src_rows, dst_w)`` intermediate, then along rows.
     Handed one block of destination rows at a time, it reads only the source
