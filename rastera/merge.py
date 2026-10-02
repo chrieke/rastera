@@ -69,8 +69,9 @@ async def merge(
             it differs from the source. When ``None``, inferred from the
             inputs using *crs_method*.
         mosaic_method: Overlap strategy when multiple COGs cover the same pixel.
-            ``"first"`` keeps the first valid pixel (matching rasterio.merge
-            default). ``"last"`` lets later COGs overwrite earlier ones.
+            ``"first"`` keeps the first valid value in each band (matching
+            rasterio.merge default). ``"last"`` lets later COGs overwrite
+            earlier ones.
         crs_method: How to choose the output CRS when *target_crs* is ``None``.
             ``"most_common"`` picks the CRS shared by the most inputs;
             ``"first"`` uses the CRS of the first input.
@@ -331,13 +332,13 @@ async def _gather_and_paste(
     """Read contributing COGs and paste into a single output array.
 
     Returns the array and the ``(dst_height, dst_width)`` coverage it was
-    pasted under: True where an output pixel holds a real source value, False
-    where it is still *fill_value* because no contributor reached it or every
-    one that did was its own nodata there.
+    pasted under: True where an output pixel holds a real source value in at
+    least one band, False where it is still *fill_value* because no contributor
+    reached it or every one that did was its own nodata there.
 
-    Results are pasted in input order, each masked by its own nodata. Overlap
-    is resolved by ``mosaic_method``: ``"first"`` keeps the first valid pixel,
-    ``"last"`` lets later COGs overwrite earlier ones.
+    Results are pasted in input order, each masked by its own nodata per band.
+    Overlap is resolved by ``mosaic_method``: ``"first"`` keeps the first valid
+    value, ``"last"`` lets later COGs overwrite earlier ones.
 
     Sequential by default: async-geotiff already parallelizes COG-block reads
     within each contributing TIFF, so an outer fan-out here multiplies the
@@ -358,6 +359,10 @@ async def _gather_and_paste(
     # cannot tell a gap from a real pixel that happens to hold the same value —
     # a contributor declaring no sentinel of its own is full of them.
     filled = np.zeros((dst_height, dst_width), dtype=bool)
+    # Per band, for "first" only, and only once a contributor's sentinel covers
+    # some bands of a pixel but not others. Until then every band of a pixel is
+    # filled together and ``filled`` says which.
+    band_filled: np.ndarray | None = None
 
     if not contributing:
         return out_array, filled
@@ -389,41 +394,52 @@ async def _gather_and_paste(
             # ground filled, locking out the neighbour that covers it.
             src_valid = None if arr.mask is None else arr.mask[src_rows, src_cols]
 
-            # Then each contributor's own sentinel: using cogs[0]'s would paste
-            # another COG's nodata as real data.
+            # Then each contributor's own sentinel, per band like gdalwarp and
+            # rasterio.merge: using cogs[0]'s would paste another COG's nodata
+            # as real data, and one band's sentinel would hide the next COG's
+            # real value in that band.
+            band_valid = None
             cog_nodata = cog._nodata
             if cog_nodata is not None:
                 if isinstance(cog_nodata, float) and math.isnan(cog_nodata):
                     valid = ~np.isnan(src_data)
                 else:
                     valid = src_data != cog_nodata
-                sentinel_valid = np.any(valid, axis=0)
-                src_valid = (
-                    sentinel_valid if src_valid is None else src_valid & sentinel_valid
-                )
+                if src_valid is not None:
+                    valid &= src_valid
+                src_valid = valid.any(axis=0)
+                if not np.array_equal(src_valid, valid.all(axis=0)):
+                    band_valid = valid
+            paste_where = band_valid if band_valid is not None else src_valid
 
             if mosaic_method == "first":
-                unfilled = ~filled[dst_rows, dst_cols]
-                if src_valid is not None:
-                    paste_mask = unfilled & src_valid
-                else:
-                    paste_mask = unfilled
+                if band_valid is not None and band_filled is None:
+                    band_filled = np.repeat(filled[np.newaxis], n_bands, axis=0)
+                taken = filled if band_filled is None else band_filled
+                paste_mask = ~taken[..., dst_rows, dst_cols]
+                if paste_where is not None:
+                    paste_mask &= paste_where
                 np.copyto(out_array[:, dst_rows, dst_cols], src_data, where=paste_mask)
-                filled[dst_rows, dst_cols] |= paste_mask
+                taken[..., dst_rows, dst_cols] |= paste_mask
+                if band_filled is not None:
+                    filled[dst_rows, dst_cols] |= paste_mask.any(axis=0)
             else:
                 # ``|=``, not ``=``: "last" overwrites pixels by design, but an
                 # earlier contributor's coverage still stands where this one is
                 # invalid. Accumulating never gates what "last" pastes.
-                if src_valid is not None:
+                if paste_where is not None:
                     np.copyto(
-                        out_array[:, dst_rows, dst_cols], src_data, where=src_valid
+                        out_array[:, dst_rows, dst_cols], src_data, where=paste_where
                     )
                     filled[dst_rows, dst_cols] |= src_valid
                 else:
                     out_array[:, dst_rows, dst_cols] = src_data
                     filled[dst_rows, dst_cols] = True
 
-        if mosaic_method == "first" and filled.all():
+        if (
+            mosaic_method == "first"
+            and (filled if band_filled is None else band_filled).all()
+        ):
             return out_array, filled
 
     return out_array, filled
