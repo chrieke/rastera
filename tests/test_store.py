@@ -195,6 +195,14 @@ class TestParseUriOther:
         with pytest.raises(ValueError, match="Unsupported URI scheme"):
             _parse_uri("ftp://host/file.tif")
 
+    @pytest.mark.parametrize(
+        "uri", ["s3://b/k.tif?versionId=v1", "gs://b/k.tif?generation=1", "az://c/k#x"]
+    )
+    def test_a_query_or_fragment_on_a_bucket_uri_raises(self, uri: str):
+        """The key is the path alone, so ?versionId= read the current version."""
+        with pytest.raises(ValueError, match="query or fragment"):
+            _parse_uri(uri)
+
 
 class TestParseUriLocal:
     def test_absolute_path(self, tmp_path: Path):

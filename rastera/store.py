@@ -17,7 +17,8 @@ dotted-bucket variants::
 
 An S3 URL with a query string — presigned, or ``?versionId=`` — is read over
 plain HTTP exactly as given instead, unsigned: the rewrite would drop the
-query, and with it the signature or the version.
+query, and with it the signature or the version. ``s3://``, ``gs://`` and
+``az://`` URIs take no query or fragment.
 
 Other ``amazonaws.com`` hosts — dual-stack, transfer acceleration, FIPS, access
 points, S3 Express, VPC endpoints — are rejected. Each implies an endpoint and
@@ -123,6 +124,13 @@ def _parse_uri(uri: str) -> ParsedURI:
         anchor = Path(path.anchor)
         key = path.relative_to(anchor).as_posix()
         return ParsedURI(uri, "local", anchor.as_uri(), key, local_path=path)
+
+    if scheme in ("s3", "gs", "az") and (parsed.query or parsed.fragment):
+        # The key is the path alone, so ?versionId= read the current version.
+        raise ValueError(
+            f"{uri!r} has a query or fragment, which a {scheme}:// URI cannot "
+            f"carry: it would be dropped and another object read."
+        )
 
     if scheme == "s3":
         return ParsedURI(uri, "aws", f"s3://{parsed.netloc}", _path_key(parsed))
