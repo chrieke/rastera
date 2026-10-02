@@ -11,10 +11,11 @@ import pyarrow.parquet as pq
 import shapely
 from obstore.store import HTTPStore as ObstoreHTTPStore
 from obstore.store import from_url as obstore_from_url
-from pyproj import CRS, Transformer
+from pyproj import CRS
 from shapely import ops
 from shapely.geometry import box
 
+from .geo import _transformer
 from .reader import (
     AsyncGeoTIFF,
     get_cached_geotiff,
@@ -438,5 +439,4 @@ def _reproject(geom: Any, from_crs: int | CRS, to_crs: int | CRS) -> Any:
         minx, miny, maxx, maxy = geom.bounds
         step = max(maxx - minx, maxy - miny) / _EDGE_SEGMENTS
         geom = shapely.segmentize(geom, step)
-    t = Transformer.from_crs(from_crs, to_crs, always_xy=True)
-    return ops.transform(t.transform, geom)
+    return ops.transform(_transformer(from_crs, to_crs).transform, geom)

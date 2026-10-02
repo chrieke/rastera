@@ -8,7 +8,9 @@ import numpy as np
 import pytest
 from affine import Affine
 from async_geotiff import RasterArray
+from pyproj import Transformer
 
+import rastera
 from rastera.geo import (
     BBox,
     WindowOutOfRangeError,
@@ -674,6 +676,42 @@ class TestMergeReprojected:
         )
         # mosaic_method="first": cog1's values should take precedence everywhere
         assert np.all(result.data == 1)  # type: ignore[reportUnknownMemberType]
+
+    async def test_builds_one_transformer_per_crs_pair(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """merge built three Transformers per tile: 7 s of a 144-tile EPSG:27700
+        merge."""
+        built: list[tuple[Any, Any]] = []
+        real = Transformer.from_crs
+
+        def _counting(from_crs: Any, to_crs: Any, **kwargs: Any) -> Transformer:
+            built.append((from_crs, to_crs))
+            return real(from_crs, to_crs, **kwargs)
+
+        monkeypatch.setattr(Transformer, "from_crs", _counting)
+        rastera.clear_cache()
+        cogs: list[AsyncGeoTIFF] = []
+        for i in range(4):
+            gt = make_mock_geotiff(
+                width=10,
+                height=10,
+                count=1,
+                crs_epsg=27700,
+                origin_x=400000.0 + 100 * i,
+                origin_y=300100.0,
+            )
+            gt.read = slicing_read(gt, np.ones((1, 10, 10), np.uint16))
+            cogs.append(AsyncGeoTIFF("s3://b/k.tif", gt))
+
+        await merge(
+            cogs,
+            bbox=BBox(400000, 300000, 400400, 300100),
+            bbox_crs=27700,
+            target_crs=3857,
+            target_resolution=10.0,
+        )
+        assert sorted(built) == [(3857, 27700), (27700, 3857)]
 
 
 # ── merge: seam between adjacent tiles ─────────────────────────────────
