@@ -80,7 +80,8 @@ def resample(
       identity; expanded to ``2·⌈scale⌉ × 2·⌈scale⌉`` when downsampling
       so the kernel acts as a low-pass anti-aliasing filter (where
       ``scale = max(1, dst_res / src_res)``, rounded to a whole factor
-      within 0.05 of one, as gdalwarp does).  Matches
+      within 0.05 of one, and 1 on both axes while neither exceeds
+      1/0.95, as gdalwarp does).  Matches
       ``Resampling.bilinear`` / ``gdalwarp -r bilinear``. No overshoot.
     - ``"cubic"``: Keys cubic convolution (a = -0.5). 4×4 at
       upsampling/identity; expanded to ``2·⌈2·scale⌉ × 2·⌈2·scale⌉`` when
@@ -332,7 +333,8 @@ def _resample_kernel(
     - Kernel half-width per axis is
       ``base_radius · max(1, _kernel_scale(|dst_res / src_res|))`` (rounded
       up), where ``base_radius`` is 1 for bilinear and 2 for cubic.
-      Upsampling and identity reads use the default radii; downsampling
+      Upsampling and identity reads use the default radii, and so do reads
+      that downsample neither axis by more than 1/0.95; downsampling
       expands.
     - Weights are separable and computed once outside the loop, then
       pre-normalized along the tap axis so the kernel sums to 1.
@@ -435,6 +437,11 @@ def _resample_kernel(
             )
 
     h, w = src_array.shape[1], src_array.shape[2]
+
+    # gdalwarp keeps the 2x2 / 4x4 kernel on both axes until one of them
+    # downsamples by more than 1/0.95 (``bUse4SamplesFormula``).
+    if max(x_scale_local, y_scale_local) <= 1 / 0.95:
+        x_scale_local = y_scale_local = 1.0
 
     # --- Anti-aliasing: GDAL expands the kernel radius when downsampling
     # (scale > 1) so that bilinear/cubic act as proper low-pass filters
