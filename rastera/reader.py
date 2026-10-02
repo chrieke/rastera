@@ -188,8 +188,9 @@ class AsyncGeoTIFF:
                 (s3://, https://, gs://, file://, etc.).
             store: Optional pre-constructed store. When provided,
                 the key is extracted from the URI and used as the
-                path within the store. If no store is provided, it
-                is auto-constructed via ``async_tiff.store.from_url``.
+                path within the store. If no store is provided, one is
+                built for the URI's bucket or host: obstore's for a local
+                path, async-tiff's otherwise.
             prefetch: Number of bytes to prefetch when opening the TIFF.
             cache: When True, cache the parsed GeoTIFF object in memory so that
                 subsequent opens of the same URI skip the header fetch. A
@@ -878,10 +879,11 @@ async def _open_many(
         stores = [None if _needs_own_store(u) else store for u in uris]
     else:
         stores = [store] * len(uris)
-    # store_kwargs is forwarded as well as consumed above: plain TIFF opens
-    # ignore it once `store` is set, but the VRT and DIMAP branches need it to
-    # build their own obstore for the descriptor fetch (the async-tiff and
-    # obstore store types are not interchangeable).
+    # store_kwargs is forwarded as well as consumed above: a URI that gets its
+    # own store (`None` here) builds it from them, and the VRT and DIMAP
+    # branches need them to build their own obstore for the descriptor fetch
+    # (the async-tiff and obstore store types are not interchangeable). Plain
+    # TIFF opens on the shared store ignore them.
     return list(
         await asyncio.gather(
             *(
