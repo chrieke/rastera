@@ -1291,6 +1291,25 @@ class TestSouthUp:
         assert arr.mask is not None and arr.mask.all()
         np.testing.assert_array_equal(data[0], np.flipud(full[0, ::2, ::2]))
 
+    @pytest.mark.parametrize("merged", [False, True])
+    async def test_columns_running_west_are_resampled_not_copied(self, merged: bool):
+        """A negative pixel width passed the on-grid checks, and the native
+        copy then came back mirrored, labelled as running east."""
+        full = np.arange(48 * 64, dtype=np.uint16).reshape(1, 48, 64)
+        gt = make_mock_geotiff(width=64, height=48, scale=10.0, count=1)
+        gt.transform = Affine(-10, 0, 500640, 0, -10, 7000480)
+        gt.read = slicing_read(gt, full)
+        ds = AsyncGeoTIFF("s3://b/k.tif", gt)
+        bbox = (500000, 7000000, 500640, 7000480)
+        if merged:
+            arr = await rastera.merge(
+                [ds], bbox=bbox, bbox_crs=32632, target_resolution=10
+            )
+        else:
+            arr = await ds.read(bbox=bbox, bbox_crs=32632, target_resolution=10)
+        assert arr.transform == Affine(10, 0, 500000, 0, -10, 7000480)
+        np.testing.assert_array_equal(arr.data, full[:, :, ::-1])  # type: ignore[reportUnknownMemberType]
+
     async def test_rotation_noise_still_counts_as_north_up(self):
         """Real north-up files carry 1e-16 in the rotation terms; an exact
         check rejected them."""

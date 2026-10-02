@@ -147,13 +147,15 @@ async def merge(
 
     # The native path is a straight block copy onto the snapped output grid,
     # which sits on multiples of target_resolution — exact only when every
-    # source grid is on those multiples too, north-up and square at that
-    # resolution (a negative -e can never isclose a positive resolution).
-    # Every input, not just the first: a later one with taller pixels, or
-    # south-up or rotated, went down the native path, which then refused it.
-    # Anything else is resampled.
+    # source grid is on those multiples too, north-up, running east and
+    # square at that resolution (a negative -e can never isclose a positive
+    # resolution). Every input, not just the first: a later one with taller
+    # pixels, or south-up or rotated, went down the native path, which then
+    # refused it, and one running west was pasted mirrored. Anything else is
+    # resampled.
     srcs_on_res_grid = all(
         math.isclose(target_resolution, -float(t.e))
+        and float(t.a) > 0
         and float(t.b) == 0
         and float(t.d) == 0
         and _is_on_res_grid(float(t.c), target_resolution)

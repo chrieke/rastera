@@ -377,8 +377,9 @@ class AsyncGeoTIFF:
             # A 1:1 window copy lands on the lattice only if the source grid
             # is on it: origin on multiples of the resolution, unrotated and
             # north-up. ``needs_resample`` already matched both axes' *sizes*;
-            # the -e test here is about the y axis' *sign*, since a south-up
-            # grid's positive e can never isclose a positive resolution.
+            # the a and -e tests here are about their *signs*: a grid whose
+            # columns run west came back mirrored, and a south-up grid's
+            # positive e can never isclose a positive resolution.
             assert target_resolution is not None
             t = gt.transform
             use_native = (
@@ -386,6 +387,7 @@ class AsyncGeoTIFF:
                 and _is_on_res_grid(float(t.f), target_resolution)
                 and float(t.b) == 0
                 and float(t.d) == 0
+                and float(t.a) > 0
                 and math.isclose(target_resolution, -float(t.e))
             )
 
