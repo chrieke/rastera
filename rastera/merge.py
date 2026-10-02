@@ -345,8 +345,8 @@ async def _gather_and_paste(
     in-flight HTTP request count without adding throughput on a saturated
     link. Set ``rastera.set_concurrency(merge=N>1)`` to opt into outer
     parallelism. Reads then run in batches of N, for both methods; for
-    ``mosaic_method="first"`` the ``filled.all()`` early exit runs between
-    batches.
+    ``mosaic_method="first"`` the ``filled.all()`` early exit, and the skip of
+    contributors whose cells are all filled, run between batches.
     """
     out_array = np.full(
         (n_bands, dst_height, dst_width),
@@ -370,6 +370,15 @@ async def _gather_and_paste(
     n = config._merge_concurrency
     for i in range(0, len(contributing), n):
         batch = contributing[i : i + n]
+        if mosaic_method == "first":
+            # "first" pastes only where nothing is yet, so a contributor whose
+            # cells are all filled, in every band, would be read for nothing.
+            taken = filled if band_filled is None else band_filled
+            batch = [
+                (cog, sub)
+                for cog, sub in batch
+                if not _cells_filled(taken, dst_transform, sub)
+            ]
         arrays = await config._gather_bounded(
             n, [_read_or_skip(read_fn, cog, sub) for cog, sub in batch]
         )
@@ -455,6 +464,26 @@ def _output_subgrid(
     guaranteeing pixel-perfect alignment with the output grid.
     Returns ``None`` if the sub-bbox doesn't overlap.
     """
+    cells = _output_cells(out_transform, out_w, out_h, sub_bbox)
+    if cells is None:
+        return None
+    rows, cols = cells
+    res = out_transform.a
+    sub_transform = Affine(
+        res,
+        0,
+        out_transform.c + cols.start * res,
+        0,
+        -res,
+        out_transform.f - rows.start * res,
+    )
+    return sub_transform, cols.stop - cols.start, rows.stop - rows.start
+
+
+def _output_cells(
+    out_transform: Affine, out_w: int, out_h: int, sub_bbox: BBox
+) -> tuple[slice, slice] | None:
+    """The rows and columns of the output grid *sub_bbox* reaches, or None."""
     inv = ~out_transform
     c0, r0 = _affine_apply(inv, sub_bbox.minx, sub_bbox.maxy)
     c1, r1 = _affine_apply(inv, sub_bbox.maxx, sub_bbox.miny)
@@ -467,21 +496,20 @@ def _output_subgrid(
     col_max = min(out_w, math.ceil(_denoise(max(c0, c1))))
     row_max = min(out_h, math.ceil(_denoise(max(r0, r1))))
 
-    sub_w = col_max - col_min
-    sub_h = row_max - row_min
-    if sub_w <= 0 or sub_h <= 0:
+    if col_max <= col_min or row_max <= row_min:
         return None
+    return slice(row_min, row_max), slice(col_min, col_max)
 
-    res = out_transform.a
-    sub_transform = Affine(
-        res,
-        0,
-        out_transform.c + col_min * res,
-        0,
-        -res,
-        out_transform.f - row_min * res,
-    )
-    return sub_transform, sub_w, sub_h
+
+def _cells_filled(filled: np.ndarray, dst_transform: Affine, sub_bbox: BBox) -> bool:
+    """Whether every output cell *sub_bbox* reaches is filled already.
+
+    *filled* is ``(rows, cols)``, or ``(bands, rows, cols)`` once bands fill
+    apart.
+    """
+    h, w = filled.shape[-2:]
+    cells = _output_cells(dst_transform, w, h, sub_bbox)
+    return cells is not None and bool(filled[(..., *cells)].all())
 
 
 def _resolve_output_nodata(

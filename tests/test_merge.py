@@ -1347,6 +1347,33 @@ def _tile(
     return cog
 
 
+class TestMergeFirstSkipsFilled:
+    @pytest.mark.parametrize("res", [1.0, 2.0], ids=["native", "resampled"])
+    async def test_a_source_whose_cells_are_filled_is_not_read(self, res: float):
+        """mosaic_method="first" pastes only where nothing is yet, but the
+        second tile, over the first one's ground, was read all the same."""
+        tiles = [_tile(0, 20, 1), _tile(0, 20, 3), _tile(20, 20, 2)]
+        calls = spy_read_native(tiles[1])
+        result = await merge(
+            tiles, bbox=BBox(0, 0, 40, 20), bbox_crs=32632, target_resolution=res
+        )
+        data: np.ndarray[Any, Any] = result.data  # type: ignore[reportUnknownMemberType]
+        assert calls == []
+        assert set(np.unique(data)) == {1, 2}
+
+    async def test_a_source_is_read_for_a_band_still_empty(self):
+        """The first tile is nodata in band 2, so its pixels are filled in
+        band 1 only, and the second tile still has band 2 to give."""
+        first = np.stack([np.full((20, 20), 1), np.zeros((20, 20))]).astype(np.uint16)
+        second = np.full((2, 20, 20), 5, np.uint16)
+        tiles = [_tile(0, 20, first, nodata=0), _tile(0, 20, second, nodata=0)]
+        result = await merge(
+            tiles, bbox=BBox(0, 0, 20, 20), bbox_crs=32632, target_resolution=1
+        )
+        data: np.ndarray[Any, Any] = result.data  # type: ignore[reportUnknownMemberType]
+        assert (data[0] == 1).all() and (data[1] == 5).all()
+
+
 class TestMergeCoverage:
     """A source that declares no nodata still has an edge.
 
