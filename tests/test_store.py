@@ -471,6 +471,12 @@ class TestStoreKwargs:
         out = _kwargs("https://cdn.example.com/f.tif", skip_signature=True)
         assert out == {}
 
+    def test_plain_http_is_allowed(self):
+        """object_store refuses http:// unless told, as "builder error" on the
+        first request."""
+        out = _kwargs("http://localhost:8000/f.tif", client_options={"timeout": "5s"})
+        assert out == {"client_options": {"allow_http": True, "timeout": "5s"}}
+
     def test_http_rejects_a_request_to_authenticate(self):
         # Silently stripping it would downgrade to an anonymous GET that only
         # fails on private objects.

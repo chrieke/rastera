@@ -375,6 +375,12 @@ def _store_kwargs_for(
             )
         for key in _S3_ONLY_KWARGS:
             out.pop(key, None)
+        if parsed.uri.lower().startswith("http://"):
+            # Refused otherwise, as "builder error" on the first request.
+            out["client_options"] = {
+                "allow_http": True,
+                **(out.get("client_options") or {}),
+            }
         return out
 
     return out  # gs://, az:// — let obstore validate its own kwargs
