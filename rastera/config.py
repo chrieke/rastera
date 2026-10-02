@@ -38,8 +38,9 @@ def set_concurrency(
       in batches of ``merge``: a batch is read and pasted before the next
       starts, which bounds the arrays held at once. For
       ``mosaic_method="first"`` (the default) the early exit
-      (``filled.all()``) runs between batches, so n>1 may over-fetch up to
-      one batch worth of contributors compared to n=1.
+      (``filled.all()``) and the skip of contributors whose cells are all
+      filled run between batches, so n>1 may read contributors that n=1
+      would skip.
     - ``vrt``: fan-out across distinct underlying sources for one VRT
       read. Bands are grouped by source first so each unique source is
       read once per call; n>1 reads multiple sources in parallel.
