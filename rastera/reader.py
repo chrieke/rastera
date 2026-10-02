@@ -459,7 +459,6 @@ class AsyncGeoTIFF:
             target_crs=target_crs,
             target_resolution=target_resolution,
             needs_reproject=needs_reproject,
-            needs_resample=needs_resample,
             snap=snap,
             use_overviews=use_overviews,
             resampling=resampling,
@@ -508,7 +507,6 @@ class AsyncGeoTIFF:
         target_crs: int | None,
         target_resolution: float | None,
         needs_reproject: bool,
-        needs_resample: bool,
         snap: bool,
         use_overviews: bool,
         resampling: ResamplingMethod,
@@ -579,7 +577,10 @@ class AsyncGeoTIFF:
             band_indices=band_indices,
             resampling=resampling,
             # gdalwarp's default *res* is not a resolution anyone asked for.
-            use_overviews=use_overviews and needs_resample,
+            # Whether a given one downsamples is up to the overview pick: a
+            # reprojection changes the units, so 10 m in EPSG:3857 at 65N is
+            # 4 m on the ground.
+            use_overviews=use_overviews and target_resolution is not None,
         )
 
     async def _read_to_grid(

@@ -853,6 +853,34 @@ class TestOverviewChoice:
         assert level.read.called is reads_level
         assert gt.read.called is not reads_level
 
+    async def test_a_reprojection_to_the_same_number_can_downsample(self):
+        """10 m in EPSG:3857 at 65N is 4 m on the ground, so a 10 m read into
+        EPSG:3006 spans 2.4 source pixels. Compared as numbers, 10 == 10 read
+        full resolution."""
+        x0, y0 = 2_000_000.0, 9_680_000.0
+        gt = make_mock_geotiff(
+            400, 400, 10.0, 1, crs_epsg=3857, origin_x=x0, origin_y=y0
+        )
+        level = make_mock_geotiff(
+            200, 200, 20.0, 1, crs_epsg=3857, origin_x=x0, origin_y=y0
+        )
+        gt.overviews = [level]
+        gt.read = AsyncMock(side_effect=slicing_read(gt, np.zeros((1, 400, 400))))
+        level.read = AsyncMock(side_effect=slicing_read(level, np.zeros((1, 200, 200))))
+        ds = AsyncGeoTIFF("s3://b/k.tif", gt)
+
+        cx, cy = Transformer.from_crs(3857, 3006, always_xy=True).transform(
+            x0 + 2000, y0 - 2000
+        )
+        await ds.read(
+            bbox=(cx - 500, cy - 500, cx + 500, cy + 500),
+            bbox_crs=3006,
+            target_crs=3006,
+            target_resolution=10.0,
+            use_overviews=True,
+        )
+        assert level.read.called and not gt.read.called
+
 
 # ── read: output grid is a pure function of the arguments ───────────────
 
