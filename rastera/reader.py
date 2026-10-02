@@ -270,7 +270,9 @@ class AsyncGeoTIFF:
                 :class:`rastera.WindowOutOfRangeError` rather than padding —
                 unlike *bbox*, which clips. A window is an exact pixel range,
                 so overhanging one is a mistake and not a partial request.
-            band_indices: 1-based.
+            band_indices: 1-based. Each GeoTIFF read still fetches and decodes
+                all of its bands, even when they are stored apart
+                (``INTERLEAVE=BAND``); the subset is taken afterwards.
             target_resolution: Without it, a reprojecting read takes the
                 resolution gdalwarp picks: ``gdalwarp -te`` with a bbox, and
                 ``gdalwarp -t_srs`` for the whole dataset without one.
