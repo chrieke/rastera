@@ -10,6 +10,7 @@ from affine import Affine
 from rastera.geo import (
     BBox,
     WindowOutOfRangeError,
+    _mercator_clamped_bounds,
     _normalize_crs,
     bounds_from_transform,
     compute_paste_slices,
@@ -361,6 +362,25 @@ class TestComputePasteSlices:
 
 
 # ── transform_bbox ───────────────────────────────────────────────────────
+
+
+class TestMercatorClampedBounds:
+    def test_a_global_source_clamps(self):
+        clamped = _mercator_clamped_bounds(BBox(-180, -90, 180, 90), 4326, 3857)
+        assert clamped == BBox(-180, -85.0511287798066, 180, 85.0511287798066)
+
+    @pytest.mark.parametrize(
+        ("bounds", "to_crs"),
+        [
+            ((0, 86, 10, 90), 3857),  # wholly beyond the clamp latitude
+            ((0, -80, 10, 80), 3857),  # wholly within it
+            ((0, -90, 360, 90), 3857),  # past 180°
+            ((-180, -90, 180, 90), 3832),  # central meridian 150°
+            ((-180, -90, 180, 90), 32632),  # not Mercator
+        ],
+    )
+    def test_gdalwarp_leaves_alone(self, bounds: tuple[float, ...], to_crs: int):
+        assert _mercator_clamped_bounds(BBox(*bounds), 4326, to_crs) is None
 
 
 class TestTransformBbox:

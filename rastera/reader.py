@@ -22,6 +22,7 @@ from .geo import (
     _denoise,
     _grid_bounds,
     _is_on_res_grid,
+    _mercator_clamped_bounds,
     _normalize_crs,
     _require_north_up,
     _transformer,
@@ -187,8 +188,9 @@ class AsyncGeoTIFF:
                 (s3://, https://, gs://, file://, etc.).
             store: Optional pre-constructed store. When provided,
                 the key is extracted from the URI and used as the
-                path within the store. If no store is provided, it
-                is auto-constructed via ``async_tiff.store.from_url``.
+                path within the store. If no store is provided, one is
+                built for the URI's bucket or host: obstore's for a local
+                path, async-tiff's otherwise.
             prefetch: Number of bytes to prefetch when opening the TIFF.
             cache: When True, cache the parsed GeoTIFF object in memory so that
                 subsequent opens of the same URI skip the header fetch. A
@@ -265,7 +267,9 @@ class AsyncGeoTIFF:
 
         Args:
             bbox: Must be in *bbox_crs*, which must equal *target_crs* if set,
-                else the dataset CRS.
+                else the dataset CRS. Defaults to the dataset's extent,
+                clamped to ±85.0511° when reprojecting a geographic dataset to
+                Mercator, as gdalwarp does.
             window: In full-resolution pixels. Combines with
                 *target_resolution* but not with *target_crs*. Naming pixels
                 the dataset does not have raises
@@ -277,7 +281,11 @@ class AsyncGeoTIFF:
                 (``INTERLEAVE=BAND``); the subset is taken afterwards.
             target_resolution: Without it, a reprojecting read takes the
                 resolution gdalwarp picks: ``gdalwarp -te`` with a bbox, and
-                ``gdalwarp -t_srs`` for the whole dataset without one.
+                ``gdalwarp -t_srs`` for the whole dataset without one. The
+                grid is then laid out as for a given resolution, square and
+                rounded out, so it can have a row or column more than
+                gdalwarp's, which rounds the pixel count and stretches each
+                axis's pixel size to fit.
             snap_to_grid: When True (default) and *target_resolution* is
                 given with a bbox, the output grid is rounded outward onto
                 multiples of ``target_resolution`` — see
@@ -518,7 +526,13 @@ class AsyncGeoTIFF:
         elif needs_reproject:
             # needs_reproject implies target_crs was given, so out_crs is set.
             assert src_crs is not None and out_crs is not None
-            target_bbox = transform_bbox(_grid_bounds(gt), src_crs, out_crs)
+            src_bounds = _grid_bounds(gt)
+            clamped = _mercator_clamped_bounds(src_bounds, src_crs, out_crs)
+            target_bbox = transform_bbox(clamped or src_bounds, src_crs, out_crs)
+            if clamped is not None:
+                # gdalwarp then reads as if -te named the clamped extent, which
+                # also picks the -te resolution below.
+                bbox = target_bbox
         else:
             target_bbox = _grid_bounds(gt)
 
@@ -865,10 +879,11 @@ async def _open_many(
         stores = [None if _needs_own_store(u) else store for u in uris]
     else:
         stores = [store] * len(uris)
-    # store_kwargs is forwarded as well as consumed above: plain TIFF opens
-    # ignore it once `store` is set, but the VRT and DIMAP branches need it to
-    # build their own obstore for the descriptor fetch (the async-tiff and
-    # obstore store types are not interchangeable).
+    # store_kwargs is forwarded as well as consumed above: a URI that gets its
+    # own store (`None` here) builds it from them, and the VRT and DIMAP
+    # branches need them to build their own obstore for the descriptor fetch
+    # (the async-tiff and obstore store types are not interchangeable). Plain
+    # TIFF opens on the shared store ignore them.
     return list(
         await asyncio.gather(
             *(

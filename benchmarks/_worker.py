@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import resource
 import time
 
@@ -131,7 +132,6 @@ def read_rasterio(
     would only make GDAL resample a region it can copy.
     """
     import math
-    import os
 
     import rasterio
     from affine import Affine
@@ -139,9 +139,6 @@ def read_rasterio(
     from rasterio.vrt import WarpedVRT
     from rasterio.warp import Resampling
     from rasterio.windows import from_bounds
-
-    # Match rastera's skip_signature=True for public S3 buckets
-    os.environ["AWS_NO_SIGN_REQUEST"] = "YES"
 
     out_crs = CRS.from_epsg(target_crs) if target_crs else CRS.from_epsg(bbox_crs)
 
@@ -203,14 +200,10 @@ def merge_rasterio(
     use_overviews: bool,
     resampling: str,
 ) -> tuple[np.ndarray, list]:
-    import os
-
     import rasterio
     from rasterio.crs import CRS
     from rasterio.enums import Resampling
     from rasterio.merge import merge
-
-    os.environ["AWS_NO_SIGN_REQUEST"] = "YES"
 
     out_crs = CRS.from_epsg(target_crs) if target_crs else None
 
@@ -273,6 +266,12 @@ def merge_rasterio(
 
 
 def main():
+    # The scenarios read the public Sentinel-2 bucket, in us-west-2. GDAL needs
+    # this to read it unsigned, as rastera does, and an AWS profile's own region
+    # would send both libraries' requests to the wrong endpoint.
+    os.environ["AWS_NO_SIGN_REQUEST"] = "YES"
+    os.environ["AWS_REGION"] = "us-west-2"
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--library", required=True, choices=["rastera", "rasterio"])
     parser.add_argument("--mode", default="read", choices=["read", "merge"])
