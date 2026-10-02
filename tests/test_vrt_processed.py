@@ -218,16 +218,36 @@ class TestParseProcessedVRT:
         with pytest.raises(ValueError, match="dst_nodata=300"):
             _parse_vrt_xml(xml, "s3://b/x.vrt")
 
-    @pytest.mark.parametrize("value", ["inf", "-inf", "nan", "abc"])
-    def test_rejects_unusable_src_nodata(self, value: str):
-        """``int(float("inf"))`` raises OverflowError, not ValueError, so this
-        escaped as a bare traceback."""
+    @pytest.mark.parametrize("name", ["src_nodata", "dst_nodata"])
+    @pytest.mark.parametrize("value", ["inf", "-inf", "nan", "abc", "0.5"])
+    def test_rejects_non_integer_nodata_arg(self, name: str, value: str):
+        """GDAL compares a fractional ``src_nodata`` in double, so no integer
+        pixel matches it; truncating 0.5 to 0 masked real zeros."""
+        xml = _processed_vrt(n_bands=1).replace(
+            f'<Argument name="{name}">0</Argument>'.encode(),
+            f'<Argument name="{name}">{value}</Argument>'.encode(),
+        )
+        with pytest.raises(ValueError, match=name):
+            _parse_vrt_xml(xml, "s3://b/x.vrt")
+
+    @pytest.mark.parametrize("name", ["src_nodata", "dst_nodata"])
+    def test_rejects_missing_nodata_arg(self, name: str):
+        """GDAL takes a missing src_nodata from the input band and a missing
+        dst_nodata from src_nodata; rastera read both as 0."""
+        xml = _processed_vrt(n_bands=1).replace(
+            f'<Argument name="{name}">0</Argument>'.encode(), b""
+        )
+        with pytest.raises(NotImplementedError, match=f"name='{name}'"):
+            _parse_vrt_xml(xml, "s3://b/x.vrt")
+
+    def test_integral_float_nodata_arg_accepted(self):
         xml = _processed_vrt(n_bands=1).replace(
             b'<Argument name="src_nodata">0</Argument>',
-            f'<Argument name="src_nodata">{value}</Argument>'.encode(),
+            b'<Argument name="src_nodata">0.0</Argument>',
         )
-        with pytest.raises(ValueError, match="bad src/dst nodata"):
-            _parse_vrt_xml(xml, "s3://b/x.vrt")
+        spec = _parse_vrt_xml(xml, "s3://b/x.vrt")
+        assert isinstance(spec, _VRTProcessedSpec)
+        assert spec.src_nodata == 0
 
     def test_rejects_missing_lut_for_band(self):
         # Strip the second band's LUT.

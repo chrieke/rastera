@@ -1253,12 +1253,8 @@ def _parse_processed_vrt(root: ET.Element, vrt_uri: str) -> _VRTProcessedSpec:
         if name and arg.text is not None:
             args[name] = arg.text
 
-    try:
-        # OverflowError too: that, not ValueError, is what int(float("inf")) raises.
-        src_nodata = int(float(args.get("src_nodata", "0")))
-        dst_nodata = int(float(args.get("dst_nodata", "0")))
-    except (ValueError, OverflowError) as e:
-        raise ValueError(f"VRTProcessedDataset: bad src/dst nodata: {e}") from e
+    src_nodata = _lut_nodata_arg(args, "src_nodata")
+    dst_nodata = _lut_nodata_arg(args, "dst_nodata")
     if not 0 <= dst_nodata <= 255:
         raise ValueError(
             f"VRTProcessedDataset: dst_nodata={dst_nodata} is outside the "
@@ -1284,6 +1280,30 @@ def _parse_processed_vrt(root: ET.Element, vrt_uri: str) -> _VRTProcessedSpec:
         dst_nodata=dst_nodata,
         output_count=output_count,
     )
+
+
+def _lut_nodata_arg(args: dict[str, str], name: str) -> int:
+    """Read the LUT step's ``src_nodata`` or ``dst_nodata`` as an integer.
+
+    GDAL takes a missing ``src_nodata`` from the input band's nodata and a
+    missing ``dst_nodata`` from ``src_nodata``. It compares a fractional
+    ``src_nodata`` in double, so no integer pixel matches it. rastera copies
+    none of this, so both raise.
+    """
+    if name not in args:
+        raise NotImplementedError(
+            f"VRTProcessedDataset: the LUT step has no <Argument name='{name}'>; "
+            f"rastera needs both src_nodata and dst_nodata. {_GDAL_HINT}"
+        )
+    text = args[name].strip()
+    try:
+        value = float(text)
+    except ValueError as e:
+        raise ValueError(f"VRTProcessedDataset: bad {name}: {e}") from e
+    # is_integer() is False for inf and nan too, so int() cannot overflow.
+    if not value.is_integer():
+        raise ValueError(f"VRTProcessedDataset: {name}={text!r} is not an integer")
+    return int(value)
 
 
 def _reject_processed_nodata_mismatch(
