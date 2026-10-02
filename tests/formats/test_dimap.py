@@ -1574,6 +1574,35 @@ class TestTileCache:
         assert calls == 1
         assert ds._tiles[(0, 1, 1)] is tile
 
+    async def test_a_failed_open_whose_readers_were_cancelled_is_retried(self):
+        """With every reader cancelled, none was left to drop the open from
+        _tile_tasks when it failed, so the next read got its stale error."""
+        ds = _DIMAPDataset("s3://bucket/DIM_PNEO.XML", self._layout())
+        tile = MagicMock()
+        release = asyncio.Event()
+        calls = 0
+
+        async def flaky(*_: Any, **__: Any):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                await release.wait()
+                raise OSError("transient 503")
+            return tile
+
+        with patch.object(_DIMAPDataset, "_open_tile", new=flaky):
+            reader = asyncio.ensure_future(ds._get_tile(0, 1, 1))
+            await asyncio.sleep(0)
+            open_task = ds._tile_tasks[(0, 1, 1)]
+            reader.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await reader
+            release.set()
+            with pytest.raises(OSError, match="transient"):
+                await open_task
+            assert await ds._get_tile(0, 1, 1) is tile
+        assert calls == 2
+
     def test_construction_needs_no_running_loop(self):
         """The primed first tile was held as a resolved Future, which requires a
         running event loop and binds the dataset to it."""

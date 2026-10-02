@@ -290,18 +290,21 @@ class _DIMAPDataset(AsyncGeoTIFF):
         if task is None:
             task = asyncio.ensure_future(self._open_tile(group_idx, tile_row, tile_col))
             self._tile_tasks[key] = task
-        try:
-            # Shielded: a reader being cancelled must not cancel the open for the
-            # others awaiting it.
-            tile = await asyncio.shield(task)
-        finally:
-            # Drop the in-flight entry once the open is over: on success the
-            # tile moves to `_tiles`, on failure the next read gets a fresh
-            # attempt. A cancelled reader leaves a running open to the others.
-            if task.done():
-                self._tile_tasks.pop(key, None)
-        self._tiles[key] = tile
-        return tile
+            # A callback rather than code after the await: when every reader
+            # is cancelled, none is left to clear the entry once the open ends.
+            task.add_done_callback(lambda t: self._tile_opened(key, t))
+        # Shielded: a reader being cancelled must not cancel the open for the
+        # others awaiting it.
+        return await asyncio.shield(task)
+
+    def _tile_opened(
+        self, key: tuple[int, int, int], task: asyncio.Task[AsyncGeoTIFF]
+    ) -> None:
+        """Drop a finished open from ``_tile_tasks``: on success the tile moves
+        to ``_tiles``, on failure the next read gets a fresh attempt."""
+        self._tile_tasks.pop(key, None)
+        if not task.cancelled() and task.exception() is None:
+            self._tiles[key] = task.result()
 
     async def _open_tile(
         self, group_idx: int, tile_row: int, tile_col: int
