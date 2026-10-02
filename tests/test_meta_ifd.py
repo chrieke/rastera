@@ -54,3 +54,21 @@ class TestCoerceNodata:
         """No integer pixel can equal it, which is how GDAL reads it. Truncated
         to 3, a 3.7 sentinel masked every real 3."""
         assert _coerce_nodata(nodata, np.dtype(dtype)) is None
+
+    @pytest.mark.parametrize(
+        ("text", "dtype"),
+        [(str(2**64 - 1), "u8"), (str(2**63 - 1), "i8"), (str(2**60 + 1), "u8")],
+    )
+    def test_tag_text_keeps_a_64_bit_integer_exact(self, text: str, dtype: str):
+        """float() rounds past 2**53: the type maxima came back as 2**64 and
+        2**63, out of range and dropped, and 2**60 + 1 as 2**60."""
+        assert _coerce_nodata(text, np.dtype(dtype)) == int(text)
+
+    @pytest.mark.parametrize(
+        ("text", "dtype", "expected"),
+        [("255.0", "u1", 255), ("-9999", "f4", -9999.0), ("3.7", "u1", None)],
+    )
+    def test_tag_text_that_is_not_an_integer_reads_as_a_float(
+        self, text: str, dtype: str, expected: float | None
+    ):
+        assert _coerce_nodata(text, np.dtype(dtype)) == expected

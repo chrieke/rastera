@@ -109,6 +109,12 @@ class TestProfile:
         assert profile["nodata"] == 0
         assert profile["overviews"] == []
 
+    def test_nodata_is_the_tags_text_not_its_float(self):
+        """``geotiff.nodata`` reports uint64's maximum as 2**64."""
+        gt = make_mock_geotiff(dtype=np.dtype("u8"), nodata=float(2**64 - 1))
+        gt.ifd.gdal_nodata = str(2**64 - 1)
+        assert AsyncGeoTIFF("s3://b/k.tif", gt).profile["nodata"] == 2**64 - 1
+
     def test_bounds_is_a_bbox(self):
         """Not the raw 4-tuple: BBox is rastera's own spatial type, so a bbox
         out of the profile goes straight back into read() or merge()."""

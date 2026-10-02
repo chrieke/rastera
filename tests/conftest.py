@@ -100,6 +100,7 @@ def make_mock_geotiff(
     gt.tile_width = tile_width
     gt.tile_height = tile_height
     gt.ifd = SimpleNamespace(
+        gdal_nodata=None if nodata is None else str(nodata),
         planar_configuration=PlanarConfiguration.Chunky,
         predictor=None,
         samples_per_pixel=count,
