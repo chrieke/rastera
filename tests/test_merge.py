@@ -773,6 +773,28 @@ class TestMergeReprojected:
         # Both grids sit on multiples of 0.02, the narrow one 3525 columns in.
         assert np.array_equal(wide[:, 3525 : 3525 + narrow.shape[1]], narrow)
 
+    async def test_polar_source_next_to_the_antimeridian(self):
+        """The margin pushed the clip across lon 180, which has no bounds in
+        EPSG:4326; the whole extent holds the pole and does."""
+        cog = _make_cog(
+            width=600,
+            height=600,
+            scale=10000.0,
+            origin_x=-3_000_000,
+            origin_y=3_000_000,
+            crs=3031,
+        )
+        gt: Any = cog._geotiff
+        gt.read = slicing_read(gt, np.full((1, 600, 600), 7, np.uint16))
+        result = await merge(
+            [cog],
+            bbox=BBox(170, -80, 180, -75),
+            bbox_crs=4326,
+            target_crs=4326,
+            target_resolution=0.1,
+        )
+        assert result.mask is not None and result.mask.all()
+
 
 def _geographic_cog(bounds: BBox, scale: float) -> AsyncGeoTIFF:
     """An EPSG:4326 source of 7 over *bounds*."""

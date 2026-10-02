@@ -634,18 +634,16 @@ def _covered_bbox(cog: AsyncGeoTIFF, target_bbox: BBox, out_crs: int) -> BBox | 
     Clipped in the source CRS first, the direction ``read()`` transforms in.
     Transforming the source's whole extent instead under-reports a wide one (a
     continental EPSG:4326 source loses ~1 km at its edge in UTM) and fails
-    outright for a global one. The whole extent is still the fallback for an
-    output bbox the source CRS cannot hold, such as a world-wide mosaic of UTM
-    tiles.
+    outright for a global one. The whole extent is still the fallback when
+    either transform fails: an output bbox the source CRS cannot hold (a
+    world-wide mosaic of UTM tiles), or a clip off a polar source that crosses
+    the antimeridian on its way back to EPSG:4326.
     """
     src_crs = cog._crs_epsg
     assert src_crs is not None
     src_bounds = _grid_bounds(cog._geotiff)
     try:
         in_src = transform_bbox(target_bbox, out_crs, src_crs)
-    except ValueError:
-        clipped = src_bounds
-    else:
         # A wide output bbox comes back short in the source CRS too, by up to
         # ~0.5% of its size, which would cut a tile on its edge. The margin is
         # free: the result is cut back to target_bbox below.
@@ -653,9 +651,12 @@ def _covered_bbox(cog: AsyncGeoTIFF, target_bbox: BBox, out_crs: int) -> BBox | 
         clipped = BBox(
             in_src.minx - dx, in_src.miny - dy, in_src.maxx + dx, in_src.maxy + dy
         ).intersect(src_bounds)
-    if clipped is None:
-        return None
-    return target_bbox.intersect(transform_bbox(clipped, src_crs, out_crs))
+        if clipped is None:
+            return None
+        covered = transform_bbox(clipped, src_crs, out_crs)
+    except ValueError:
+        covered = transform_bbox(src_bounds, src_crs, out_crs)
+    return target_bbox.intersect(covered)
 
 
 async def _read_or_skip(
