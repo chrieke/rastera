@@ -6,9 +6,10 @@ Two flavours are supported:
   ``<SimpleSource>`` or ``<ComplexSource>`` naming a source file and band. All
   sources are assumed to describe the same spatial image, so pixels are read
   on the first source's grid and labelled with its SRS. The VRT's own raster
-  size, geotransform and band ``dataType`` must agree with the sources; its
-  SRS is not compared. An omitted ``<GeoTransform>`` or ``<SRS>`` is taken
-  from the first source, where GDAL would leave the VRT ungeoreferenced.
+  size, geotransform, band ``dataType`` and SRS (as an EPSG code, where both
+  have one) must agree with the sources. An omitted ``<GeoTransform>`` or
+  ``<SRS>`` is taken from the first source, where GDAL would leave the VRT
+  ungeoreferenced.
 
   That "same spatial image" assumption is load-bearing, so anything in the XML
   contradicting it is *rejected* rather than ignored — a silently wrong pixel
@@ -36,6 +37,7 @@ import numpy as np
 from affine import Affine
 from async_geotiff import RasterArray, Window
 from pyproj import CRS
+from pyproj.exceptions import CRSError
 
 from . import config
 from .geo import BBox
@@ -74,6 +76,8 @@ class _VRTBand:
     vrt_declared_size: tuple[float, float] | None = None
     # The VRT root's <GeoTransform>, or None if omitted.
     vrt_geotransform: Affine | None = None
+    # The EPSG code of the VRT root's <SRS>, or None if omitted or it has none.
+    vrt_crs_epsg: int | None = None
     # The band's dataType attribute; GDAL reads an omitted one as Byte.
     data_type: str = "Byte"
     # The band's own <NoDataValue>, or None when it declares none. Unlike the
@@ -193,7 +197,9 @@ async def _open_vrt_checked(
             meta_overrides=meta_overrides,
             **store_kwargs,
         )
-    _validate_source_windows(bands, sources_map)
+    _validate_source_windows(
+        bands, sources_map, check_crs="crs" not in (meta_overrides or {})
+    )
     return _VRTDataset(uri, bands, sources_map, meta_overrides=meta_overrides)
 
 
@@ -506,6 +512,7 @@ def _parse_vrt_xml(
 
     declared_size = _declared_raster_size(root)
     declared_transform = _declared_geotransform(root)
+    declared_crs_epsg = _declared_crs_epsg(root)
 
     bands: list[_VRTBand] = []
     for vrt_band in root.findall("VRTRasterBand"):
@@ -543,6 +550,7 @@ def _parse_vrt_xml(
                 dst_rect_size=dst_rect_size,
                 vrt_declared_size=declared_size,
                 vrt_geotransform=declared_transform,
+                vrt_crs_epsg=declared_crs_epsg,
                 data_type=vrt_band.attrib.get("dataType", "Byte"),
                 nodata=band_nodata,
                 hide_nodata=_hides_nodata(vrt_band),
@@ -636,6 +644,18 @@ def _declared_geotransform(root: ET.Element) -> Affine | None:
             f"VRT <GeoTransform> has {len(coeffs)} coefficients; expected 6"
         )
     return Affine.from_gdal(*coeffs)
+
+
+def _declared_crs_epsg(root: ET.Element) -> int | None:
+    """The EPSG code of the VRT's ``<SRS>``, or None when it has none, or no
+    code can be found for it."""
+    text = (root.findtext("SRS") or "").strip()
+    if not text:
+        return None
+    try:
+        return CRS.from_string(text).to_epsg()
+    except CRSError:
+        return None
 
 
 def _rect(parent: ET.Element, tag: str) -> tuple[float, float, float, float] | None:
@@ -930,7 +950,10 @@ def _hides_declared_nodata(bands: Sequence[_VRTBand]) -> bool:
 
 
 def _validate_source_windows(
-    bands: Sequence[_VRTBand], sources_map: dict[str, AsyncGeoTIFF]
+    bands: Sequence[_VRTBand],
+    sources_map: dict[str, AsyncGeoTIFF],
+    *,
+    check_crs: bool = True,
 ) -> None:
     """Check the opened sources really are the one full image the VRT implies.
 
@@ -940,7 +963,8 @@ def _validate_source_windows(
     output canvas, a declared VRT canvas that differs from the source grid, and
     sources that disagree with each other. GDAL's optional
     ``<SourceProperties>`` is deliberately not trusted for this — it may be
-    absent or stale.
+    absent or stale. *check_crs* is False when ``meta_overrides`` names the
+    CRS, which then replaces the VRT's as well as the sources'.
     """
 
     def dims(src: AsyncGeoTIFF) -> tuple[float, float]:
@@ -1026,6 +1050,23 @@ def _validate_source_windows(
             f"VRT declares geotransform {declared_gt.to_gdal()} but its source "
             f"{ref_uri!r} has {reference._geotiff.transform.to_gdal()}; a VRT "
             f"that georeferences its source anew is not supported. {_GDAL_HINT}"
+        )
+
+    # Likewise gdal_translate -of VRT -a_srs, read in the source's CRS. Compared
+    # by EPSG code, so a WKT spelled differently is not a mismatch.
+    declared_epsg = bands[0].vrt_crs_epsg
+    source_epsg = reference._crs_epsg
+    if (
+        check_crs
+        and declared_epsg is not None
+        and source_epsg is not None
+        and declared_epsg != source_epsg
+    ):
+        raise NotImplementedError(
+            f"VRT declares EPSG:{declared_epsg} but its source {ref_uri!r} is "
+            f"EPSG:{source_epsg}; a VRT that relabels its source's CRS is not "
+            f"supported. Open it with meta_overrides={{'crs': {declared_epsg}}} "
+            f"to read it in the VRT's CRS."
         )
 
     declared = bands[0].vrt_declared_size

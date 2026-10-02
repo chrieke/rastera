@@ -9,6 +9,7 @@ import numpy as np
 import pytest
 from affine import Affine
 from async_geotiff import RasterArray
+from pyproj import CRS
 
 import rastera
 from rastera.reader import AsyncGeoTIFF, _source_store
@@ -70,17 +71,22 @@ class _Dims(TypedDict):
     scale: float
     origin_x: float
     origin_y: float
+    crs_epsg: int
 
 
-# On RGBNIR_VRT's <GeoTransform> too, which _validate_source_windows also checks.
+# On RGBNIR_VRT's <GeoTransform> and <SRS> too, which _validate_source_windows
+# also checks.
 _RGBNIR_GEOTRANSFORM = b"637500.0, 0.25, 0.0, 6557500.0, 0.0, -0.25"
 _PNEO_GEOTRANSFORM = b"369516.0, 0.3, 0.0, 6447186.0, 0.0, -0.3"
+_RGBNIR_SRS = b"<SRS>EPSG:3006</SRS>"
+_PNEO_SRS = b"<SRS>EPSG:32633</SRS>"
 _RGBNIR_DIMS: _Dims = {
     "width": 10000,
     "height": 10000,
     "scale": 0.25,
     "origin_x": 637500.0,
     "origin_y": 6557500.0,
+    "crs_epsg": 3006,
 }
 
 
@@ -1008,12 +1014,13 @@ class TestOpenVRT:
         vrt_with_xml_source = (
             RGBNIR_VRT.replace(b"/vsis3/bucket/rgb.tif", b"/vsis3/bucket/DIM_PNEO.XML")
             .replace(b"/vsis3/bucket/nir.tif", b"/vsis3/bucket/DIM_PNEO.XML")
-            # Declared size and geotransform must match the PNEO fixture's.
+            # Declared size, geotransform and SRS must match the PNEO fixture's.
             .replace(
                 b'rasterXSize="10000" rasterYSize="10000"',
                 b'rasterXSize="800" rasterYSize="1000"',
             )
             .replace(_RGBNIR_GEOTRANSFORM, _PNEO_GEOTRANSFORM)
+            .replace(_RGBNIR_SRS, _PNEO_SRS)
         )
 
         from tests.formats.test_dimap import _patch_sniff
@@ -1054,6 +1061,7 @@ class TestOpenVRT:
                 b'rasterXSize="800" rasterYSize="1000"',
             )
             .replace(_RGBNIR_GEOTRANSFORM, _PNEO_GEOTRANSFORM)
+            .replace(_RGBNIR_SRS, _PNEO_SRS)
             .replace(b"<SimpleSource>", b"<NoDataValue>0</NoDataValue><SimpleSource>")
         )
         with (
@@ -1215,13 +1223,13 @@ class TestValidateSourceWindows:
 
 
 class TestDeclaredGridAndType:
-    """A VRT can say its source sits elsewhere, or holds another type:
-    gdal_translate -of VRT -a_ullr / -a_gt, or -ot. GDAL then moves or converts
-    the pixels; reading the source as is returned them at the wrong place, or
-    unconverted."""
+    """A VRT can say its source sits elsewhere, in another CRS, or holds
+    another type: gdal_translate -of VRT -a_ullr / -a_gt, -a_srs, or -ot. GDAL
+    then moves, relabels or converts the pixels; reading the source as is
+    returned them at the wrong place, or unconverted."""
 
     @staticmethod
-    async def _open(xml: bytes) -> AsyncGeoTIFF:
+    async def _open(xml: bytes, **kwargs: Any) -> AsyncGeoTIFF:
         async def fake_open(uri: str, **_: Any) -> AsyncGeoTIFF:
             count = 3 if "rgb" in uri else 1
             return AsyncGeoTIFF(uri, make_mock_geotiff(count=count, **_RGBNIR_DIMS))
@@ -1232,7 +1240,24 @@ class TestDeclaredGridAndType:
             ),
             patch.object(AsyncGeoTIFF, "open", side_effect=fake_open),
         ):
-            return await _open_vrt("s3://bucket/v.vrt")
+            return await _open_vrt("s3://bucket/v.vrt", **kwargs)
+
+    async def test_an_srs_relabelling_the_source_is_rejected(self):
+        """Read in the source's CRS, a 3006 source labelled 32633 lands some
+        hundred km off."""
+        relabelled = RGBNIR_VRT.replace(_RGBNIR_SRS, b"<SRS>EPSG:32633</SRS>")
+        with pytest.raises(NotImplementedError, match="relabels its source's CRS"):
+            await self._open(relabelled)
+
+    async def test_an_srs_relabelling_the_source_opens_under_a_crs_override(self):
+        relabelled = RGBNIR_VRT.replace(_RGBNIR_SRS, b"<SRS>EPSG:32633</SRS>")
+        ds = await self._open(relabelled, meta_overrides={"crs": 32633})
+        assert ds._crs_epsg == 32633
+
+    async def test_an_srs_written_as_wkt_passes(self):
+        wkt = CRS.from_epsg(3006).to_wkt().encode()
+        spelled = RGBNIR_VRT.replace(_RGBNIR_SRS, b"<SRS>" + wkt + b"</SRS>")
+        assert isinstance(await self._open(spelled), _VRTDataset)
 
     async def test_a_geotransform_moving_the_source_is_rejected(self):
         moved = RGBNIR_VRT.replace(
