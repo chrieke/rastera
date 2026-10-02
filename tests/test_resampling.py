@@ -1,6 +1,7 @@
 """Unit tests for the resample() function and its kernel/coord helpers."""
 
 import math
+import warnings
 from typing import Any
 
 import numpy as np
@@ -362,6 +363,19 @@ class TestResampleBilinear:
     )
     def test_kernel_scale_rounds_like_gdalwarp(self, scale: float, used: float):
         assert _kernel_scale(scale) == used
+
+    @pytest.mark.parametrize("dtype", [np.int64, np.uint64])
+    def test_64bit_maximum_kept(self, dtype: type):
+        """float64 rounds the int64 maximum up to 2**63, which the cast cannot
+        hold: x86 wrapped it to the minimum, ARM saturated with a warning."""
+        top = np.iinfo(dtype).max
+        src = np.full((1, 8, 8), top, dtype=dtype)
+        st = Affine(1, 0, 0, 0, -1, 8)
+        dt = Affine(2, 0, 0, 0, -2, 8)
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            out = resample(src, st, dt, 4, 4, method="bilinear")
+        np.testing.assert_array_equal(out, top)
 
 
 # ── resample (cubic) ─────────────────────────────────────────────────────

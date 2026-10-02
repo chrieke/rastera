@@ -1108,10 +1108,9 @@ def _finalize_kernel(
     if src_dtype.kind == "b":
         return out_f >= 0.5
     if np.issubdtype(src_dtype, np.integer):
-        info = np.iinfo(src_dtype)
-        np.clip(out_f, info.min, info.max, out=out_f)
-        np.round(out_f, out=out_f)
-    out = out_f.astype(src_dtype)
+        out = _round_to_integer(out_f, src_dtype)
+    else:
+        out = out_f.astype(src_dtype)
     if nodata is not None and invalid is not None:
         _avoid_nodata(out, nodata, ~invalid)
     return out
@@ -1236,14 +1235,11 @@ def _resample_two_pass(
     if orig_dtype.kind == "b":
         return out >= 0.5, coverage
     if np.issubdtype(orig_dtype, np.integer):
-        info = np.iinfo(orig_dtype)
         out = out.astype(np.float64, copy=False)
         # Before the round: Pass B wrote the sentinel exactly into the pixels it
         # gated, and moved any real value off it.
         gated = None if nodata is None else out == nodata
-        np.clip(out, info.min, info.max, out=out)
-        np.round(out, out=out)
-        out = out.astype(orig_dtype)
+        out = _round_to_integer(out, orig_dtype)
         if nodata is not None and gated is not None:
             _avoid_nodata(out, nodata, ~gated)
         return out, coverage
@@ -1356,6 +1352,27 @@ def _avoid_nodata(out: np.ndarray, nodata: int | float, valid: np.ndarray) -> No
         # From +inf, which a value overflowing the dtype lands on, too.
         toward = -np.inf if nodata >= np.finfo(out.dtype).max else np.inf
         out[hit] = np.nextafter(out.dtype.type(nodata), out.dtype.type(toward))
+
+
+def _round_to_integer(values: np.ndarray, dtype: np.dtype) -> np.ndarray:
+    """Clip and round float *values* in place, then cast them to integer *dtype*.
+
+    float64 rounds a 64-bit dtype's maximum up to 2**63 or 2**64, which the
+    cast cannot hold: x86 turns int64's into the minimum, ARM saturates with a
+    warning. Those pixels are clipped one float step lower and set to the
+    maximum after the cast.
+    """
+    info = np.iinfo(dtype)
+    top = float(info.max)
+    over = values >= top if top > info.max else None
+    if over is not None:
+        top = np.nextafter(top, 0.0)
+    np.clip(values, info.min, top, out=values)
+    np.round(values, out=values)
+    out = values.astype(dtype)
+    if over is not None:
+        out[over] = info.max
+    return out
 
 
 def _and_coverage(
