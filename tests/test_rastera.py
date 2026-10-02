@@ -597,6 +597,24 @@ class TestRead:
         )
         assert (arr.bounds[0], arr.bounds[2]) == (300.0, 380.0)
 
+    async def test_integer_factor_resample_on_degree_grid_adds_no_pixel(self):
+        """The span divides by the resolution to 300.00000000000244 and
+        150.00000000000568, and ceil made those 301 and 151."""
+        gt = make_mock_geotiff(
+            width=600,
+            height=300,
+            scale=0.0001,
+            count=1,
+            tile_width=1024,
+            tile_height=1024,
+            crs_epsg=4326,
+            origin_x=10.0,
+            origin_y=50.0,
+        )
+        gt.read = slicing_read(gt, np.ones((1, 300, 600), np.uint16))
+        arr = await AsyncGeoTIFF("s3://b/k.tif", gt).read(target_resolution=0.0002)
+        assert (arr.width, arr.height) == (300, 150)
+
     @pytest.mark.parametrize("method", ["bilinear", "cubic"])
     # res 1x1 downsamples 10x on both axes; 2x20 downsamples 5x in x but
     # *up*samples in y, so an x-derived halo is too narrow for the y kernel.
