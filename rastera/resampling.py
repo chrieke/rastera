@@ -666,9 +666,12 @@ def _coarse_grid_transform(
 
     src_col, src_row = _along_rows(temp_col), _along_rows(temp_row)
 
-    # Measuring costs three times the nodes' transforms, so only where the
+    # Measuring costs four times the nodes' transforms, so only where the
     # nodes' curvature says it may be needed.  On random CRS pairs and grids the
-    # measured error came within 1.25x of that estimate, hence the margin.
+    # measured error came within 1.25x of that estimate, hence the margin.  It
+    # misses where PROJ switches datum transformation at an area-of-use edge
+    # (e.g. around EPSG:27700 or 2056): a jump of J px reads as J/8, so jumps
+    # under about 0.5 px stay interpolated.
     bend = _bend(coarse_cols, coarse_rows, coarse_src_col, coarse_src_row)
     if bend <= _WARP_MAX_ERROR / 2:
         return src_col, src_row
