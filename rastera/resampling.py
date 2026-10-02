@@ -524,19 +524,15 @@ def _resample_kernel(
             )
         return (outs[0] if len(outs) == 1 else np.concatenate(outs)), covered
 
-    if coords_2d:
-        # A block of destination rows at a time: the 2-D weights and sums are
-        # (taps, rows, W) and (bands, rows, W) in float64, and over the whole
-        # grid they peaked at 49x the output for cubic.
-        out = np.empty(
-            (src_array.shape[0], dst_height, dst_width), dtype=src_array.dtype
-        )
-        covered = np.empty((dst_height, dst_width), dtype=bool)
-        for r0 in range(0, dst_height, _ROW_BLOCK):
-            rows = slice(r0, r0 + _ROW_BLOCK)
-            out[:, rows], covered[rows] = _kernel(src_col_f[rows], src_row_f[rows])
-    else:
-        out, covered = _kernel(src_col_f, src_row_f)
+    # A block of destination rows at a time: the sums are (bands, rows, W) in
+    # float64, plus (taps, rows, W) weights cross-CRS.  Over the whole grid they
+    # peaked at 15x a uint8 output same-CRS and 49x cross-CRS for cubic.
+    out = np.empty((src_array.shape[0], dst_height, dst_width), dtype=src_array.dtype)
+    covered = np.empty((dst_height, dst_width), dtype=bool)
+    for r0 in range(0, dst_height, _ROW_BLOCK):
+        rows = slice(r0, r0 + _ROW_BLOCK)
+        col_f = src_col_f[rows] if coords_2d else src_col_f
+        out[:, rows], covered[rows] = _kernel(col_f, src_row_f[rows])
     return out, None if covered.all() else covered
 
 
@@ -609,9 +605,9 @@ _WARP_GRID_STEP = 16
 # a coarse-grid cell is transformed per pixel. gdalwarp's default ``-et``.
 _WARP_MAX_ERROR = 0.125
 
-# Destination rows the kernels handle at a time.  Bounds the separable
-# accumulator's (bands, src_rows, dst_w) intermediate and the cross-CRS
-# path's 2-D weights and sums, and keeps each pass cache-resident.
+# Destination rows the kernels handle at a time.  Bounds their float64 sums,
+# the separable accumulator's (bands, src_rows, dst_w) intermediate and the
+# cross-CRS path's 2-D weights, and keeps each pass cache-resident.
 _ROW_BLOCK = 256
 
 
@@ -928,8 +924,8 @@ def _accumulate_separable(
     Equivalent to the non-separable 2-D loop in :func:`_resample_kernel`, but
     ``O(taps_x + taps_y)`` instead of ``O(taps_x · taps_y)``: convolve along
     columns into a ``(bands, src_rows, dst_w)`` intermediate, then along rows.
-    Processed in output-row blocks so the intermediate stays bounded and each
-    pass is cache-resident.
+    Handed one block of destination rows at a time, it reads only the source
+    rows their taps reach.
 
     ``base_col``/``base_row`` are 1-D ``(dst_w,)``/``(dst_h,)`` and ``wx``/``wy``
     are ``(taps, dst_w)``/``(taps, dst_h)`` (separable, same-CRS only).
@@ -945,72 +941,61 @@ def _accumulate_separable(
     dst_w = base_col.shape[0]
     dst_h = base_row.shape[0]
 
-    # Per-x-tap source columns (edge-clamped) and in-bounds, reused per block.
+    # Per-x-tap source columns (edge-clamped) and in-bounds.
     safe_cols = [np.clip(base_col + dx, 0, w - 1) for dx in x_offsets]
     inb_cols = [(base_col + dx >= 0) & (base_col + dx < w) for dx in x_offsets]
 
-    acc_val = np.empty((n_bands, dst_h, dst_w), dtype=np.float64)
-    acc_wt = np.empty((dst_h, dst_w), dtype=np.float64) if nodata is not None else None
+    # Only the source rows the y-taps reach, clamped into the source.  A tap
+    # outside them is outside the source too, so on this slice the edge clamp
+    # and the in-bounds test below give the same answer as on the full source.
+    smin = int(np.clip(int(base_row.min()) + y_offsets[0], 0, h - 1))
+    smax = int(np.clip(int(base_row.max()) + y_offsets[-1], 0, h - 1))
+    src_blk = src_array[:, smin : smax + 1, :]
+    br = base_row - smin
+    nrows = smax - smin + 1
 
-    # Source-pixel validity (all bands non-nodata), shared by every block.
+    acc_wt: np.ndarray | None = None
     valid_src: np.ndarray | None = None
     if nodata is not None:
+        # Source-pixel validity (all bands non-nodata).
         if nodata_is_nan:
-            valid_src = np.asarray(~np.isnan(src_array).any(axis=0))
+            valid_src = np.asarray(~np.isnan(src_blk).any(axis=0))
         else:
-            valid_src = np.asarray(~(src_array == nodata).any(axis=0))
-
-    for r0 in range(0, dst_h, _ROW_BLOCK):
-        r1 = min(r0 + _ROW_BLOCK, dst_h)
-        br = base_row[r0:r1]
-        # Source-row span this block touches (clamped into [0, h-1]).
-        smin = int(np.clip(int(br.min()) + y_offsets[0], 0, h - 1))
-        smax = int(np.clip(int(br.max()) + y_offsets[-1], 0, h - 1))
-        nrows = smax - smin + 1
-
-        if nodata is not None:
-            assert valid_src is not None and acc_wt is not None
-            vs_blk = valid_src[smin : smax + 1]  # (nrows, w)
-            # Zero out invalid (incl. NaN) source values before the multiply.
-            # A typed zero keeps the source dtype; a 0.0 fill would promote an
-            # integer block to float64, 8x the size of a uint8 one.
-            ms_blk = np.where(
-                vs_blk, src_array[:, smin : smax + 1, :], src_array.dtype.type(0)
-            )
-            # Pass 1 (columns): masked-value numerator + valid-weight denom.
-            inter_num = np.zeros((n_bands, nrows, dst_w), dtype=np.float64)
-            inter_den = np.zeros((nrows, dst_w), dtype=np.float64)
-            for j in range(len(x_offsets)):
-                weff = wx[j] * inb_cols[j]  # (dst_w,)
-                inter_num += ms_blk[:, :, safe_cols[j]] * weff
-                inter_den += vs_blk[:, safe_cols[j]] * weff
-            # Pass 2 (rows).
-            val_blk = np.zeros((n_bands, r1 - r0, dst_w), dtype=np.float64)
-            wt_blk = np.zeros((r1 - r0, dst_w), dtype=np.float64)
-            for i, dy in enumerate(y_offsets):
-                src_row_idx = br + dy
-                sr = np.clip(np.clip(src_row_idx, 0, h - 1) - smin, 0, nrows - 1)
-                weff_y = wy[i][r0:r1] * ((src_row_idx >= 0) & (src_row_idx < h))
-                val_blk += inter_num[:, sr, :] * weff_y[None, :, None]
-                wt_blk += inter_den[sr, :] * weff_y[:, None]
-            acc_val[:, r0:r1, :] = val_blk
-            acc_wt[r0:r1, :] = wt_blk
-        else:
-            src_blk = src_array[:, smin : smax + 1, :]
-            inter = np.zeros((n_bands, nrows, dst_w), dtype=np.float64)
-            for j in range(len(x_offsets)):
-                inter += src_blk[:, :, safe_cols[j]] * wx[j]
-            val_blk = np.zeros((n_bands, r1 - r0, dst_w), dtype=np.float64)
-            for i, dy in enumerate(y_offsets):
-                sr = np.clip(np.clip(br + dy, 0, h - 1) - smin, 0, nrows - 1)
-                val_blk += inter[:, sr, :] * wy[i][r0:r1][None, :, None]
-            acc_val[:, r0:r1, :] = val_blk
+            valid_src = np.asarray(~(src_blk == nodata).any(axis=0))
+        # Zero out invalid (incl. NaN) source values before the multiply.
+        # A typed zero keeps the source dtype; a 0.0 fill would promote an
+        # integer block to float64, 8x the size of a uint8 one.
+        ms_blk = np.where(valid_src, src_blk, src_array.dtype.type(0))
+        # Pass 1 (columns): masked-value numerator + valid-weight denom.
+        inter_num = np.zeros((n_bands, nrows, dst_w), dtype=np.float64)
+        inter_den = np.zeros((nrows, dst_w), dtype=np.float64)
+        for j in range(len(x_offsets)):
+            weff = wx[j] * inb_cols[j]  # (dst_w,)
+            inter_num += ms_blk[:, :, safe_cols[j]] * weff
+            inter_den += valid_src[:, safe_cols[j]] * weff
+        # Pass 2 (rows).
+        acc_val = np.zeros((n_bands, dst_h, dst_w), dtype=np.float64)
+        acc_wt = np.zeros((dst_h, dst_w), dtype=np.float64)
+        for i, dy in enumerate(y_offsets):
+            src_row_idx = br + dy
+            sr = np.clip(src_row_idx, 0, nrows - 1)
+            weff_y = wy[i] * ((src_row_idx >= 0) & (src_row_idx < nrows))
+            acc_val += inter_num[:, sr, :] * weff_y[None, :, None]
+            acc_wt += inter_den[sr, :] * weff_y[:, None]
+    else:
+        inter = np.zeros((n_bands, nrows, dst_w), dtype=np.float64)
+        for j in range(len(x_offsets)):
+            inter += src_blk[:, :, safe_cols[j]] * wx[j]
+        acc_val = np.zeros((n_bands, dst_h, dst_w), dtype=np.float64)
+        for i, dy in enumerate(y_offsets):
+            sr = np.clip(br + dy, 0, nrows - 1)
+            acc_val += inter[:, sr, :] * wy[i][None, :, None]
 
     per_dim_ok: np.ndarray | None = None
     if nodata is not None and method == "cubic":
         assert valid_src is not None
         per_dim_ok = _separable_cubic_per_dim_ok(
-            valid_src, base_row, safe_cols, inb_cols, x_offsets, y_offsets, h, w
+            valid_src, br, safe_cols, inb_cols, x_offsets, y_offsets, nrows, w
         )
     return acc_val, acc_wt, per_dim_ok
 
