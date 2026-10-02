@@ -1366,6 +1366,10 @@ def _compile_lut(arg_text: str, *, src_nodata: int, dst_nodata: int) -> np.ndarr
         raise ValueError("LUT control points must be non-decreasing in x")
     grid = np.arange(_LUT_SIZE, dtype=np.float64)
     interp = np.interp(grid, xs_arr, ys_arr)
+    # At a repeated x, np.interp returns the last y and GDAL the first.
+    first = np.searchsorted(xs_arr, grid, side="left")
+    at_x = xs_arr[np.minimum(first, xs_arr.size - 1)] == grid
+    interp[at_x] = ys_arr[first[at_x]]
     lut = np.clip(np.floor(interp + 0.5), 0, 255).astype(np.uint8)
     if 0 <= src_nodata < _LUT_SIZE:
         lut[src_nodata] = np.uint8(dst_nodata)

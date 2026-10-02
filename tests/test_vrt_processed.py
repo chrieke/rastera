@@ -121,6 +121,16 @@ class TestCompileLut:
         lut = _compile_lut("0.0:0,2.0:1,4.0:2,6.0:3", src_nodata=0, dst_nodata=0)
         assert [int(lut[v]) for v in (1, 3, 5)] == [1, 2, 3]
 
+    def test_repeated_x_takes_the_first_y_like_gdal(self):
+        """Checked against GDAL 3.12: an input at a repeated x maps to the
+        first y, and inputs past it interpolate from the last."""
+        lut = _compile_lut(
+            "0:0,10:50,10:200,15:210,15:220,15:230,20:255",
+            src_nodata=-1,
+            dst_nodata=0,
+        )
+        assert [int(lut[v]) for v in (9, 10, 11, 15, 16)] == [45, 50, 202, 210, 235]
+
     def test_rejects_decreasing_x(self):
         with pytest.raises(ValueError, match="non-decreasing"):
             _compile_lut("100.0:1,50.0:2", src_nodata=0, dst_nodata=0)
