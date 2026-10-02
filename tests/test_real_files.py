@@ -8,6 +8,7 @@ own reads of them; ``data/make_fixtures.py`` rebuilds both.
 """
 
 import math
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -113,6 +114,45 @@ class TestReads:
         )
         arr = await rastera.merge(
             [a, b],
+            bbox=(600000, 5100000, 600560, 5100320),
+            bbox_crs=32632,
+            target_resolution=10,
+            mosaic_method="last",
+        )
+        np.testing.assert_array_equal(_data(arr), REF["mosaic_last"])
+
+
+class TestLocalPaths:
+    """async-tiff percent-encodes the key it passes its own store, and that
+    store looked for the encoded name on disk: ``ü`` as ``%C3%BC``."""
+
+    @pytest.mark.parametrize("name", ["ü", "a~b", "a%b", "a#b", "a?b", "a[b]"])
+    async def test_special_characters_in_folder_and_file_names(
+        self, name: str, tmp_path: Path
+    ):
+        f = tmp_path / name / f"{name}.tif"
+        f.parent.mkdir()
+        shutil.copy(DATA / "u16.tif", f)
+        arr = await (await rastera.open(f, cache=False)).read()
+        np.testing.assert_array_equal(_data(arr), REF["u16"])
+
+    async def test_a_percent_escape_in_a_name_is_read_as_written(self, tmp_path: Path):
+        """x%20y.tif was looked for as x%2520y.tif, so that file was read."""
+        shutil.copy(DATA / "u16.tif", tmp_path / "x%20y.tif")
+        shutil.copy(DATA / "f32.tif", tmp_path / "x%2520y.tif")
+        ds = await rastera.open(tmp_path / "x%20y.tif", cache=False)
+        assert ds.profile["dtype"] == "uint16"
+
+    async def test_a_list_across_folders_merges(self, tmp_path: Path):
+        """The list shares one store at the filesystem root, so the folder
+        names are part of every key."""
+        a, b = tmp_path / "ü" / "tile_a.tif", tmp_path / "a#b" / "tile_b.tif"
+        for f in (a, b):
+            f.parent.mkdir()
+            shutil.copy(DATA / f.name, f)
+        srcs = await rastera.open([a, b], cache=False)
+        arr = await rastera.merge(
+            srcs,
             bbox=(600000, 5100000, 600560, 5100320),
             bbox_crs=32632,
             target_resolution=10,
