@@ -866,7 +866,11 @@ def _accumulate_separable(
             assert valid_src is not None and acc_wt is not None
             vs_blk = valid_src[smin : smax + 1]  # (nrows, w)
             # Zero out invalid (incl. NaN) source values before the multiply.
-            ms_blk = np.where(vs_blk, src_array[:, smin : smax + 1, :], 0.0)
+            # A typed zero keeps the source dtype; a 0.0 fill would promote an
+            # integer block to float64, 8x the size of a uint8 one.
+            ms_blk = np.where(
+                vs_blk, src_array[:, smin : smax + 1, :], src_array.dtype.type(0)
+            )
             # Pass 1 (columns): masked-value numerator + valid-weight denom.
             inter_num = np.zeros((n_bands, nrows, dst_w), dtype=np.float64)
             inter_den = np.zeros((nrows, dst_w), dtype=np.float64)
