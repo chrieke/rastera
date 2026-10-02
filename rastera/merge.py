@@ -264,14 +264,9 @@ async def _merge_reprojected(
         else _grid_for_bbox(target_bbox, res)
     )
 
-    # Find contributing COGs by intersecting bounds (in target CRS) with output
-    # bbox.
     contributing: list[tuple[AsyncGeoTIFF, BBox]] = []
     for cog in cogs:
-        assert cog._crs_epsg is not None
-        sub_bbox = target_bbox.intersect(
-            transform_bbox(_grid_bounds(cog._geotiff), cog._crs_epsg, out_crs)
-        )
+        sub_bbox = _covered_bbox(cog, target_bbox, out_crs)
         if sub_bbox is not None:
             contributing.append((cog, sub_bbox))
 
@@ -631,6 +626,37 @@ def _resolve_target_crs(
             return counts.most_common(1)[0][0]
     msg = "No CRS found in any input GeoTIFF; pass target_crs explicitly."
     raise ValueError(msg)
+
+
+def _covered_bbox(cog: AsyncGeoTIFF, target_bbox: BBox, out_crs: int) -> BBox | None:
+    """The part of *target_bbox* (in *out_crs*) that *cog* covers.
+
+    Clipped in the source CRS first, the direction ``read()`` transforms in.
+    Transforming the source's whole extent instead under-reports a wide one (a
+    continental EPSG:4326 source loses ~1 km at its edge in UTM) and fails
+    outright for a global one. The whole extent is still the fallback when
+    either transform fails: an output bbox the source CRS cannot hold (a
+    world-wide mosaic of UTM tiles), or a clip off a polar source that crosses
+    the antimeridian on its way back to EPSG:4326.
+    """
+    src_crs = cog._crs_epsg
+    assert src_crs is not None
+    src_bounds = _grid_bounds(cog._geotiff)
+    try:
+        in_src = transform_bbox(target_bbox, out_crs, src_crs)
+        # A wide output bbox comes back short in the source CRS too, by up to
+        # ~0.5% of its size, which would cut a tile on its edge. The margin is
+        # free: the result is cut back to target_bbox below.
+        dx, dy = in_src.width * 0.05, in_src.height * 0.05
+        clipped = BBox(
+            in_src.minx - dx, in_src.miny - dy, in_src.maxx + dx, in_src.maxy + dy
+        ).intersect(src_bounds)
+        if clipped is None:
+            return None
+        covered = transform_bbox(clipped, src_crs, out_crs)
+    except ValueError:
+        covered = transform_bbox(src_bounds, src_crs, out_crs)
+    return target_bbox.intersect(covered)
 
 
 async def _read_or_skip(
