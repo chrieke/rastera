@@ -145,13 +145,10 @@ class AsyncGeoTIFF:
         is a hair coarser than its factor, 20.009 m for 2301 px at 10 m, and an
         exact comparison skipped it at the very targets overviews serve.
 
-        None when ``self.overviews`` is empty, as the VRT and DIMAP datasets
-        leave it: a band-stack VRT's ``_geotiff`` is its first source's, whose
-        pyramid the other sources need not share. The levels themselves come
-        off ``_geotiff``, since ``self.overviews`` holds only their sizes.
+        Reads the pyramid off ``_geotiff``, not ``self.overviews``: this needs
+        readable ``Overview`` objects, while ``self.overviews`` holds (width,
+        height) pairs and is emptied by both VRT flavours.
         """
-        if not self.overviews:
-            return None
         gt = self._geotiff
         # The largest factor each axis allows; the slack absorbs float noise in
         # an exact request such as 20 m from 10 m.
@@ -287,9 +284,9 @@ class AsyncGeoTIFF:
                 resampled one can overhang the bbox by up to a pixel.
             use_overviews: Read the coarsest COG overview level no coarser
                 than *target_resolution*, to save bandwidth. Ignored without
-                one, and on a VRT or DIMAP, which list no levels. Overview
-                pixels are the writer's resampled aggregates, not the stored
-                measurements.
+                one. A VRT or DIMAP raises ``NotImplementedError``, since its
+                sources' pyramids need not match. Overview pixels are the
+                writer's resampled aggregates, not the stored measurements.
             resampling: ``"nearest"`` (default), ``"bilinear"`` or
                 ``"cubic"``, as gdalwarp; see
                 :func:`rastera.resampling.resample`. A file with an internal

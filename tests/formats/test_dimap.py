@@ -955,6 +955,20 @@ class TestDIMAPRead:
         np.testing.assert_array_equal(data[0, :, :50], 42)  # inside mosaic
         np.testing.assert_array_equal(data[0, :, 50:], 0)  # nodata fill
 
+    async def test_read_rejects_use_overviews(self):
+        """DIMAP per-tile overviews cannot safely mix across tiles; the
+        public ``read`` must refuse rather than silently produce shape-
+        mismatched output."""
+        ds = self._make_ds(
+            lambda g, r, c: _mock_tile_ds(
+                lambda bands, w: np.zeros(
+                    (len(bands), w.height, w.width), dtype=np.uint16
+                )
+            )
+        )
+        with pytest.raises(NotImplementedError, match="use_overviews"):
+            await ds.read(use_overviews=True)
+
     async def test_read_native_rejects_overview(self):
         ds = self._make_ds(
             lambda g, r, c: _mock_tile_ds(
