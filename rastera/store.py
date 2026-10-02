@@ -60,7 +60,9 @@ from obstore.store import from_url as obstore_from_url
 
 _DEFAULT_REGION = "us-west-2"
 
-_AWS_SUFFIX = r"amazonaws\.com(?:\.cn)?"
+# Not ``.com.cn``: obstore sends a China-region bucket to the ``.com`` endpoint,
+# so those hosts are read over plain HTTP like any other.
+_AWS_SUFFIX = r"amazonaws\.com"
 _AWS_REGION = r"[a-z]{2}(?:-[a-z]+)+-\d+"
 # Anchored on the host alone: a substring search also matches a region spelled
 # out in an attacker-controlled path segment.
