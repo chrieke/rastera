@@ -51,7 +51,7 @@ from .store import (
 
 # LRU cache for parsed GeoTIFF objects, keyed by URI (see ``_cache_key``).
 # Avoids re-fetching headers on repeated opens of the same file.
-_CacheKey = str | tuple[str, int, int]
+_CacheKey = str | tuple[str, int, int, int, int]
 _geotiff_cache: OrderedDict[_CacheKey, GeoTIFF] = OrderedDict()
 _cache_max_size: int = 128
 
@@ -1254,10 +1254,12 @@ def _cache_get(key: _CacheKey) -> GeoTIFF | None:
 def _cache_key(uri: str) -> _CacheKey | None:
     """Where *uri*'s header is cached, or ``None`` when it cannot be.
 
-    A local file is keyed on its resolved path, modification time and size,
-    so a file rewritten in place, or a relative path opened again from another
-    directory, misses. A remote URI is keyed as given: checking that would cost
-    a request per open, which is what the cache saves.
+    A local file is keyed on its resolved path, modification and change times,
+    inode and size, so a file rewritten in place, or a relative path opened
+    again from another directory, misses. The change time catches a rewrite
+    that restores the modification time, as ``cp -p`` and ``tar -x`` do. A
+    remote URI is keyed as given: checking that would cost a request per open,
+    which is what the cache saves.
     """
     path = _resolve_local_path(uri)
     if path is None:
@@ -1266,7 +1268,7 @@ def _cache_key(uri: str) -> _CacheKey | None:
         st = path.stat()
     except OSError:
         return None  # the open itself says why
-    return (str(path), st.st_mtime_ns, st.st_size)
+    return (str(path), st.st_mtime_ns, st.st_ctime_ns, st.st_ino, st.st_size)
 
 
 def _source_store(

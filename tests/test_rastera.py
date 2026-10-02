@@ -1508,6 +1508,21 @@ class TestLRUCache:
 
     @patch("rastera.reader.GeoTIFF")
     @patch("rastera.store.obstore_from_url")
+    async def test_a_rewrite_that_restores_the_mtime_is_read_again(
+        self, mock_from_url: Any, mock_geotiff_cls: Any, tmp_path: Path
+    ):
+        """As ``cp -p`` and ``tar -x`` leave it: same size, same mtime."""
+        first, second = self._headers(mock_geotiff_cls)
+        f = tmp_path / "out.tif"
+        f.write_bytes(b"v1")
+        mtime = f.stat().st_mtime_ns
+        assert (await AsyncGeoTIFF.open(str(f)))._geotiff is first
+        f.write_bytes(b"v2")
+        os.utime(f, ns=(f.stat().st_atime_ns, mtime))
+        assert (await AsyncGeoTIFF.open(str(f)))._geotiff is second
+
+    @patch("rastera.reader.GeoTIFF")
+    @patch("rastera.store.obstore_from_url")
     async def test_a_relative_path_is_keyed_where_it_resolves(
         self,
         mock_from_url: Any,
