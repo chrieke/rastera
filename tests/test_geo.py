@@ -16,6 +16,7 @@ from rastera.geo import (
     ensure_bbox,
     normalize_band_indices,
     transform_bbox,
+    unsnapped_window,
     validate_resolution,
     window_from_bbox,
 )
@@ -212,7 +213,7 @@ class TestWindow:
         # so the rounded window has zero width and window_from_bbox must raise.
         p = make_meta()
         with pytest.raises(WindowOutOfRangeError, match="does not intersect"):
-            window_from_bbox(p, BBox(999.9, 0, 1000.0, 1000), snap_to_grid=False)  # type: ignore[reportArgumentType]
+            unsnapped_window(p, BBox(999.9, 0, 1000.0, 1000))  # type: ignore[reportArgumentType]
 
     def test_from_bbox_subpixel_overlap_snaps_to_whole_pixel(self):
         p = make_meta()
@@ -267,15 +268,17 @@ class TestWindow:
         p = make_meta()  # 100x100 at 10 m/px, x in [0, 1000]
         # x 8-20 spans columns 0.8-2.0: column 1 is wholly inside the bbox.
         bbox = BBox(8, 990, 20, 1000)
-        assert window_from_bbox(p, bbox, snap_to_grid=False).width == 1  # type: ignore[reportArgumentType]
+        assert unsnapped_window(p, bbox)[0].width == 1  # type: ignore[reportArgumentType]
         assert window_from_bbox(p, bbox).width == 2  # type: ignore[reportArgumentType]
 
-    def test_snapped_keeps_last_column_at_image_edge(self):
-        """The merge-seam case: clipping the far edge to the image and then
-        rounding the span drops the image's final column."""
+    def test_snapped_keeps_both_edge_columns(self):
+        """The merge-seam case: clipped to the image the bbox spans 99.2
+        columns, which an unsnapped read rounds to 99 pixels. It drops column
+        0, the one farthest from its label; snapping keeps all 100."""
         p = make_meta()
         bbox = BBox(8, 0, 1500, 1000)  # 99.2 px, running past the right edge
-        assert window_from_bbox(p, bbox, snap_to_grid=False).width == 99  # type: ignore[reportArgumentType]
+        w, _, cols = unsnapped_window(p, bbox)  # type: ignore[reportArgumentType]
+        assert (w.col_off, w.width, len(cols)) == (1, 99, 99)
         w = window_from_bbox(p, bbox)  # type: ignore[reportArgumentType]
         assert w.col_off == 0 and w.width == 100
 

@@ -166,6 +166,10 @@ def snapped_grid_for_bbox(
     return transform, max(1, col_max - col_min), max(1, row_max - row_min)
 
 
+# Source rows or columns, as :func:`unsnapped_window` returns them.
+Picks = np.ndarray[Any, np.dtype[np.intp]]
+
+
 class WindowOutOfRangeError(ValueError):
     """A read names no readable pixels.
 
@@ -175,66 +179,53 @@ class WindowOutOfRangeError(ValueError):
 
 
 def window_from_bbox(
-    meta: HasTransform,
-    bbox: BBox | tuple[float, float, float, float],
-    *,
-    snap_to_grid: bool = True,
+    meta: HasTransform, bbox: BBox | tuple[float, float, float, float]
 ) -> Window:
-    """Return the pixel window for a world-space bbox.
+    """Return the pixel window for a world-space bbox, rounded outward onto the
+    source grid.
 
-    ``snap_to_grid=True`` (default) rounds outward onto the source grid, so the
-    window never holds fewer pixels than *bbox* covers — one short leaves a row
-    or column with nothing behind it. ``False`` gives ``round(span)`` pixels
-    like rasterio, for callers that re-anchor the transform on *bbox*.
+    The window never holds fewer pixels than *bbox* covers — one short leaves
+    a row or column with nothing behind it. :func:`unsnapped_window` is the
+    ``snap_to_grid=False`` counterpart.
     """
-    bbox = ensure_bbox(bbox)
-    inv = ~meta.transform
-    # All four corners, as rasterio's from_bounds takes them: on a rotated grid
-    # each one can set an edge of the pixel envelope.
-    corners = [
-        _affine_apply(inv, x, y)
-        for x in (bbox.minx, bbox.maxx)
-        for y in (bbox.miny, bbox.maxy)
-    ]
-    cols = [c for c, _ in corners]
-    rows = [r for _, r in corners]
-
-    # The interval is clipped to the image first.  Clamping only the offset
-    # (`max(0, floor(lo))`) leaves the span positive for a bbox lying entirely
-    # left of or above the image, which yields a plausible window over the wrong
-    # pixels.  For a bbox inside the image the clip is a no-op, so the sizing
-    # rules below are unaffected.
-    col_lo = max(0.0, min(cols))
-    col_hi = min(float(meta.width), max(cols))
-    row_lo = max(0.0, min(rows))
-    row_hi = min(float(meta.height), max(rows))
-
-    if col_hi <= col_lo or row_hi <= row_lo:
-        raise WindowOutOfRangeError("BBox does not intersect image")
-
-    if snap_to_grid:
-        # A bare ceil would buy a whole extra column off ~transform's ULP error;
-        # the else branch takes a difference, which cancels it.
-        col_lo, col_hi = _denoise(col_lo), _denoise(col_hi)
-        row_lo, row_hi = _denoise(row_lo), _denoise(row_hi)
-        col_off, row_off = math.floor(col_lo), math.floor(row_lo)
-        # col_hi/row_hi are already clipped to the image, so ceil stays in range.
-        width = math.ceil(col_hi) - col_off
-        height = math.ceil(row_hi) - row_off
-    else:
-        # rasterio passes float windows to GDALRasterIOEx (e.g. offset=5539.5,
-        # height=1800.6); GDAL starts at floor(offset) and produces round(span)
-        # pixels.  Replicating it makes native reads match rasterio's shape AND
-        # pixel values (confirmed RMSE=0).
-        col_off, row_off = math.floor(col_lo), math.floor(row_lo)
-        width = min(meta.width, col_off + math.floor(col_hi - col_lo + 0.5)) - col_off
-        height = min(meta.height, row_off + math.floor(row_hi - row_lo + 0.5)) - row_off
-
-    # Sub-pixel sliver: the bbox overlaps but rounds to nothing.
+    col_lo, col_hi, row_lo, row_hi = _clipped_pixel_bounds(meta, bbox)
+    # A bare ceil would buy a whole extra column off ~transform's ULP error.
+    col_lo, col_hi = _denoise(col_lo), _denoise(col_hi)
+    row_lo, row_hi = _denoise(row_lo), _denoise(row_hi)
+    col_off, row_off = math.floor(col_lo), math.floor(row_lo)
+    # col_hi/row_hi are already clipped to the image, so ceil stays in range.
+    width = math.ceil(col_hi) - col_off
+    height = math.ceil(row_hi) - row_off
+    # A sliver within float noise of a pixel edge denoises to nothing.
     if width <= 0 or height <= 0:
         raise WindowOutOfRangeError("BBox does not intersect image")
-
     return Window(col_off=col_off, row_off=row_off, width=width, height=height)
+
+
+def unsnapped_window(
+    meta: HasTransform, bbox: BBox | tuple[float, float, float, float]
+) -> tuple[Window, Picks, Picks]:
+    """The pixels a ``snap_to_grid=False`` read returns, picked as rasterio does.
+
+    ``rasterio.read(window=from_bounds(...))`` passes GDAL the fractional
+    window and a buffer of ``round(span)`` pixels. GDAL fills it by nearest
+    neighbour (``GDALRasterBand::IRasterIO``): pixel k takes source index
+    ``int(off + (k + 0.5) * span / n + 1e-10)``. The step is ``span / n``, not
+    1, so unless the span is whole pixels one row or column repeats or drops
+    out.
+
+    Returns the window to fetch, then the rows and columns to take from it.
+    """
+    col_lo, col_hi, row_lo, row_hi = _clipped_pixel_bounds(meta, bbox)
+    rows = _nearest_picks(row_lo, row_hi)
+    cols = _nearest_picks(col_lo, col_hi)
+    window = Window(
+        col_off=int(cols[0]),
+        row_off=int(rows[0]),
+        width=int(cols[-1] - cols[0]) + 1,
+        height=int(rows[-1] - rows[0]) + 1,
+    )
+    return window, rows - rows[0], cols - cols[0]
 
 
 def compute_paste_slices(
@@ -327,6 +318,48 @@ def transform_bbox(
             f"covers it. Split the request at the antimeridian."
         )
     return BBox(float(minx), float(miny), float(maxx), float(maxy))
+
+
+def _clipped_pixel_bounds(
+    meta: HasTransform, bbox: BBox | tuple[float, float, float, float]
+) -> tuple[float, float, float, float]:
+    """*bbox* in fractional pixels, ``(col_lo, col_hi, row_lo, row_hi)``,
+    clipped to the image."""
+    bbox = ensure_bbox(bbox)
+    inv = ~meta.transform
+    # All four corners, as rasterio's from_bounds takes them: on a rotated grid
+    # each one can set an edge of the pixel envelope.
+    corners = [
+        _affine_apply(inv, x, y)
+        for x in (bbox.minx, bbox.maxx)
+        for y in (bbox.miny, bbox.maxy)
+    ]
+    cols = [c for c, _ in corners]
+    rows = [r for _, r in corners]
+
+    # Clipped as an interval: clamping only the offset (`max(0, floor(lo))`)
+    # leaves the span positive for a bbox lying entirely left of or above the
+    # image, which yields a plausible window over the wrong pixels.
+    col_lo = max(0.0, min(cols))
+    col_hi = min(float(meta.width), max(cols))
+    row_lo = max(0.0, min(rows))
+    row_hi = min(float(meta.height), max(rows))
+
+    if col_hi <= col_lo or row_hi <= row_lo:
+        raise WindowOutOfRangeError("BBox does not intersect image")
+    return col_lo, col_hi, row_lo, row_hi
+
+
+def _nearest_picks(lo: float, hi: float) -> Picks:
+    """GDAL's nearest-neighbour source indices for the fractional span
+    ``[lo, hi)`` read into ``round(hi - lo)`` pixels."""
+    n = math.floor(hi - lo + 0.5)
+    # Sub-pixel sliver: the bbox overlaps but rounds to nothing.
+    if n <= 0:
+        raise WindowOutOfRangeError("BBox does not intersect image")
+    # GDAL's own expression order; its 1e-10 settles a pick that lands on a
+    # pixel edge. The span is clipped to the image, so no pick leaves it.
+    return ((np.arange(n) + 0.5) * ((hi - lo) / n) + lo + 1e-10).astype(np.intp)
 
 
 def _affine_apply(t: Affine, x: float, y: float) -> tuple[float, float]:

@@ -14,7 +14,7 @@ from __future__ import annotations
 import asyncio
 import xml.etree.ElementTree as ET
 from collections.abc import Awaitable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 import numpy as np
@@ -28,9 +28,16 @@ from ..geo import (
     _grid_bounds,
     _require_north_up,
     ensure_bbox,
+    unsnapped_window,
     window_from_bbox,
 )
-from ..reader import AsyncGeoTIFF, MetaOverrides, _make_output_array, _source_store
+from ..reader import (
+    AsyncGeoTIFF,
+    MetaOverrides,
+    _make_output_array,
+    _source_store,
+    _take_picks,
+)
 from ..resampling import ResamplingMethod
 from ..store import _check_source_uri, _fetch_descriptor_bytes, _join_relative_uri
 
@@ -189,13 +196,18 @@ class _DIMAPDataset(AsyncGeoTIFF):
             )
 
         layout = self._layout
-        if bbox is not None and not snap_to_grid:
+        unsnapped = bbox is not None and not snap_to_grid
+        if unsnapped:
             _require_north_up(layout.transform)  # before any tile read
+        rows = cols = None
         if bbox is None and window is None:
             bbox = _grid_bounds(self._geotiff)
         if window is None:
             assert bbox is not None
-            window = window_from_bbox(self._geotiff, bbox, snap_to_grid=snap_to_grid)
+            if unsnapped:
+                window, rows, cols = unsnapped_window(self._geotiff, bbox)
+            else:
+                window = window_from_bbox(self._geotiff, bbox)
 
         if band_indices is None:
             indices_0 = list(range(len(layout.bands)))
@@ -251,30 +263,33 @@ class _DIMAPDataset(AsyncGeoTIFF):
             for i, pos in enumerate(out_positions):
                 out[pos, tr.dst_rows, tr.dst_cols] = data[i]
 
-        out_transform = layout.transform @ Affine.translation(
-            window.col_off, window.row_off
-        )
-        if bbox is not None and not snap_to_grid:
-            bbox = ensure_bbox(bbox)
-            # Clamp to the mosaic: the window was clipped to it, so anchoring
-            # on an edge the bbox overhangs would mislabel where the pixels are.
-            img = _grid_bounds(self._geotiff)
-            out_transform = Affine(
-                layout.transform.a,
-                0,
-                max(bbox.minx, img.minx),
-                0,
-                layout.transform.e,
-                min(bbox.maxy, img.maxy),
-            )
-
-        return _make_output_array(
+        result = _make_output_array(
             out,
-            out_transform,
+            layout.transform @ Affine.translation(window.col_off, window.row_off),
             window.width,
             window.height,
             self._output_geotiff_ref(self._crs_epsg),
         )
+        if unsnapped:
+            assert bbox is not None
+            if rows is not None and cols is not None:
+                result = _take_picks(result, rows, cols)
+            bbox = ensure_bbox(bbox)
+            # Clamp to the mosaic: the window was clipped to it, so anchoring
+            # on an edge the bbox overhangs would mislabel where the pixels are.
+            img = _grid_bounds(self._geotiff)
+            result = replace(
+                result,
+                transform=Affine(
+                    layout.transform.a,
+                    0,
+                    max(bbox.minx, img.minx),
+                    0,
+                    layout.transform.e,
+                    min(bbox.maxy, img.maxy),
+                ),
+            )
+        return result
 
     async def _get_tile(
         self, group_idx: int, tile_row: int, tile_col: int

@@ -12,6 +12,10 @@ from run import run_benchmarks
 
 # UTM 33N subset over Rome, inside the B03 tile's footprint.
 BBOX = "255804.0,4626619.0,274330.0,4644625.0"
+# BBOX moved 3 m east and south: the window starts at column 5582.7, row 5541.8.
+# BBOX's 5582.4 and 5541.5 round down in GDAL's nearest pick, so it alone cannot
+# tell a floor(offset) window from rasterio's read.
+BBOX_PAST_CENTRES = "255807.0,4626616.0,274333.0,4644622.0"
 
 # Synthetic 10-band, band-interleaved files with a predictor, written on first
 # run under the gitignored data dir.
@@ -36,6 +40,14 @@ SCENARIOS = [
         "name": "Read: same CRS, native resolution (bbox subset), not snapped - raster matches bbox exactly (rasterio default)",
         "mode": "read",
         "bbox": BBOX,
+        "bbox_crs": 32633,
+        "snap_to_grid": False,
+        "expect": {"max_pct_differ": 0, "max_rmse_pct": 0},
+    },
+    {
+        "name": "Read: same CRS, native resolution (bbox subset), not snapped, bbox edges past the pixel centres",
+        "mode": "read",
+        "bbox": BBOX_PAST_CENTRES,
         "bbox_crs": 32633,
         "snap_to_grid": False,
         "expect": {"max_pct_differ": 0, "max_rmse_pct": 0},

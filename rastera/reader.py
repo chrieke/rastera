@@ -16,6 +16,7 @@ from pyproj import CRS, Transformer
 
 from .geo import (
     BBox,
+    Picks,
     WindowOutOfRangeError,
     _affine_apply,
     _denoise,
@@ -29,6 +30,7 @@ from .geo import (
     normalize_band_indices,
     snapped_grid_for_bbox,
     transform_bbox,
+    unsnapped_window,
     validate_resolution,
     window_from_bbox,
 )
@@ -285,10 +287,12 @@ class AsyncGeoTIFF:
                 Without *target_resolution* the window snaps outward on the
                 source grid instead — a 1:1 copy of the stored pixels. When
                 False, the transform is anchored at ``bbox``. A native read
-                then matches its extent to within half a pixel —
-                ``rasterio.read(window=from_bounds(...))`` behaviour; a
-                resampled one is ceil-sized, so the max edges can overhang
-                ``bbox`` by up to a pixel.
+                then matches its extent to within half a pixel and returns
+                the pixels ``rasterio.read(window=from_bounds(...))`` does:
+                GDAL's nearest picks, which on a span that is not whole
+                pixels repeat or drop one row or column. A resampled one is
+                ceil-sized, so the max edges can overhang ``bbox`` by up to
+                a pixel.
 
                 Within one CRS the result is clipped to the dataset either
                 way, so a bbox reaching past the edge comes back smaller
@@ -672,14 +676,19 @@ class AsyncGeoTIFF:
         # pull every pixel in the requested window at the chosen overview
         # level; any further downsampling happens post-fetch in `resample`.
         readable = overview if overview is not None else self._geotiff
-        if bbox is not None and not snap_to_grid:
+        unsnapped = bbox is not None and not snap_to_grid
+        if unsnapped:
             _require_north_up(readable.transform)  # before any I/O
 
+        rows = cols = None
         if bbox is None and window is None:
             bbox = _grid_bounds(readable)
         if window is None:
             assert bbox is not None
-            window = window_from_bbox(readable, bbox, snap_to_grid=snap_to_grid)
+            if unsnapped:
+                window, rows, cols = unsnapped_window(readable, bbox)
+            else:
+                window = window_from_bbox(readable, bbox)
 
         # ``_GeoTIFFLike`` carries no ``read``. The datasets that synthesize
         # their ``_geotiff`` override ``_read_native``, so this is always real.
@@ -703,7 +712,10 @@ class AsyncGeoTIFF:
         # origin — rasterio's fractional-window behaviour.  Clamped to the
         # image, as the window was: an edge the bbox overhangs would otherwise
         # label the pixels somewhere they are not.
-        if bbox is not None and not snap_to_grid:
+        if unsnapped:
+            assert bbox is not None
+            if rows is not None and cols is not None:
+                result = _take_picks(result, rows, cols)
             bbox = ensure_bbox(bbox)
             res_x, res_y = readable.res
             img = _grid_bounds(readable)
@@ -1011,6 +1023,29 @@ def _make_output_array(
         _alpha_band_idx=None,
         _geotiff=geotiff,  # type: ignore[reportArgumentType]
     )
+
+
+def _take_picks(arr: RasterArray, rows: Picks, cols: Picks) -> RasterArray:
+    """The *rows* and *cols* of *arr* that :func:`~rastera.geo.unsnapped_window`
+    picked.
+
+    An axis with as many picks as pixels is left alone: picks step by 0-1 or
+    by 1-2, never both, so those are all of them, in order.
+    """
+    if (len(rows), len(cols)) == (arr.height, arr.width):
+        return arr
+    idx: tuple[Any, Any]
+    if len(rows) == arr.height:
+        idx = (slice(None), cols)
+    elif len(cols) == arr.width:
+        idx = (rows, slice(None))
+    else:
+        # One index for both axes: one axis after the other held a third
+        # full-size copy at the peak.
+        idx = (rows[:, None], cols)
+    data: np.ndarray[Any, Any] = arr.data[(slice(None), *idx)]  # type: ignore[reportUnknownMemberType]
+    mask = None if arr.mask is None else arr.mask[idx]
+    return dc_replace(arr, data=data, mask=mask, height=len(rows), width=len(cols))
 
 
 def _src_units_per_pixel(
