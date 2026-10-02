@@ -4,10 +4,7 @@ repos:
     rev: v6.0.0
     hooks:
       - id: trailing-whitespace
-        # nbformat owns notebook whitespace; let it.
-        exclude: \.ipynb$
       - id: end-of-file-fixer
-        exclude: \.ipynb$
       - id: check-yaml
       - id: check-toml
       - id: check-merge-conflict

@@ -76,7 +76,6 @@ ignore = []
 "benchmarks/**/*.py" = ["E501"]
 "tests/**/*.py" = ["E501"]
 "examples/**/*.py" = ["E501"]
-"notebooks/**/*.ipynb" = ["E501", "F821"]
 
 [tool.ruff.lint.isort]
 known-first-party = ["rastera"]
