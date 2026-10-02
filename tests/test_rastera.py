@@ -1522,6 +1522,29 @@ class TestLRUCache:
         assert (await AsyncGeoTIFF.open(str(f)))._geotiff is second
 
     @patch("rastera.reader.GeoTIFF")
+    @patch("rastera.store.from_url")
+    async def test_two_opens_of_one_uncached_uri_evict_nothing_else(
+        self, mock_from_url: Any, mock_geotiff_cls: Any
+    ):
+        """Both found the cache full when they inserted, so the second evicted
+        an entry to store a URI already there."""
+        set_cache_size(2)
+        _geotiff_cache["s3://bucket/old.tif"] = make_mock_geotiff()
+
+        async def _fetch(*args: Any, **kwargs: Any) -> Any:
+            await asyncio.sleep(0)  # both opens are past the cache lookup
+            return make_mock_geotiff()
+
+        mock_geotiff_cls.open = _fetch
+        await asyncio.gather(
+            *(
+                AsyncGeoTIFF.open("s3://bucket/new.tif", skip_signature=True)
+                for _ in range(2)
+            )
+        )
+        assert list(_geotiff_cache) == ["s3://bucket/old.tif", "s3://bucket/new.tif"]
+
+    @patch("rastera.reader.GeoTIFF")
     @patch("rastera.store.obstore_from_url")
     async def test_a_relative_path_is_keyed_where_it_resolves(
         self,

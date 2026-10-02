@@ -241,9 +241,7 @@ class AsyncGeoTIFF:
         geotiff = await GeoTIFF.open(_extract_key(uri), store=store, prefetch=prefetch)
 
         if key is not None:
-            if len(_geotiff_cache) >= _cache_max_size:
-                _geotiff_cache.popitem(last=False)
-            _geotiff_cache[key] = geotiff
+            _cache_put(key, geotiff)
 
         return cls(uri, geotiff, meta_overrides=meta_overrides)
 
@@ -1249,6 +1247,15 @@ def _cache_get(key: _CacheKey) -> GeoTIFF | None:
     if gt is not None:
         _geotiff_cache.move_to_end(key)
     return gt
+
+
+def _cache_put(key: _CacheKey, gt: GeoTIFF) -> None:
+    """Insert first, then trim: two opens of one uncached URI both land here,
+    and trimming first evicted an unrelated entry for the second."""
+    _geotiff_cache[key] = gt
+    _geotiff_cache.move_to_end(key)
+    while len(_geotiff_cache) > _cache_max_size:
+        _geotiff_cache.popitem(last=False)
 
 
 def _cache_key(uri: str) -> _CacheKey | None:
