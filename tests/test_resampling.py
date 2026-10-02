@@ -497,6 +497,44 @@ class TestResampleCubic:
         )
 
 
+# ── grids shifted by whole pixels ────────────────────────────────────────
+
+
+class TestWholePixelShift:
+    """A destination grid that is the source grid shifted by whole pixels puts
+    each kernel on one source pixel, with weight 0 on its neighbours. gdalwarp
+    copies the pixels there; the kernels spread NaN through the 0 weights and
+    cubic's ≥2-valid gate dropped one-pixel-wide lines."""
+
+    @pytest.mark.parametrize("method", ["bilinear", "cubic"])
+    def test_a_nan_block_keeps_its_size(self, method: ResamplingMethod):
+        arr = np.ones((1, 20, 20), dtype=np.float32)
+        arr[0, 5:9, 5:9] = np.nan
+        src_t = Affine(10, 0, 0, 0, -10, 200)
+        # 3 pixels left and up, plus float noise far below a pixel.
+        dst_t = Affine(10, 0, -30 + 1e-9, 0, -10, 230)
+        out = resample(arr, src_t, dst_t, 20, 20, method=method)
+        np.testing.assert_array_equal(out[:, 3:, 3:], arr[:, :17, :17])
+
+    def test_cubic_keeps_a_one_pixel_line(self):
+        arr = np.full((1, 10, 10), -9999.0, dtype=np.float32)
+        arr[0, 5, :] = 7.0
+        t = Affine(10, 0, 0, 0, -10, 100)
+        out = resample(arr, t, t, 10, 10, nodata=-9999.0, method="cubic")
+        np.testing.assert_array_equal(out, arr)
+
+    @pytest.mark.parametrize("method", ["bilinear", "cubic"])
+    def test_an_odd_downsample_still_filters(self, method: ResamplingMethod):
+        # At 3x every destination center sits on a source center as well, but
+        # the kernel is an anti-aliasing filter there, not a copy.
+        arr = np.zeros((1, 9, 9), dtype=np.float32)
+        arr[0, 4, 4] = 9.0
+        src_t = Affine(10, 0, 0, 0, -10, 90)
+        dst_t = Affine(30, 0, 0, 0, -30, 90)
+        out = resample(arr, src_t, dst_t, 3, 3, method=method)
+        assert 0 < out[0, 1, 1] < 9
+
+
 # ── separable (same-CRS) two-pass accumulator ────────────────────────────
 
 
