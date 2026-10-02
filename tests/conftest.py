@@ -174,7 +174,7 @@ def slicing_read(geotiff: Any, full: np.ndarray[Any, Any]):
         ]
         return make_raster_array(
             data,
-            geotiff.transform @ Affine.translation(window.col_off, window.row_off),
+            geotiff.transform * Affine.translation(window.col_off, window.row_off),
             geotiff,
         )
 
