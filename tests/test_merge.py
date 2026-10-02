@@ -1447,6 +1447,24 @@ def _tile(
     return cog
 
 
+class TestMergeContributors:
+    async def test_a_source_covering_only_the_snapped_margin_fills_it(self):
+        """Snapping grows the grid past the bbox. A source reaching only that
+        margin was tested against the bbox and left out, so the last column,
+        x 1000..1020 and centred in it, stayed empty."""
+        left = _tile(0, 1005, 1, scale=5.0, size=201)  # x 0..1005
+        right = _tile(1005, 1005, 2, scale=5.0, size=201)  # x 1005..2010
+        result = await merge(
+            [left, right],
+            bbox=BBox(0, 0, 1003, 100),
+            bbox_crs=32632,
+            target_resolution=20,
+        )
+        data: np.ndarray[Any, Any] = result.data  # type: ignore[reportUnknownMemberType]
+        assert result.mask is not None and result.mask.all()
+        assert (data[0, :, -1] == 2).all()
+
+
 class TestMergeFirstSkipsFilled:
     @pytest.mark.parametrize("res", [1.0, 2.0], ids=["native", "resampled"])
     async def test_a_source_whose_cells_are_filled_is_not_read(self, res: float):

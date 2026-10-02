@@ -19,6 +19,7 @@ from .geo import (
     _grid_bounds,
     _is_on_res_grid,
     _normalize_crs,
+    bounds_from_transform,
     compute_paste_slices,
     ensure_bbox,
     normalize_band_indices,
@@ -266,9 +267,12 @@ async def _merge_reprojected(
         else _grid_for_bbox(target_bbox, res)
     )
 
+    # Against the grid, not the bbox: snapping grows the grid by up to a pixel,
+    # and a source covering only that margin was left out, leaving it empty.
+    grid_bbox = bounds_from_transform(out_transform, out_w, out_h)
     contributing: list[tuple[AsyncGeoTIFF, BBox]] = []
     for cog in cogs:
-        sub_bbox = _covered_bbox(cog, target_bbox, out_crs)
+        sub_bbox = _covered_bbox(cog, grid_bbox, out_crs)
         if sub_bbox is not None:
             contributing.append((cog, sub_bbox))
 
