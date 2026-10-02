@@ -419,11 +419,6 @@ class TestProcessedRead:
         with pytest.raises(NotImplementedError, match="tile.xml has an internal mask"):
             await ds.read(target_resolution=20.0)
 
-    async def test_use_overviews_rejected(self):
-        ds, _ = _make_processed_ds()
-        with pytest.raises(NotImplementedError, match="use_overviews"):
-            await ds.read(use_overviews=True)
-
     async def test_read_native_overview_rejected(self):
         ds, _ = _make_processed_ds()
         with pytest.raises(NotImplementedError, match="overview"):

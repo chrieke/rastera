@@ -38,7 +38,6 @@ from ..reader import (
     _source_store,
     _take_picks,
 )
-from ..resampling import ResamplingMethod
 from ..store import (
     _check_source_uri,
     _fetch_descriptor_bytes,
@@ -147,37 +146,6 @@ class _DIMAPDataset(AsyncGeoTIFF):
             # _DIMAPDataset does not require a running event loop.
             assert first_tile_key is not None
             self._tiles[first_tile_key] = first_tile
-
-    # Spelled out rather than ``*args, **kwargs``: forwarding blindly left every
-    # DIMAP read untyped, so a misspelled keyword reached ``AsyncGeoTIFF.read``
-    # as a TypeError at runtime instead of being caught by the type checker.
-    async def read(
-        self,
-        bbox: BBox | tuple[float, float, float, float] | None = None,
-        bbox_crs: int | CRS | None = None,
-        window: Window | None = None,
-        band_indices: Sequence[int] | None = None,
-        target_crs: int | CRS | None = None,
-        target_resolution: float | None = None,
-        snap_to_grid: bool = True,
-        use_overviews: bool = False,
-        resampling: ResamplingMethod = "nearest",
-    ) -> RasterArray:
-        if use_overviews:
-            raise NotImplementedError(
-                "use_overviews is not supported on DIMAP datasets"
-            )
-        return await super().read(
-            bbox=bbox,
-            bbox_crs=bbox_crs,
-            window=window,
-            band_indices=band_indices,
-            target_crs=target_crs,
-            target_resolution=target_resolution,
-            snap_to_grid=snap_to_grid,
-            use_overviews=False,
-            resampling=resampling,
-        )
 
     async def _read_native(
         self,

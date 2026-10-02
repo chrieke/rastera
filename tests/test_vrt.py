@@ -23,7 +23,7 @@ from rastera.vrt import (
     _VRTBand,
     _VRTDataset,
 )
-from tests.conftest import make_mock_geotiff, make_raster_array
+from tests.conftest import make_mock_geotiff, make_raster_array, spy_read_native
 
 pytestmark = pytest.mark.usefixtures("stub_shared_store")
 
@@ -1558,12 +1558,15 @@ class TestVRTRead:
         with pytest.raises(NotImplementedError, match="overview"):
             await ds._read_native(overview=MagicMock())
 
-    async def test_read_rejects_use_overviews(self):
-        """Public read() refuses use_overviews=True — independent overview
-        selection across sources can yield mismatched shapes."""
-        ds = _make_rgbnir_ds()
-        with pytest.raises(NotImplementedError, match="use_overviews"):
-            await ds.read(use_overviews=True)
+    async def test_use_overviews_reads_full_resolution(self):
+        """Band 1's source pyramid is not the others': handed one of its levels,
+        ``_read_native`` raised, and so did a merge with use_overviews."""
+        ds = _mocked_rgbnir_ds()
+        level = make_mock_geotiff(width=10, height=10, scale=100.0)
+        cast(Any, ds._geotiff).overviews = [level]
+        calls = spy_read_native(ds)
+        await ds.read(target_resolution=100.0, use_overviews=True)
+        assert calls[0]["overview"] is None
 
     def test_count_reflects_vrt_band_count(self):
         """cog.count on a VRT must return the VRT's logical band count, not
@@ -1709,14 +1712,13 @@ class TestMergeOnVRT:
         )
         assert result.nodata == 0
 
-    async def test_merge_vrt_with_use_overviews_raises(self):
-        """use_overviews=True passes an `overview` object to `_read_native`,
-        which VRTs can't support across multiple sources."""
+    async def test_merge_vrt_with_use_overviews_reads_full_resolution(self):
+        """It picked the first source's level, which ``_read_native`` refused."""
         from rastera.geo import BBox
         from rastera.merge import merge
 
         # Natively 1.0 m/px, request 10.0 m/px to trigger the reprojected
-        # path, and give each source a coarse overview so merge selects it.
+        # path, and give each source the coarse level merge used to pick.
         vrt_a = _vrt_with_one_source(
             "s3://b/a.vrt",
             "s3://b/a.tif",
@@ -1742,15 +1744,17 @@ class TestMergeOnVRT:
             # overviews is a read-only property on the real GeoTIFF.
             vrt._band_sources[0][0]._geotiff.overviews = [ov]  # type: ignore[reportAttributeAccessIssue]
 
-        with pytest.raises(NotImplementedError, match="overview"):
-            await merge(
-                [vrt_a, vrt_b],
-                bbox=BBox(0, 0, 15, 10),
-                bbox_crs=32632,
-                target_crs=32632,
-                target_resolution=10.0,
-                use_overviews=True,
-            )
+        result = await merge(
+            [vrt_a, vrt_b],
+            bbox=BBox(0, 0, 15, 10),
+            bbox_crs=32632,
+            target_crs=32632,
+            target_resolution=10.0,
+            use_overviews=True,
+        )
+        data: np.ndarray[Any, Any] = result.data  # type: ignore[reportUnknownMemberType]
+        assert data.shape == (1, 1, 2)
+        assert data[0, 0, 0] == 1
 
 
 # ── dispatch from rastera.open ──────────────────────────────────────────────
