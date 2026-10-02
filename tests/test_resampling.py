@@ -84,15 +84,34 @@ class TestResampleNearest:
         # Some pixels should have data (1.0), some may be nodata (0)
         assert np.any(out == 1.0) or np.any(out == 0)
 
-    def test_coarse_grid_matches_brute_force(self):
+    @pytest.mark.parametrize(
+        ("src_crs", "src_t", "dst_crs", "dst_t"),
+        [
+            # Sentinel-2 in UTM 33N read into WGS84.
+            (
+                32633,
+                Affine(10, 0, 200000, 0, -10, 4700000),
+                4326,
+                Affine(0.0001, 0, 12.0, 0, -0.0001, 42.4),
+            ),
+            # A global WGS84 raster read into polar stereographic, the North
+            # Pole near a corner: longitude bends around it and jumps at 180°.
+            (
+                4326,
+                Affine(0.1, 0, -180, 0, -0.1, 90),
+                3413,
+                Affine(5000, 0, -900000, 0, -5000, 850000),
+            ),
+        ],
+    )
+    def test_coarse_grid_matches_brute_force(
+        self, src_crs: int, src_t: Affine, dst_crs: int, dst_t: Affine
+    ):
         """Coarse-grid interpolation should match per-pixel pyproj within 0.125 px."""
         from rastera.resampling import _coarse_grid_transform
 
-        # Source in UTM 33N, destination in WGS84 — realistic Sentinel-2 scenario
-        src_t = Affine(10, 0, 200000, 0, -10, 4700000)  # 10m pixels
-        dst_t = Affine(0.0001, 0, 12.0, 0, -0.0001, 42.4)
-        transformer = Transformer.from_crs(4326, 32633, always_xy=True)
-        dst_w, dst_h = 200, 200
+        transformer = Transformer.from_crs(dst_crs, src_crs, always_xy=True)
+        dst_w, dst_h = 200, 193  # the last row is a coarse-grid node row
 
         # Coarse-grid result
         col_f, row_f = _coarse_grid_transform(dst_w, dst_h, dst_t, src_t, transformer)
