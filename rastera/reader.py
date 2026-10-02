@@ -11,7 +11,7 @@ from typing import Any, Protocol, TypedDict, cast, overload
 
 import numpy as np
 from affine import Affine
-from async_geotiff import GeoTIFF, RasterArray, Window
+from async_geotiff import GeoTIFF, Overview, RasterArray, Window
 from pyproj import CRS, Transformer
 
 from .geo import (
@@ -29,6 +29,7 @@ from .geo import (
     validate_resolution,
     window_from_bbox,
 )
+from .predictor import read_window
 from .profile import RasterProfile, _build_profile
 from .resampling import (
     ResamplingMethod,
@@ -665,7 +666,7 @@ class AsyncGeoTIFF:
 
         # ``_GeoTIFFLike`` carries no ``read``. The datasets that synthesize
         # their ``_geotiff`` override ``_read_native``, so this is always real.
-        result = await cast("_Readable", readable).read(window=window)
+        result = await read_window(cast("GeoTIFF | Overview", readable), window)
 
         # rastera reads an alpha band as a plain band. The file's tag is the only
         # sign of one, and GDAL puts it on band 4 of any 4-band Byte file it

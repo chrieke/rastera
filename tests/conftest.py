@@ -7,6 +7,7 @@ import pytest
 from affine import Affine
 from async_geotiff import RasterArray
 from async_geotiff.exceptions import WindowError
+from async_tiff.enums import PlanarConfiguration
 
 # The attribute surface a real GeoTIFF offers rastera, plus ``read``. Spec'ing
 # the mock to it turns a read outside that contract into an AttributeError
@@ -17,6 +18,7 @@ _GEOTIFF_ATTRS = (
     "crs",
     "dtype",
     "height",
+    "ifd",
     "nodata",
     "overviews",
     "read",
@@ -97,6 +99,11 @@ def make_mock_geotiff(
     gt.nodata = nodata
     gt.tile_width = tile_width
     gt.tile_height = tile_height
+    gt.ifd = SimpleNamespace(
+        planar_configuration=PlanarConfiguration.Chunky,
+        predictor=None,
+        samples_per_pixel=count,
+    )
 
     gt.transform = Affine(scale, 0, origin_x, 0, -y_scale, origin_y)
     gt.res = (scale, y_scale)
