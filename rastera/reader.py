@@ -335,6 +335,13 @@ class AsyncGeoTIFF:
             raise ValueError("bbox_crs is required when bbox is provided")
         if window is not None and target_crs is not None:
             raise ValueError("Cannot combine window with target_crs")
+        # async-geotiff reads anything that is not its own Window, a rasterio
+        # Window included, as no window at all and returns the whole image.
+        if window is not None and not isinstance(window, Window):
+            raise TypeError(
+                f"window must be a rastera.Window, got "
+                f"{type(window).__module__}.{type(window).__qualname__}"
+            )
         if window is not None:
             _validate_window(gt, window)
         # ``resampling`` is checked here rather than left to ``resample()``: the

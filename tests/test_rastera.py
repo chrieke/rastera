@@ -4,6 +4,7 @@ import asyncio
 import os
 from dataclasses import replace as dc_replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
@@ -422,6 +423,14 @@ class TestReadArgumentValidation:
                 window=Window(col_off=10, row_off=0, width=10, height=10),
                 target_resolution=res,
             )
+
+    @pytest.mark.parametrize("res", [None, 2.0])
+    async def test_foreign_window_type_rejected(self, res: float | None):
+        """A rasterio Window has the same four fields, so it passed the bounds
+        check, and the native read then returned the whole image."""
+        rasterio_like = SimpleNamespace(col_off=0, row_off=0, width=4, height=4)
+        with pytest.raises(TypeError, match="must be a rastera.Window"):
+            await self._obj().read(window=rasterio_like, target_resolution=res)  # type: ignore[arg-type]
 
     @pytest.mark.parametrize("bad", [0.0, -1.0, float("nan"), float("inf")])
     async def test_bad_target_resolution_rejected(self, bad: float):
