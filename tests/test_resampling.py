@@ -339,23 +339,22 @@ class TestResampleBilinear:
         out = resample(arr, src_t, dst_t, 8, 8, nodata=nodata, method="bilinear")
         assert set(np.unique(out)) == {np.float32(-9999.9), np.float32(5.0)}
 
-    def test_a_scale_just_above_one_interpolates_plainly(self):
-        """gdalwarp rounds a downsample factor within 0.05 of a whole one. At
-        1.02 that leaves plain 2x2 interpolation, where widening the kernel by
-        1.02 blurred slightly and sampled 4x4."""
+    @pytest.mark.parametrize(
+        ("x_scale", "y_scale"), [(1.02, 1.02), (1.05, 1.05), (1.052, 0.5)]
+    )
+    def test_a_scale_just_above_one_interpolates_plainly(
+        self, x_scale: float, y_scale: float
+    ):
+        """gdalwarp rounds a downsample factor within 0.05 of a whole one, and
+        samples 2x2 while neither axis downsamples by more than 1/0.95. Up to
+        there, widening the kernel blurred slightly and sampled 4x4."""
         src = np.random.default_rng(0).uniform(0, 200, (1, 40, 40))
         st = Affine(10, 0, 0, 0, -10, 400)
-        dt = Affine(10.2, 0, 50, 0, -10.2, 350)
+        dt = Affine(10 * x_scale, 0, 50, 0, -10 * y_scale, 350)
         out = resample(src, st, dt, 30, 30, method="bilinear")
 
-        # Both axes sample at 1.02 * (i + 0.5) + 5; interpolate between the
-        # source pixel centers, which sit at j + 0.5.
-        pos = 1.02 * (np.arange(30) + 0.5) + 5 - 0.5
-        lo = np.floor(pos).astype(int)
-        w = np.zeros((30, 40))
-        w[np.arange(30), lo] = 1 - (pos - lo)
-        w[np.arange(30), lo + 1] = pos - lo
-        np.testing.assert_allclose(out[0], w @ src[0] @ w.T, rtol=0, atol=1e-9)
+        expected = _linear_weights(y_scale) @ src[0] @ _linear_weights(x_scale).T
+        np.testing.assert_allclose(out[0], expected, rtol=0, atol=1e-9)
 
     @pytest.mark.parametrize(
         ("scale", "used"),
@@ -1540,3 +1539,15 @@ class TestRealValueOnTheSentinel:
         )
         assert not (out == 0).any()
         assert (out == 1).sum() == 144
+
+
+def _linear_weights(scale: float) -> np.ndarray:
+    """Plain 2-tap interpolation weights, 30 destination by 40 source pixels,
+    for an axis sampled at ``scale * (i + 0.5) + 5``. Source pixel centers sit
+    at ``j + 0.5``."""
+    pos = scale * (np.arange(30) + 0.5) + 5 - 0.5
+    lo = np.floor(pos).astype(int)
+    w = np.zeros((30, 40))
+    w[np.arange(30), lo] = 1 - (pos - lo)
+    w[np.arange(30), lo + 1] = pos - lo
+    return w
