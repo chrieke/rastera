@@ -4,6 +4,7 @@ import asyncio
 import os
 from dataclasses import replace as dc_replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
@@ -422,6 +423,14 @@ class TestReadArgumentValidation:
                 window=Window(col_off=10, row_off=0, width=10, height=10),
                 target_resolution=res,
             )
+
+    @pytest.mark.parametrize("res", [None, 2.0])
+    async def test_foreign_window_type_rejected(self, res: float | None):
+        """A rasterio Window has the same four fields, so it passed the bounds
+        check, and the native read then returned the whole image."""
+        rasterio_like = SimpleNamespace(col_off=0, row_off=0, width=4, height=4)
+        with pytest.raises(TypeError, match="must be a rastera.Window"):
+            await self._obj().read(window=rasterio_like, target_resolution=res)  # type: ignore[arg-type]
 
     @pytest.mark.parametrize("bad", [0.0, -1.0, float("nan"), float("inf")])
     async def test_bad_target_resolution_rejected(self, bad: float):
@@ -999,9 +1008,9 @@ class TestWarpSeam:
         ("method", "pad"),
         [
             # bilinear at 2x downsample reaches 2 source px; nearest needs no
-            # kernel halo and falls back to the 1 px floor.
+            # halo in one CRS.
             ("bilinear", 20.0),
-            ("nearest", 10.0),
+            ("nearest", 0.0),
         ],
     )
     async def test_same_crs_halo_is_kernel_sized(self, method: str, pad: float):
@@ -1282,6 +1291,25 @@ class TestSouthUp:
         assert arr.mask is not None and arr.mask.all()
         np.testing.assert_array_equal(data[0], np.flipud(full[0, ::2, ::2]))
 
+    @pytest.mark.parametrize("merged", [False, True])
+    async def test_columns_running_west_are_resampled_not_copied(self, merged: bool):
+        """A negative pixel width passed the on-grid checks, and the native
+        copy then came back mirrored, labelled as running east."""
+        full = np.arange(48 * 64, dtype=np.uint16).reshape(1, 48, 64)
+        gt = make_mock_geotiff(width=64, height=48, scale=10.0, count=1)
+        gt.transform = Affine(-10, 0, 500640, 0, -10, 7000480)
+        gt.read = slicing_read(gt, full)
+        ds = AsyncGeoTIFF("s3://b/k.tif", gt)
+        bbox = (500000, 7000000, 500640, 7000480)
+        if merged:
+            arr = await rastera.merge(
+                [ds], bbox=bbox, bbox_crs=32632, target_resolution=10
+            )
+        else:
+            arr = await ds.read(bbox=bbox, bbox_crs=32632, target_resolution=10)
+        assert arr.transform == Affine(10, 0, 500000, 0, -10, 7000480)
+        np.testing.assert_array_equal(arr.data, full[:, :, ::-1])  # type: ignore[reportUnknownMemberType]
+
     async def test_rotation_noise_still_counts_as_north_up(self):
         """Real north-up files carry 1e-16 in the rotation terms; an exact
         check rejected them."""
@@ -1496,6 +1524,44 @@ class TestLRUCache:
         os.utime(f, ns=(f.stat().st_atime_ns, f.stat().st_mtime_ns + 1_000_000))
         assert (await AsyncGeoTIFF.open(str(f)))._geotiff is second
         assert mock_geotiff_cls.open.await_count == 2
+
+    @patch("rastera.reader.GeoTIFF")
+    @patch("rastera.store.obstore_from_url")
+    async def test_a_rewrite_that_restores_the_mtime_is_read_again(
+        self, mock_from_url: Any, mock_geotiff_cls: Any, tmp_path: Path
+    ):
+        """As ``cp -p`` and ``tar -x`` leave it: same size, same mtime."""
+        first, second = self._headers(mock_geotiff_cls)
+        f = tmp_path / "out.tif"
+        f.write_bytes(b"v1")
+        mtime = f.stat().st_mtime_ns
+        assert (await AsyncGeoTIFF.open(str(f)))._geotiff is first
+        f.write_bytes(b"v2")
+        os.utime(f, ns=(f.stat().st_atime_ns, mtime))
+        assert (await AsyncGeoTIFF.open(str(f)))._geotiff is second
+
+    @patch("rastera.reader.GeoTIFF")
+    @patch("rastera.store.from_url")
+    async def test_two_opens_of_one_uncached_uri_evict_nothing_else(
+        self, mock_from_url: Any, mock_geotiff_cls: Any
+    ):
+        """Both found the cache full when they inserted, so the second evicted
+        an entry to store a URI already there."""
+        set_cache_size(2)
+        _geotiff_cache["s3://bucket/old.tif"] = make_mock_geotiff()
+
+        async def _fetch(*args: Any, **kwargs: Any) -> Any:
+            await asyncio.sleep(0)  # both opens are past the cache lookup
+            return make_mock_geotiff()
+
+        mock_geotiff_cls.open = _fetch
+        await asyncio.gather(
+            *(
+                AsyncGeoTIFF.open("s3://bucket/new.tif", skip_signature=True)
+                for _ in range(2)
+            )
+        )
+        assert list(_geotiff_cache) == ["s3://bucket/old.tif", "s3://bucket/new.tif"]
 
     @patch("rastera.reader.GeoTIFF")
     @patch("rastera.store.obstore_from_url")

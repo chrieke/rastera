@@ -51,7 +51,7 @@ from .store import (
 
 # LRU cache for parsed GeoTIFF objects, keyed by URI (see ``_cache_key``).
 # Avoids re-fetching headers on repeated opens of the same file.
-_CacheKey = str | tuple[str, int, int]
+_CacheKey = str | tuple[str, int, int, int, int]
 _geotiff_cache: OrderedDict[_CacheKey, GeoTIFF] = OrderedDict()
 _cache_max_size: int = 128
 
@@ -241,9 +241,7 @@ class AsyncGeoTIFF:
         geotiff = await GeoTIFF.open(_extract_key(uri), store=store, prefetch=prefetch)
 
         if key is not None:
-            if len(_geotiff_cache) >= _cache_max_size:
-                _geotiff_cache.popitem(last=False)
-            _geotiff_cache[key] = geotiff
+            _cache_put(key, geotiff)
 
         return cls(uri, geotiff, meta_overrides=meta_overrides)
 
@@ -270,7 +268,9 @@ class AsyncGeoTIFF:
                 :class:`rastera.WindowOutOfRangeError` rather than padding —
                 unlike *bbox*, which clips. A window is an exact pixel range,
                 so overhanging one is a mistake and not a partial request.
-            band_indices: 1-based.
+            band_indices: 1-based. Each GeoTIFF read still fetches and decodes
+                all of its bands, even when they are stored apart
+                (``INTERLEAVE=BAND``); the subset is taken afterwards.
             target_resolution: Without it, a reprojecting read takes the
                 resolution gdalwarp picks: ``gdalwarp -te`` with a bbox, and
                 ``gdalwarp -t_srs`` for the whole dataset without one.
@@ -335,6 +335,13 @@ class AsyncGeoTIFF:
             raise ValueError("bbox_crs is required when bbox is provided")
         if window is not None and target_crs is not None:
             raise ValueError("Cannot combine window with target_crs")
+        # async-geotiff reads anything that is not its own Window, a rasterio
+        # Window included, as no window at all and returns the whole image.
+        if window is not None and not isinstance(window, Window):
+            raise TypeError(
+                f"window must be a rastera.Window, got "
+                f"{type(window).__module__}.{type(window).__qualname__}"
+            )
         if window is not None:
             _validate_window(gt, window)
         # ``resampling`` is checked here rather than left to ``resample()``: the
@@ -370,8 +377,9 @@ class AsyncGeoTIFF:
             # A 1:1 window copy lands on the lattice only if the source grid
             # is on it: origin on multiples of the resolution, unrotated and
             # north-up. ``needs_resample`` already matched both axes' *sizes*;
-            # the -e test here is about the y axis' *sign*, since a south-up
-            # grid's positive e can never isclose a positive resolution.
+            # the a and -e tests here are about their *signs*: a grid whose
+            # columns run west came back mirrored, and a south-up grid's
+            # positive e can never isclose a positive resolution.
             assert target_resolution is not None
             t = gt.transform
             use_native = (
@@ -379,6 +387,7 @@ class AsyncGeoTIFF:
                 and _is_on_res_grid(float(t.f), target_resolution)
                 and float(t.b) == 0
                 and float(t.d) == 0
+                and float(t.a) > 0
                 and math.isclose(target_resolution, -float(t.e))
             )
 
@@ -608,6 +617,7 @@ class AsyncGeoTIFF:
             method=resampling,
             dst_res=reach,
             src_res=(float(readable.res[0]), float(readable.res[1])),
+            reprojecting=needs_reproject,
         )
 
         native = await self._read_native(
@@ -1097,18 +1107,22 @@ def _halo_bbox(
     method: ResamplingMethod,
     dst_res: tuple[float, float],
     src_res: tuple[float, float],
+    reprojecting: bool,
 ) -> BBox:
     """Widen a source-read bbox by the reach of the resampling kernel.
 
     Sized to the output extent alone, the outermost pixels come out of a
     truncated, renormalised kernel — a biased ring, and two adjacent AOIs
     disagreeing along their shared edge. Per axis, because a kernel widened for
-    a 10x downsample in x is not wide enough for a 2x one in y. One pixel is the
-    floor: nearest needs no kernel halo, but a cross-CRS ``read_bbox`` is a
-    densified envelope, so the slack absorbs any curvature it under-states.
+    a 10x downsample in x is not wide enough for a 2x one in y. Reprojecting,
+    one pixel is the floor: nearest needs no kernel halo, but a cross-CRS
+    ``read_bbox`` is a densified envelope, so the slack absorbs any curvature
+    it under-states. In one CRS that pixel only reached into the neighbouring
+    tiles.
     """
-    pad_x = max(1, _kernel_halo(method, dst_res[0] / src_res[0])) * src_res[0]
-    pad_y = max(1, _kernel_halo(method, dst_res[1] / src_res[1])) * src_res[1]
+    floor = 1 if reprojecting else 0
+    pad_x = max(floor, _kernel_halo(method, dst_res[0] / src_res[0])) * src_res[0]
+    pad_y = max(floor, _kernel_halo(method, dst_res[1] / src_res[1])) * src_res[1]
     return BBox(
         bbox.minx - pad_x, bbox.miny - pad_y, bbox.maxx + pad_x, bbox.maxy + pad_y
     )
@@ -1242,13 +1256,24 @@ def _cache_get(key: _CacheKey) -> GeoTIFF | None:
     return gt
 
 
+def _cache_put(key: _CacheKey, gt: GeoTIFF) -> None:
+    """Insert first, then trim: two opens of one uncached URI both land here,
+    and trimming first evicted an unrelated entry for the second."""
+    _geotiff_cache[key] = gt
+    _geotiff_cache.move_to_end(key)
+    while len(_geotiff_cache) > _cache_max_size:
+        _geotiff_cache.popitem(last=False)
+
+
 def _cache_key(uri: str) -> _CacheKey | None:
     """Where *uri*'s header is cached, or ``None`` when it cannot be.
 
-    A local file is keyed on its resolved path, modification time and size,
-    so a file rewritten in place, or a relative path opened again from another
-    directory, misses. A remote URI is keyed as given: checking that would cost
-    a request per open, which is what the cache saves.
+    A local file is keyed on its resolved path, modification and change times,
+    inode and size, so a file rewritten in place, or a relative path opened
+    again from another directory, misses. The change time catches a rewrite
+    that restores the modification time, as ``cp -p`` and ``tar -x`` do. A
+    remote URI is keyed as given: checking that would cost a request per open,
+    which is what the cache saves.
     """
     path = _resolve_local_path(uri)
     if path is None:
@@ -1257,7 +1282,7 @@ def _cache_key(uri: str) -> _CacheKey | None:
         st = path.stat()
     except OSError:
         return None  # the open itself says why
-    return (str(path), st.st_mtime_ns, st.st_size)
+    return (str(path), st.st_mtime_ns, st.st_ctime_ns, st.st_ino, st.st_size)
 
 
 def _source_store(

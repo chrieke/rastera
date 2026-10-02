@@ -17,16 +17,18 @@ dotted-bucket variants::
 
 An S3 URL with a query string — presigned, or ``?versionId=`` — is read over
 plain HTTP exactly as given instead, unsigned: the rewrite would drop the
-query, and with it the signature or the version.
+query, and with it the signature or the version. ``s3://``, ``gs://`` and
+``az://`` URIs take no query or fragment.
 
 Other ``amazonaws.com`` hosts — dual-stack, transfer acceleration, FIPS, access
 points, S3 Express, VPC endpoints — are rejected. Each implies an endpoint and
 addressing style that cannot be inferred from the URL, and silently serving them
 from the standard endpoint would defeat the reason for using them.
 
-Non-AWS S3-compatible services (Wasabi, MinIO, Ceph) are read over plain HTTP,
-which works for public objects only; signed access needs an explicit
-``store=S3Store(bucket=..., endpoint=..., region=...)``.
+Every other http(s) URL, Azure Blob and non-AWS S3-compatible services (Wasabi,
+MinIO, Ceph, R2) included, is read over plain HTTP, which works for public
+objects only; signed access needs an explicit store, such as
+``store=S3Store(bucket=..., endpoint=..., region=...)``, or an ``az://`` URI.
 
 **Region** for AWS URIs, in priority order: encoded in the host, explicit
 ``region`` kwarg, ``AWS_REGION``/``AWS_DEFAULT_REGION``, the boto3 session (only
@@ -124,6 +126,13 @@ def _parse_uri(uri: str) -> ParsedURI:
         key = path.relative_to(anchor).as_posix()
         return ParsedURI(uri, "local", anchor.as_uri(), key, local_path=path)
 
+    if scheme in ("s3", "gs", "az") and (parsed.query or parsed.fragment):
+        # The key is the path alone, so ?versionId= read the current version.
+        raise ValueError(
+            f"{uri!r} has a query or fragment, which a {scheme}:// URI cannot "
+            f"carry: it would be dropped and another object read."
+        )
+
     if scheme == "s3":
         return ParsedURI(uri, "aws", f"s3://{parsed.netloc}", _path_key(parsed))
 
@@ -149,9 +158,10 @@ def _build_store_with(
     """
     parsed = _parse_uri(uri)
     kwargs = _store_kwargs_for(parsed, store_kwargs)
-    if parsed.kind == "http" and parsed.root == parsed.uri:
-        # Kept whole for its query. from_url picks the store by host, and for
-        # an S3 host that is an S3Store, which drops the query again.
+    if parsed.kind == "http":
+        # from_url picks the store by host: an S3, Azure or R2 host gets that
+        # service's store, which drops a query, and off-cloud fails asking the
+        # instance metadata endpoint for credentials.
         return http_store.from_url(parsed.root, **kwargs)
     return from_url_fn(parsed.root, **kwargs)
 
@@ -375,6 +385,12 @@ def _store_kwargs_for(
             )
         for key in _S3_ONLY_KWARGS:
             out.pop(key, None)
+        if parsed.uri.lower().startswith("http://"):
+            # Refused otherwise, as "builder error" on the first request.
+            out["client_options"] = {
+                "allow_http": True,
+                **(out.get("client_options") or {}),
+            }
         return out
 
     return out  # gs://, az:// — let obstore validate its own kwargs

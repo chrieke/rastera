@@ -195,6 +195,14 @@ class TestParseUriOther:
         with pytest.raises(ValueError, match="Unsupported URI scheme"):
             _parse_uri("ftp://host/file.tif")
 
+    @pytest.mark.parametrize(
+        "uri", ["s3://b/k.tif?versionId=v1", "gs://b/k.tif?generation=1", "az://c/k#x"]
+    )
+    def test_a_query_or_fragment_on_a_bucket_uri_raises(self, uri: str):
+        """The key is the path alone, so ?versionId= read the current version."""
+        with pytest.raises(ValueError, match="query or fragment"):
+            _parse_uri(uri)
+
 
 class TestParseUriLocal:
     def test_absolute_path(self, tmp_path: Path):
@@ -471,6 +479,12 @@ class TestStoreKwargs:
         out = _kwargs("https://cdn.example.com/f.tif", skip_signature=True)
         assert out == {}
 
+    def test_plain_http_is_allowed(self):
+        """object_store refuses http:// unless told, as "builder error" on the
+        first request."""
+        out = _kwargs("http://localhost:8000/f.tif", client_options={"timeout": "5s"})
+        assert out == {"client_options": {"allow_http": True, "timeout": "5s"}}
+
     def test_http_rejects_a_request_to_authenticate(self):
         # Silently stripping it would downgrade to an anonymous GET that only
         # fails on private objects.
@@ -519,6 +533,31 @@ class TestBuildStoreWith:
         store = build(uri)
         assert isinstance(store, http_store)
         assert uri in repr(store)
+
+    @pytest.mark.parametrize(
+        "uri",
+        [
+            "https://acct.blob.core.windows.net/container/a.tif",
+            "https://acct.r2.cloudflarestorage.com/bucket/a.tif",
+        ],
+    )
+    @pytest.mark.parametrize(
+        ("build", "http_store"),
+        [
+            (_build_store, HTTPStore),
+            (
+                lambda u: _build_store_with(u, obstore_from_url, ObstoreHTTPStore),
+                ObstoreHTTPStore,
+            ),
+        ],
+        ids=["async_tiff", "obstore"],
+    )
+    def test_a_cloud_host_over_https_gets_a_plain_http_store(
+        self, uri: str, build: Any, http_store: Any
+    ):
+        """from_url gave these hosts their service's store, which off-cloud
+        asked the instance metadata endpoint for credentials."""
+        assert isinstance(build(uri), http_store)
 
     def test_signing_a_query_string_url_names_the_query(self):
         with pytest.raises(ValueError, match="has a query string"):

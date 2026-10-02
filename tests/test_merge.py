@@ -597,7 +597,7 @@ class TestMergeReprojected:
         native_result = _make_array(native_arr, Affine(1, 0, 0, 0, -1, 10))
         cog._read_native = AsyncMock(return_value=native_result)
 
-        await merge(
+        result = await merge(
             [cog],
             bbox=BBox(0, 0, 10, 10),
             bbox_crs=32632,
@@ -606,6 +606,7 @@ class TestMergeReprojected:
             target_resolution=1.0,
         )
         cog._read_native.assert_called()
+        assert result.crs is not None and result.crs.to_epsg() == 4326
 
     async def test_merge_with_target_resolution(self):
         """target_resolution != native triggers reprojected path."""
@@ -1444,6 +1445,24 @@ def _tile(
     gt: Any = cog._geotiff
     gt.read = slicing_read(gt, full)
     return cog
+
+
+class TestMergeContributors:
+    async def test_a_source_covering_only_the_snapped_margin_fills_it(self):
+        """Snapping grows the grid past the bbox. A source reaching only that
+        margin was tested against the bbox and left out, so the last column,
+        x 1000..1020 and centred in it, stayed empty."""
+        left = _tile(0, 1005, 1, scale=5.0, size=201)  # x 0..1005
+        right = _tile(1005, 1005, 2, scale=5.0, size=201)  # x 1005..2010
+        result = await merge(
+            [left, right],
+            bbox=BBox(0, 0, 1003, 100),
+            bbox_crs=32632,
+            target_resolution=20,
+        )
+        data: np.ndarray[Any, Any] = result.data  # type: ignore[reportUnknownMemberType]
+        assert result.mask is not None and result.mask.all()
+        assert (data[0, :, -1] == 2).all()
 
 
 class TestMergeFirstSkipsFilled:

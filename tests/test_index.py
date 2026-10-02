@@ -691,3 +691,32 @@ class TestBuildIndexStore:
         # The header fetch goes through the caller's store, not a rebuilt one.
         assert mock_get_range.await_args is not None
         assert mock_get_range.await_args.args[0] is sentinel
+
+    @pytest.mark.parametrize("entry", ["build_index", "open_from_index"])
+    @patch("rastera.index._build_obstore")
+    @patch("rastera.index.AsyncGeoTIFF.open", new_callable=AsyncMock)
+    @patch("rastera.index.obstore.get_range_async", new_callable=AsyncMock)
+    async def test_a_descriptor_gets_the_store_kwargs(
+        self, mock_get_range: Any, mock_open: Any, mock_build_obs: Any, entry: str
+    ) -> None:
+        """A VRT or DIMAP fetches its descriptor with them, and without them
+        went out without the caller's region or credentials."""
+        mock_build_obs.return_value = MagicMock()
+        mock_get_range.return_value = b"\x00" * 100
+        mock_open.return_value = _make_mock_async_geotiff(uri="s3://bucket/v.vrt")
+        if entry == "build_index":
+            await build_index(["s3://bucket/v.vrt"], region="eu-north-1")
+        else:
+            gdf = _make_index_gdf(
+                [
+                    {
+                        "uri": "s3://bucket/v.vrt",
+                        "minx": 0,
+                        "miny": 0,
+                        "maxx": 1,
+                        "maxy": 1,
+                    }
+                ]
+            )
+            await open_from_index(gdf, region="eu-north-1")
+        assert mock_open.call_args.kwargs["region"] == "eu-north-1"

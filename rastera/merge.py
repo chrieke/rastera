@@ -19,6 +19,7 @@ from .geo import (
     _grid_bounds,
     _is_on_res_grid,
     _normalize_crs,
+    bounds_from_transform,
     compute_paste_slices,
     ensure_bbox,
     normalize_band_indices,
@@ -147,13 +148,15 @@ async def merge(
 
     # The native path is a straight block copy onto the snapped output grid,
     # which sits on multiples of target_resolution — exact only when every
-    # source grid is on those multiples too, north-up and square at that
-    # resolution (a negative -e can never isclose a positive resolution).
-    # Every input, not just the first: a later one with taller pixels, or
-    # south-up or rotated, went down the native path, which then refused it.
-    # Anything else is resampled.
+    # source grid is on those multiples too, north-up, running east and
+    # square at that resolution (a negative -e can never isclose a positive
+    # resolution). Every input, not just the first: a later one with taller
+    # pixels, or south-up or rotated, went down the native path, which then
+    # refused it, and one running west was pasted mirrored. Anything else is
+    # resampled.
     srcs_on_res_grid = all(
         math.isclose(target_resolution, -float(t.e))
+        and float(t.a) > 0
         and float(t.b) == 0
         and float(t.d) == 0
         and _is_on_res_grid(float(t.c), target_resolution)
@@ -264,9 +267,12 @@ async def _merge_reprojected(
         else _grid_for_bbox(target_bbox, res)
     )
 
+    # Against the grid, not the bbox: snapping grows the grid by up to a pixel,
+    # and a source covering only that margin was left out, leaving it empty.
+    grid_bbox = bounds_from_transform(out_transform, out_w, out_h)
     contributing: list[tuple[AsyncGeoTIFF, BBox]] = []
     for cog in cogs:
-        sub_bbox = _covered_bbox(cog, target_bbox, out_crs)
+        sub_bbox = _covered_bbox(cog, grid_bbox, out_crs)
         if sub_bbox is not None:
             contributing.append((cog, sub_bbox))
 

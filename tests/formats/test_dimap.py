@@ -340,6 +340,27 @@ class TestParseDIMAP:
         with pytest.raises(NotImplementedError, match="OVERLAP"):
             _parse_dimap_xml(xml)
 
+    @pytest.mark.parametrize("tag", ["OVERLAP_ROW", "OVERLAP_COL"])
+    def test_rejects_phr_overlap(self, tag: str):
+        """PHR descriptors declare overlap as <OVERLAP_ROW>/<OVERLAP_COL>.
+        Only NTILES_OVERLAP was checked, so a nonzero overlap placed every
+        tile after the first at the wrong offset."""
+        xml = _modified(
+            PNEO_DIMAP,
+            b'<NTILES_OVERLAP ncols="0" nrows="0" />',
+            f"<{tag}>4</{tag}>".encode(),
+        )
+        with pytest.raises(NotImplementedError, match=tag):
+            _parse_dimap_xml(xml)
+
+    def test_zero_phr_overlap_accepted(self):
+        xml = _modified(
+            PNEO_DIMAP,
+            b'<NTILES_OVERLAP ncols="0" nrows="0" />',
+            b"<OVERLAP_ROW>0</OVERLAP_ROW><OVERLAP_COL>0</OVERLAP_COL>",
+        )
+        _parse_dimap_xml(xml)
+
     def test_rejects_non_band_composite(self):
         xml = _modified(
             PNEO_DIMAP,
@@ -777,6 +798,10 @@ class TestDIMAPRead:
         data: np.ndarray[Any, Any] = arr.data  # type: ignore[reportUnknownMemberType]
         assert data.shape == (3, 40, 50)
         assert opened == [(0, 1, 1)]
+        # 10 columns east and 20 rows south of the mosaic's origin.
+        assert tuple(arr.transform)[:6] == pytest.approx(
+            (0.3, 0, 369516 + 3, 0, -0.3, 6447186 - 6), rel=0, abs=1e-6
+        )
 
     async def test_cross_group_band_order_preserved(self):
         """band_indices=[5, 0] selects band 6 (group 1, src_band 3) then
@@ -1552,6 +1577,35 @@ class TestTileCache:
                 await first
         assert calls == 1
         assert ds._tiles[(0, 1, 1)] is tile
+
+    async def test_a_failed_open_whose_readers_were_cancelled_is_retried(self):
+        """With every reader cancelled, none was left to drop the open from
+        _tile_tasks when it failed, so the next read got its stale error."""
+        ds = _DIMAPDataset("s3://bucket/DIM_PNEO.XML", self._layout())
+        tile = MagicMock()
+        release = asyncio.Event()
+        calls = 0
+
+        async def flaky(*_: Any, **__: Any):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                await release.wait()
+                raise OSError("transient 503")
+            return tile
+
+        with patch.object(_DIMAPDataset, "_open_tile", new=flaky):
+            reader = asyncio.ensure_future(ds._get_tile(0, 1, 1))
+            await asyncio.sleep(0)
+            open_task = ds._tile_tasks[(0, 1, 1)]
+            reader.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await reader
+            release.set()
+            with pytest.raises(OSError, match="transient"):
+                await open_task
+            assert await ds._get_tile(0, 1, 1) is tile
+        assert calls == 2
 
     def test_construction_needs_no_running_loop(self):
         """The primed first tile was held as a resolved Future, which requires a
