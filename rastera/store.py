@@ -286,6 +286,21 @@ def _check_source_uri(source_uri: str, descriptor_uri: str) -> None:
         )
 
 
+def _source_store_kwargs(
+    descriptor_uri: str, store_kwargs: dict[str, Any]
+) -> dict[str, Any]:
+    """*store_kwargs* for a descriptor's sources, with the region its host names.
+
+    A ``/vsis3/`` source becomes ``s3://``, which names no region, so a VRT read
+    from ``https://<bucket>.s3.<region>.amazonaws.com`` opened it in the default
+    region and the request failed.
+    """
+    region = _parse_uri(descriptor_uri).region
+    if region is None or "region" in store_kwargs:
+        return store_kwargs
+    return {**store_kwargs, "region": region}
+
+
 def _join_relative_uri(base_uri: str, relative: str) -> str:
     """Resolve *relative* against *base_uri*'s parent directory. Local
     paths are joined via pathlib; remote URIs via posix path normalization.

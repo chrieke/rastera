@@ -39,7 +39,12 @@ from ..reader import (
     _take_picks,
 )
 from ..resampling import ResamplingMethod
-from ..store import _check_source_uri, _fetch_descriptor_bytes, _join_relative_uri
+from ..store import (
+    _check_source_uri,
+    _fetch_descriptor_bytes,
+    _join_relative_uri,
+    _source_store_kwargs,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -367,6 +372,7 @@ async def _maybe_open_dimap(
     if b"Dimap_Document" not in xml_bytes[:2048]:
         return None
     layout = _parse_dimap_xml(xml_bytes)
+    store_kwargs = _source_store_kwargs(uri, store_kwargs)
     stores: dict[tuple[str, str | None], Any] = {}
     tile_open_kwargs: dict[str, Any] = {
         "store": store,

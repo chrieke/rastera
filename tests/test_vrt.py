@@ -942,6 +942,29 @@ class TestOpenVRT:
         assert stores[0] is stores[1] and stores[0] is not None
         stub_shared_store.assert_called_once()
 
+    async def test_vsis3_sources_take_the_region_of_an_https_vrt(
+        self, stub_shared_store: MagicMock
+    ):
+        """``/vsis3/`` names no region, so the sources were opened in us-west-2."""
+        regions: list[Any] = []
+
+        async def fake_open(uri: str, **kwargs: Any) -> AsyncGeoTIFF:
+            regions.append(kwargs.get("region"))
+            count = 3 if "rgb" in uri else 1
+            return AsyncGeoTIFF(uri, make_mock_geotiff(count=count, **_RGBNIR_DIMS))
+
+        with (
+            patch(
+                "rastera.vrt._fetch_descriptor_bytes",
+                new=AsyncMock(return_value=RGBNIR_VRT),
+            ),
+            patch.object(AsyncGeoTIFF, "open", side_effect=fake_open),
+        ):
+            await _open_vrt("https://bucket.s3.eu-north-1.amazonaws.com/v.vrt")
+
+        assert regions == ["eu-north-1", "eu-north-1"]
+        assert stub_shared_store.call_args.kwargs["region"] == "eu-north-1"
+
     @pytest.mark.parametrize("nested", ["s3://bucket/inner.vrt", "s3://bucket/DIM.XML"])
     def test_a_nested_descriptor_gets_no_store(
         self, stub_shared_store: MagicMock, nested: str

@@ -50,7 +50,12 @@ from .reader import (
     _source_store,
 )
 from .resampling import ResamplingMethod
-from .store import _check_source_uri, _fetch_descriptor_bytes, _join_relative_uri
+from .store import (
+    _check_source_uri,
+    _fetch_descriptor_bytes,
+    _join_relative_uri,
+    _source_store_kwargs,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -165,6 +170,7 @@ async def _open_vrt_checked(
     """
     xml_bytes = await _fetch_descriptor_bytes(uri, **store_kwargs)
     parsed = _parse_vrt_xml(xml_bytes, uri)
+    store_kwargs = _source_store_kwargs(uri, store_kwargs)
 
     if isinstance(parsed, _VRTProcessedSpec):
         source = await _open_vrt_source(
