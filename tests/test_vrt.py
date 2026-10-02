@@ -454,6 +454,34 @@ def _one_source_ds_over(
     )
 
 
+class TestNestedVRTNodata:
+    """An outer VRT took its nodata from the file under the inner one, not
+    from the inner VRT: a hidden one came back as the file's 0, and merge
+    pasted a neighbour over the real zeros."""
+
+    @pytest.mark.parametrize(
+        ("inner_band", "expected"),
+        [
+            ("<NoDataValue>0</NoDataValue><HideNoDataValue>1</HideNoDataValue>", None),
+            ("<NoDataValue>7</NoDataValue>", 7),
+        ],
+        ids=["hidden", "declared"],
+    )
+    async def test_it_reports_the_inner_vrts_nodata(
+        self, tmp_path: Path, inner_band: str, expected: int | None
+    ):
+        tif = Path(__file__).parent / "data" / "u16.tif"  # nodata 0
+        band = (
+            '<VRTDataset rasterXSize="96" rasterYSize="64"><VRTRasterBand '
+            'dataType="UInt16" band="1">{}<SimpleSource><SourceFilename>{}'
+            "</SourceFilename></SimpleSource></VRTRasterBand></VRTDataset>"
+        )
+        (tmp_path / "inner.vrt").write_text(band.format(inner_band, tif))
+        (tmp_path / "outer.vrt").write_text(band.format("", tmp_path / "inner.vrt"))
+        ds = await rastera.open(tmp_path / "outer.vrt", cache=False)
+        assert ds._nodata == expected
+
+
 class TestDeclaredNodata:
     """The VRT's own ``<NoDataValue>`` is honoured (the one piece of
     ``<VRTRasterBand>`` metadata that is not ignored). Band-stack VRTs over a

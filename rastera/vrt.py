@@ -214,6 +214,9 @@ class _VRTDataset(AsyncGeoTIFF):
     ):
         first = sources_map[bands[0].source_uri]
         super().__init__(uri, first._geotiff, meta_overrides=meta_overrides)
+        # The source's resolved value, not its file's: for a nested VRT those
+        # differ, and the file's 0 made merge paste over a hidden nodata.
+        self._nodata = first._nodata
         # Don't inherit the first source's pyramid: read(use_overviews=True)
         # raises here, so advertising overviews we refuse to use is misleading.
         self.overviews = []
