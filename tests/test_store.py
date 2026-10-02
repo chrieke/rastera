@@ -534,6 +534,31 @@ class TestBuildStoreWith:
         assert isinstance(store, http_store)
         assert uri in repr(store)
 
+    @pytest.mark.parametrize(
+        "uri",
+        [
+            "https://acct.blob.core.windows.net/container/a.tif",
+            "https://acct.r2.cloudflarestorage.com/bucket/a.tif",
+        ],
+    )
+    @pytest.mark.parametrize(
+        ("build", "http_store"),
+        [
+            (_build_store, HTTPStore),
+            (
+                lambda u: _build_store_with(u, obstore_from_url, ObstoreHTTPStore),
+                ObstoreHTTPStore,
+            ),
+        ],
+        ids=["async_tiff", "obstore"],
+    )
+    def test_a_cloud_host_over_https_gets_a_plain_http_store(
+        self, uri: str, build: Any, http_store: Any
+    ):
+        """from_url gave these hosts their service's store, which off-cloud
+        asked the instance metadata endpoint for credentials."""
+        assert isinstance(build(uri), http_store)
+
     def test_signing_a_query_string_url_names_the_query(self):
         with pytest.raises(ValueError, match="has a query string"):
             _build_store(

@@ -25,9 +25,10 @@ points, S3 Express, VPC endpoints — are rejected. Each implies an endpoint and
 addressing style that cannot be inferred from the URL, and silently serving them
 from the standard endpoint would defeat the reason for using them.
 
-Non-AWS S3-compatible services (Wasabi, MinIO, Ceph) are read over plain HTTP,
-which works for public objects only; signed access needs an explicit
-``store=S3Store(bucket=..., endpoint=..., region=...)``.
+Every other http(s) URL, Azure Blob and non-AWS S3-compatible services (Wasabi,
+MinIO, Ceph, R2) included, is read over plain HTTP, which works for public
+objects only; signed access needs an explicit store, such as
+``store=S3Store(bucket=..., endpoint=..., region=...)``, or an ``az://`` URI.
 
 **Region** for AWS URIs, in priority order: encoded in the host, explicit
 ``region`` kwarg, ``AWS_REGION``/``AWS_DEFAULT_REGION``, the boto3 session (only
@@ -157,9 +158,10 @@ def _build_store_with(
     """
     parsed = _parse_uri(uri)
     kwargs = _store_kwargs_for(parsed, store_kwargs)
-    if parsed.kind == "http" and parsed.root == parsed.uri:
-        # Kept whole for its query. from_url picks the store by host, and for
-        # an S3 host that is an S3Store, which drops the query again.
+    if parsed.kind == "http":
+        # from_url picks the store by host: an S3, Azure or R2 host gets that
+        # service's store, which drops a query, and off-cloud fails asking the
+        # instance metadata endpoint for credentials.
         return http_store.from_url(parsed.root, **kwargs)
     return from_url_fn(parsed.root, **kwargs)
 
