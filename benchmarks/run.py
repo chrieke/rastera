@@ -13,6 +13,8 @@ pixel apart it would measure the offset rather than the pixels. So rasterio is
 re-run on rastera's terms and only those pixels are compared — see
 :func:`check_shared_grid` for what that proves.
 
+Needs rasterio, which is not in the lockfile: ``uv pip install rasterio``.
+
 Usage (as scripts, not ``-m``: run_read/run_merge import this module as a
 sibling, which needs their own directory on sys.path):
     python benchmarks/run_read.py [--runs 5]
