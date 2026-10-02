@@ -713,6 +713,61 @@ class TestMergeReprojected:
         )
         assert sorted(built) == [(3857, 27700), (27700, 3857)]
 
+    async def test_global_source(self):
+        """Its whole extent has no bounds in UTM, so every merge raised."""
+        result = await merge(
+            [_geographic_cog(BBox(-180, -90, 180, 90), scale=1.0)],
+            bbox=BBox(400000, 5000000, 410000, 5010000),
+            bbox_crs=32632,
+            target_crs=32632,
+            target_resolution=100.0,
+        )
+        assert result.mask is not None and result.mask.all()
+
+    async def test_continental_source_keeps_its_edge(self):
+        """Its whole extent came back ~950 m short in UTM, so merge left that
+        strip along the southern edge empty."""
+        # In UTM the lat 30 edge dips lowest on the central meridian, between
+        # the points transform_bounds samples along it.
+        edge_y = Transformer.from_crs(4326, 32632, always_xy=True).transform(9, 30)[1]
+        miny = (edge_y // 100 + 1) * 100
+        result = await merge(
+            [_geographic_cog(BBox(-30, 30, 45, 72), scale=0.05)],
+            bbox=BBox(495000, miny, 505000, miny + 3000),
+            bbox_crs=32632,
+            target_crs=32632,
+            target_resolution=100.0,
+        )
+        assert result.mask is not None and result.mask.all()
+
+    async def test_world_output_from_a_utm_tile(self):
+        """A world-wide bbox has no bounds in UTM; the tile's own extent does."""
+        result = await merge(
+            [_tile(400000, 5100000, 7, scale=2000.0, size=100)],
+            bbox=BBox(-180, -80, 180, 80),
+            bbox_crs=4326,
+            target_crs=4326,
+            target_resolution=0.5,
+        )
+        assert result.mask is not None and result.mask.any()
+
+
+def _geographic_cog(bounds: BBox, scale: float) -> AsyncGeoTIFF:
+    """An EPSG:4326 source of 7 over *bounds*."""
+    width = round(bounds.width / scale)
+    height = round(bounds.height / scale)
+    cog = _make_cog(
+        width=width,
+        height=height,
+        scale=scale,
+        origin_x=bounds.minx,
+        origin_y=bounds.maxy,
+        crs=4326,
+    )
+    gt: Any = cog._geotiff
+    gt.read = slicing_read(gt, np.full((1, height, width), 7, np.uint16))
+    return cog
+
 
 # ── merge: seam between adjacent tiles ─────────────────────────────────
 

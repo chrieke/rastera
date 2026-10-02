@@ -264,14 +264,9 @@ async def _merge_reprojected(
         else _grid_for_bbox(target_bbox, res)
     )
 
-    # Find contributing COGs by intersecting bounds (in target CRS) with output
-    # bbox.
     contributing: list[tuple[AsyncGeoTIFF, BBox]] = []
     for cog in cogs:
-        assert cog._crs_epsg is not None
-        sub_bbox = target_bbox.intersect(
-            transform_bbox(_grid_bounds(cog._geotiff), cog._crs_epsg, out_crs)
-        )
+        sub_bbox = _covered_bbox(cog, target_bbox, out_crs)
         if sub_bbox is not None:
             contributing.append((cog, sub_bbox))
 
@@ -631,6 +626,28 @@ def _resolve_target_crs(
             return counts.most_common(1)[0][0]
     msg = "No CRS found in any input GeoTIFF; pass target_crs explicitly."
     raise ValueError(msg)
+
+
+def _covered_bbox(cog: AsyncGeoTIFF, target_bbox: BBox, out_crs: int) -> BBox | None:
+    """The part of *target_bbox* (in *out_crs*) that *cog* covers.
+
+    Clipped in the source CRS first, the direction ``read()`` transforms in.
+    Transforming the source's whole extent instead under-reports a wide one (a
+    continental EPSG:4326 source loses ~1 km at its edge in UTM) and fails
+    outright for a global one. The whole extent is still the fallback for an
+    output bbox the source CRS cannot hold, such as a world-wide mosaic of UTM
+    tiles.
+    """
+    src_crs = cog._crs_epsg
+    assert src_crs is not None
+    src_bounds = _grid_bounds(cog._geotiff)
+    try:
+        clipped = transform_bbox(target_bbox, out_crs, src_crs).intersect(src_bounds)
+    except ValueError:
+        clipped = src_bounds
+    if clipped is None:
+        return None
+    return target_bbox.intersect(transform_bbox(clipped, src_crs, out_crs))
 
 
 async def _read_or_skip(
