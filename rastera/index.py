@@ -99,11 +99,14 @@ async def build_index(
     async def _open_one(uri: str, hdr: bytes) -> tuple[AsyncGeoTIFF, bytes]:
         async with sem:
             try:
+                # store_kwargs too: a VRT or DIMAP fetches its descriptor with
+                # them, not through the store.
                 src = await AsyncGeoTIFF.open(
                     uri,
                     store=cached_store,
                     prefetch=prefetch,
                     cache=_resolve_local_path(uri) is None,
+                    **store_kwargs,
                 )
                 return src, hdr
             except Exception as exc:
@@ -213,6 +216,7 @@ async def open_from_index(
                 store=cached_store,
                 prefetch=prefetch,
                 cache=_resolve_local_path(uri) is None,
+                **store_kwargs,
             )
 
     opened = list(await asyncio.gather(*(_open_one(u) for u in uris)))
