@@ -751,6 +751,28 @@ class TestMergeReprojected:
         )
         assert result.mask is not None and result.mask.any()
 
+    async def test_wide_output_keeps_a_tile_on_its_edge(self):
+        """This output bbox came back ~5 km short at lat 40 in UTM, which cut
+        the strip off a tile on that edge."""
+        tile = _tile(450000, 4480000, 7, scale=1000.0, size=100)  # lat ~39.6-40.5
+
+        async def _mask(bbox: BBox) -> np.ndarray[Any, Any]:
+            result = await merge(
+                [tile],
+                bbox=bbox,
+                bbox_crs=4326,
+                target_crs=4326,
+                target_resolution=0.02,
+            )
+            assert result.mask is not None
+            return result.mask
+
+        narrow = await _mask(BBox(8, 40, 10, 41))
+        wide = await _mask(BBox(-62.5, 40, 87.5, 41))
+        assert narrow[-1].any()
+        # Both grids sit on multiples of 0.02, the narrow one 3525 columns in.
+        assert np.array_equal(wide[:, 3525 : 3525 + narrow.shape[1]], narrow)
+
 
 def _geographic_cog(bounds: BBox, scale: float) -> AsyncGeoTIFF:
     """An EPSG:4326 source of 7 over *bounds*."""
