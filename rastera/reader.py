@@ -14,6 +14,7 @@ from affine import Affine
 from async_geotiff import GeoTIFF, Overview, RasterArray, Window
 from pyproj import CRS, Transformer
 
+from .config import _gather_bounded
 from .geo import (
     BBox,
     Picks,
@@ -68,6 +69,10 @@ class AsyncGeoTIFF:
     resampling, and overview selection.
     """
 
+    # The dataset kind ``use_overviews`` raises on, set by the VRT and DIMAP
+    # datasets: their sources' pyramids need not match.
+    _use_overviews_unsupported: str | None = None
+
     def __init__(
         self,
         uri: str,
@@ -78,10 +83,8 @@ class AsyncGeoTIFF:
         self.uri = uri
         self._geotiff = geotiff
         resolved = _resolve_meta_overrides(meta_overrides)
-        # Kept apart from ``_crs_epsg``, which conflates "the caller declared
-        # this" with "the file resolved to this". ``_resolved_crs`` needs the
-        # difference: an override is the one case where reading ``geotiff.crs``
-        # is both lossy and liable to raise.
+        # Apart from ``_crs_epsg``: under an override ``geotiff.crs`` may not
+        # parse, so ``_resolved_crs`` must not read it.
         self._crs_override: int | None = resolved.get("crs")
         self._crs_epsg: int | None = (
             self._crs_override
@@ -99,13 +102,8 @@ class AsyncGeoTIFF:
         ]
 
     def _override_nodata(self, nodata: float) -> None:
-        """Replace the sentinel this dataset's *pixels* use with *nodata*.
-
-        A value this dataset's dtype cannot carry is ignored rather than
-        treated as "no nodata", which would discard a sentinel the file does
-        declare. Subclasses that wrap other datasets override this to push the
-        value down to them (see ``_VRTDataset``).
-        """
+        """Replace the sentinel this dataset's pixels use with *nodata*. One
+        the dtype cannot carry is ignored, keeping the file's own."""
         coerced = _coerce_nodata(nodata, self._geotiff.dtype)
         if coerced is not None:
             self._nodata = coerced
@@ -179,32 +177,23 @@ class AsyncGeoTIFF:
         meta_overrides: MetaOverrides | None = None,
         **store_kwargs: Any,
     ) -> AsyncGeoTIFF:
-        """Open a GeoTIFF from a URI.
-
-        Supports s3://, https://, gs://, az://, and local file paths.
+        """Open a GeoTIFF, VRT or DIMAP from a local path or an s3://,
+        https://, gs:// or az:// URI (see ``rastera.store`` for the forms).
 
         Args:
-            uri: Any URI supported by object_store
-                (s3://, https://, gs://, file://, etc.).
-            store: Optional pre-constructed store. When provided,
-                the key is extracted from the URI and used as the
-                path within the store. If no store is provided, one is
-                built for the URI's bucket or host: obstore's for a local
-                path, async-tiff's otherwise.
-            prefetch: Number of bytes to prefetch when opening the TIFF.
-            cache: When True, cache the parsed GeoTIFF object in memory so that
-                subsequent opens of the same URI skip the header fetch. A
-                local file rewritten since is read afresh; a remote object is
-                assumed unchanged until :func:`rastera.clear_cache`. A remote
-                URI is cached with the store it was first opened through, so
-                a later open with another store or other credentials reads
-                through that first one; pass ``cache=False`` where it matters.
-            meta_overrides: Optional header overrides applied at construction.
-                Currently supports ``{"crs": int | CRS}`` for TIFFs missing
-                or carrying incorrect georeferencing. Overrides always
-                replace the file's reported value.
-            **store_kwargs: Extra keyword arguments forwarded to ``from_url``
-                (e.g. ``region``, ``skip_signature``, ``request_payer``).
+            store: Optional pre-constructed store, which the URI's key is read
+                from. Without one, a store is built for the URI's bucket or
+                host.
+            prefetch: Bytes fetched with the header.
+            cache: Keep the parsed header in memory, so later opens of the URI
+                skip the fetch. A local file rewritten since is read afresh; a
+                remote object is assumed unchanged until
+                :func:`rastera.clear_cache`, and stays cached with the store it
+                was first opened through, so pass ``cache=False`` to open it
+                with other credentials.
+            meta_overrides: Optional header overrides, see ``MetaOverrides``.
+            **store_kwargs: Forwarded to ``from_url`` (e.g. ``region``,
+                ``skip_signature``, ``request_payer``).
         """
         if uri.lower().endswith(".vrt"):
             from .vrt import _open_vrt
@@ -266,81 +255,50 @@ class AsyncGeoTIFF:
         """Read image data, optionally reprojecting and resampling.
 
         Args:
-            bbox: Must be in *bbox_crs*, which must equal *target_crs* if set,
-                else the dataset CRS. Defaults to the dataset's extent,
-                clamped to ±85.0511° when reprojecting a geographic dataset to
-                Mercator, as gdalwarp does.
-            window: In full-resolution pixels. Combines with
-                *target_resolution* but not with *target_crs*. Naming pixels
-                the dataset does not have raises
-                :class:`rastera.WindowOutOfRangeError` rather than padding —
-                unlike *bbox*, which clips. A window is an exact pixel range,
-                so overhanging one is a mistake and not a partial request.
-            band_indices: 1-based. Each GeoTIFF read still fetches and decodes
-                all of its bands, even when they are stored apart
-                (``INTERLEAVE=BAND``); the subset is taken afterwards.
-            target_resolution: Without it, a reprojecting read takes the
-                resolution gdalwarp picks: ``gdalwarp -te`` with a bbox, and
-                ``gdalwarp -t_srs`` for the whole dataset without one. The
-                grid is then laid out as for a given resolution, square and
-                rounded out, so it can have a row or column more than
-                gdalwarp's, which rounds the pixel count and stretches each
-                axis's pixel size to fit.
-            snap_to_grid: When True (default) and *target_resolution* is
-                given with a bbox, the output grid is rounded outward onto
-                multiples of ``target_resolution`` — see
-                :func:`rastera.snapped_grid_for_bbox`. Transform and shape
-                are then a pure function of bbox and resolution, before the
-                clip to the dataset described below; sources
-                already on that grid are copied 1:1, anything else is
-                resampled onto it, shifting values by up to half a pixel.
-                Without *target_resolution* the window snaps outward on the
-                source grid instead — a 1:1 copy of the stored pixels. When
-                False, the transform is anchored at ``bbox``. A native read
-                then matches its extent to within half a pixel and returns
-                the pixels ``rasterio.read(window=from_bounds(...))`` does:
-                GDAL's nearest picks, which on a span that is not whole
-                pixels repeat or drop one row or column. A resampled one is
-                ceil-sized, so the max edges can overhang ``bbox`` by up to
-                a pixel.
+            bbox: In *bbox_crs*, which must equal *target_crs* if set, else the
+                dataset CRS. Defaults to the dataset's extent, clamped to
+                ±85.0511° when reprojecting a geographic dataset to Mercator,
+                as gdalwarp does.
 
-                Within one CRS the result is clipped to the dataset either
-                way, so a bbox reaching past the edge comes back smaller
-                rather than padded — ``rasterio.read``'s default, where
-                padding is ``boundless=True``. A reprojecting read is not
-                clipped, matching ``gdalwarp -te``: it returns the whole grid
-                the bbox names, and the pixels with no source behind them
-                carry the dataset's ``nodata``, or 0 where it declares none.
-                Reprojecting leaves some of those regardless, since the grid
-                is the envelope of a footprint that arrives rotated. Which
-                pixels they were is on ``RasterArray.mask`` when the dataset
-                declares no sentinel — 0 is real data in most rasters, so
-                comparing against it would blank them; when it does declare
-                one the value is in the pixels and ``as_masked()`` finds it.
-                A NaN sentinel is the exception: ``as_masked()`` compares by
-                equality, which NaN never meets, so find it with
-                ``np.isnan``.
-            use_overviews: When True, reads from pre-computed COG overview
-                levels to save bandwidth, and only when the read actually
-                changes resolution — a native-resolution or purely
-                reprojecting read ignores it, since every overview is coarser
-                than what such a read asks for. Overview pixels are resampled
-                aggregates, not original measurements — expect reduced
-                variance, dampened extremes, and altered spectral ratios
-                compared to full-resolution data. Suitable for thumbnails
-                or coarse segmentation; avoid for tasks requiring precise
-                pixel values such as spectral index computation or
-                per-pixel regression.
-            resampling: Used when reprojecting or changing resolution.
-                ``"nearest"`` (default) is fast, exact and blocky;
-                ``"bilinear"`` is smooth with no overshoot; ``"cubic"`` is
-                sharper but can overshoot the source value range. Both
-                kernels widen when downsampling, to anti-alias as GDAL's
-                warp does, and renormalize around nodata GDAL-style — see
-                :func:`rastera.resampling.resample` for the precise rules.
-                A file with an internal mask raises ``NotImplementedError``
-                here, since the warp would read the pixels it hides as data.
+                Within one CRS the result is clipped to the dataset, as
+                ``rasterio.read`` is without ``boundless``. A reprojecting read
+                returns the whole grid the bbox names, as ``gdalwarp -te``
+                does, and pixels with no source behind them get the dataset's
+                nodata, or 0 without one. ``RasterArray.mask`` marks those when
+                there is no sentinel; with one, ``as_masked()`` finds them, or
+                ``np.isnan`` for a NaN sentinel.
+            window: In full-resolution pixels. Combines with
+                *target_resolution* but not with *target_crs*. A window past
+                the dataset's edge raises :class:`rastera.WindowOutOfRangeError`
+                rather than being clipped.
+            band_indices: 1-based. Every band is still fetched and decoded, and
+                the subset taken afterwards.
+            target_resolution: Without it, a reprojecting read takes the
+                resolution gdalwarp picks (``-te`` with a bbox, ``-t_srs``
+                without). The grid is still square and rounded out, so it can
+                have a row or column more than gdalwarp's.
+            snap_to_grid: With a bbox and *target_resolution*, round the output
+                grid outward onto multiples of the resolution
+                (:func:`rastera.snapped_grid_for_bbox`), so it depends only on
+                the two. Sources already on that grid are copied, others
+                resampled onto it. Without *target_resolution* the bbox snaps
+                outward on the source grid. When False, the grid is anchored at
+                the bbox: a native read returns the pixels
+                ``rasterio.read(window=from_bounds(...))`` does, and a
+                resampled one can overhang the bbox by up to a pixel.
+            use_overviews: Read the coarsest COG overview level no coarser
+                than *target_resolution*, to save bandwidth. Ignored without
+                one. A VRT or DIMAP raises ``NotImplementedError``, since its
+                sources' pyramids need not match. Overview pixels are the
+                writer's resampled aggregates, not the stored measurements.
+            resampling: ``"nearest"`` (default), ``"bilinear"`` or
+                ``"cubic"``, as gdalwarp; see
+                :func:`rastera.resampling.resample`. A file with an internal
+                mask raises ``NotImplementedError`` here, since the warp would
+                read the pixels it hides as data.
         """
+        if use_overviews:
+            _require_overview_support(self)
         gt = self._geotiff
         band_indices = normalize_band_indices(band_indices, self.count)
         if window is not None and bbox is not None:
@@ -358,9 +316,7 @@ class AsyncGeoTIFF:
             )
         if window is not None:
             _validate_window(gt, window)
-        # ``resampling`` is checked here rather than left to ``resample()``: the
-        # native path never calls it, so an unknown method was silently ignored
-        # on exactly the reads where it looked like it had been honoured.
+        # Here, since the native path never resamples.
         validate_resampling(resampling)
         if target_resolution is not None:
             validate_resolution(target_resolution)
@@ -384,16 +340,11 @@ class AsyncGeoTIFF:
         # snap_to_grid mean "snap the output onto resolution multiples".
         snap = snap_to_grid and bbox is not None and target_resolution is not None
 
-        # Native fast path: no reprojection or resampling needed, so read
-        # directly from the source without an extra copy through resample().
         use_native = not needs_reproject and not needs_resample
         if use_native and snap:
-            # A 1:1 window copy lands on the lattice only if the source grid
-            # is on it: origin on multiples of the resolution, unrotated and
-            # north-up. ``needs_resample`` already matched both axes' *sizes*;
-            # the a and -e tests here are about their *signs*: a grid whose
-            # columns run west came back mirrored, and a south-up grid's
-            # positive e can never isclose a positive resolution.
+            # A window copy lands on the lattice only if the source grid is on
+            # it: origin on multiples of the resolution, unrotated, north-up
+            # and running east (``needs_resample`` checked only the sizes).
             assert target_resolution is not None
             t = gt.transform
             use_native = (
@@ -458,7 +409,6 @@ class AsyncGeoTIFF:
             target_crs=target_crs,
             target_resolution=target_resolution,
             needs_reproject=needs_reproject,
-            needs_resample=needs_resample,
             snap=snap,
             use_overviews=use_overviews,
             resampling=resampling,
@@ -507,7 +457,6 @@ class AsyncGeoTIFF:
         target_crs: int | None,
         target_resolution: float | None,
         needs_reproject: bool,
-        needs_resample: bool,
         snap: bool,
         use_overviews: bool,
         resampling: ResamplingMethod,
@@ -577,8 +526,10 @@ class AsyncGeoTIFF:
             out_crs=out_crs,
             band_indices=band_indices,
             resampling=resampling,
-            # gdalwarp's default *res* is not a resolution anyone asked for.
-            use_overviews=use_overviews and needs_resample,
+            # Not at gdalwarp's default resolution, which nobody asked for.
+            # Whether a given one downsamples is the overview pick's call, in
+            # source units: 10 m in EPSG:3857 at 65N is 4 m on the ground.
+            use_overviews=use_overviews and target_resolution is not None,
         )
 
     async def _read_to_grid(
@@ -688,9 +639,6 @@ class AsyncGeoTIFF:
         snap_to_grid: bool = True,
     ) -> RasterArray:
         """Read at native resolution/CRS, optionally from an overview."""
-        # async_geotiff's Window has no stride/step support, so reads always
-        # pull every pixel in the requested window at the chosen overview
-        # level; any further downsampling happens post-fetch in `resample`.
         readable = overview if overview is not None else self._geotiff
         unsnapped = bbox is not None and not snap_to_grid
         if unsnapped:
@@ -833,9 +781,8 @@ async def open(
         prefetch: Number of bytes to prefetch when opening the TIFF.
         cache: When True, cache parsed TIFF headers in memory so that
             subsequent opens of the same URI skip the header fetch.
-        meta_overrides: Optional header overrides (e.g. ``{"crs": 3006}``)
-            for TIFFs missing or carrying incorrect georeferencing. The
-            same override is applied to every URI when a list is passed.
+        meta_overrides: Optional header overrides (e.g. ``{"crs": 3006}``),
+            see ``MetaOverrides``. A list applies the same one to every URI.
         **store_kwargs: Extra kwargs forwarded to ``async_tiff.store.from_url``
             (e.g. ``skip_signature``, ``region``, ``request_payer``).
     """
@@ -875,6 +822,9 @@ async def _open_many(
         shared = [u for u in uris if not _needs_own_store(u)]
         if shared:
             _require_same_bucket(shared, "using a shared store")
+        # Only when some header is not cached: the opens of cached ones never
+        # touch the store, and building it blocks for 80-160 ms.
+        if any(not cache or get_cached_geotiff(u) is None for u in shared):
             store = _build_store(shared[0], **store_kwargs)
         stores = [None if _needs_own_store(u) else store for u in uris]
     else:
@@ -884,33 +834,27 @@ async def _open_many(
     # branches need them to build their own obstore for the descriptor fetch
     # (the async-tiff and obstore store types are not interchangeable). Plain
     # TIFF opens on the shared store ignore them.
-    return list(
-        await asyncio.gather(
-            *(
-                AsyncGeoTIFF.open(
-                    u,
-                    store=s,
-                    prefetch=prefetch,
-                    cache=cache,
-                    meta_overrides=meta_overrides,
-                    **store_kwargs,
-                )
-                for u, s in zip(uris, stores)
+    return await _gather_bounded(
+        len(uris),
+        [
+            AsyncGeoTIFF.open(
+                u,
+                store=s,
+                prefetch=prefetch,
+                cache=cache,
+                meta_overrides=meta_overrides,
+                **store_kwargs,
             )
-        )
+            for u, s in zip(uris, stores)
+        ],
     )
 
 
-# ---- Public cache API ----
+# ---- Header cache ----
 
 
 def get_cached_geotiff(uri: str) -> GeoTIFF | None:
-    """Return the cached parsed ``GeoTIFF`` for *uri*, or ``None`` on miss.
-
-    The cache is the module-level LRU populated by ``AsyncGeoTIFF.open``.
-    A hit moves *uri* to the most-recently-used position. Returns ``None``
-    when caching is disabled (``set_cache_size(0)``) or the URI is absent.
-    """
+    """The cached header for *uri*, marked most recently used, or None."""
     if _cache_max_size > 0:
         key = _cache_key(uri)
         if key is not None:
@@ -919,25 +863,15 @@ def get_cached_geotiff(uri: str) -> GeoTIFF | None:
 
 
 def clear_cache() -> None:
-    """Drop all entries from the in-memory GeoTIFF header cache.
-
-    Does not change the configured cache size; subsequent opens repopulate
-    it up to the current limit. Also drops the cached pyproj Transformers, so
-    a later change to PROJ's network or grid settings takes effect.
-    """
+    """Drop every cached header, and the cached pyproj Transformers, so a
+    later change to PROJ's network or grid settings takes effect."""
     _geotiff_cache.clear()
     _transformer.cache_clear()
 
 
 def set_cache_size(n: int) -> None:
-    """Set the maximum number of parsed GeoTIFF headers held in memory.
-
-    The cache is a process-wide LRU shared by all callers of
-    ``AsyncGeoTIFF.open``; the default capacity is 128. Passing ``n=0``
-    disables caching entirely and evicts everything currently held.
-    Shrinking below the current population evicts least-recently-used
-    entries until the new bound is satisfied.
-    """
+    """Set how many parsed headers the process-wide LRU holds (default 128).
+    0 disables the cache; shrinking evicts the least recently used."""
     if not isinstance(n, int) or isinstance(n, bool) or n < 0:
         raise ValueError(f"cache size must be int >= 0, got {n!r}")
     global _cache_max_size
@@ -973,11 +907,8 @@ class _OverviewLike(_Readable, Protocol):
 class _GeoTIFFLike(Protocol):
     """The ``self._geotiff`` contract: header metadata, no I/O.
 
-    Only plain files hold a real ``async_geotiff.GeoTIFF``; the VRT and DIMAP
-    datasets synthesize theirs (``_VirtualGeoTIFF``). Reading anything wider
-    than this raises ``AttributeError`` on those, and annotating the attribute
-    ``GeoTIFF`` is what let that pass unchecked — so widening this Protocol
-    means every synthesized dataset must supply the new field.
+    The VRT and DIMAP datasets synthesize theirs (``_VirtualGeoTIFF``), so a
+    field added here must be added there too.
     """
 
     @property
@@ -1013,13 +944,11 @@ class _CrsNodata:
 def _grid_for_bbox(
     bbox: BBox, res: float, *, use_ceil: bool = False
 ) -> tuple[Affine, int, int]:
-    """Compute (transform, width, height) for a regular grid covering *bbox*.
+    """``(transform, width, height)`` of a grid anchored at *bbox*'s corner.
 
-    Uses ``round()`` by default to match rasterio/GDAL merge behaviour.
-    When *use_ceil* is True, uses ``math.ceil()`` to match rasterio read
-    behaviour (always covers the full bbox). Denoised first: on a degree grid,
-    600 pixels of 0.0001 divide by 0.0002 to 300.00000000000244, which ceil
-    alone makes 301.
+    Rounds the pixel counts, as rasterio's merge does, or ceils them to cover
+    the bbox, as its read does. Denoised first: 600 pixels of 0.0001 divide by
+    0.0002 to 300.00000000000244, which ceil alone makes 301.
     """
     fn = math.ceil if use_ceil else round
     width = max(1, fn(_denoise(bbox.width / res)))
@@ -1077,21 +1006,17 @@ def _src_units_per_pixel(
     """One destination pixel of *dst_res* in source-CRS units, per axis: its
     spacing, then its reach.
 
-    The spacing is the length of one destination step, and picks the overview.
-    The reach adds both destination steps along each source axis, since the
-    CRSs may be rotated against each other. The kernel is widened by the reach
-    (``resampling._footprint``), so the halo sized from it covers the kernel.
-    The overview is not picked by the reach: on a grid rotated by θ it is
-    cos θ + sin θ times the spacing, so a level that much coarser than the
-    request was read and resampled up.
+    The spacing is one destination step's length, and picks the overview. The
+    reach adds both destination steps along each source axis, which is what
+    the kernel widens by (``resampling._footprint``), and sizes the halo.
+    Picked by the reach, a grid rotated by θ took a level cos θ + sin θ times
+    too coarse.
 
-    A one-pixel finite difference at *bbox*'s centre, not a ratio of the bbox
-    extents: ``transform_bbox`` returns a densified *envelope*, so for a thin
-    grid — merge hands us 1-px-wide edge contributors — the envelope's width is
-    set by the projection's curvature over the long axis rather than by the
-    grid's own width, inflating the ratio by 100x and with it the halo.
-    Falls back to *dst_res* for both if the probe leaves the transform's
-    domain; ``transform_bbox`` on the same rectangle raises loudly right after.
+    A one-pixel difference at *bbox*'s centre, not a ratio of extents: for a
+    1-px-wide merge contributor the transformed envelope's width comes from
+    the projection's curvature, which inflated the halo 100x. Falls back to
+    *dst_res* outside the transform's domain, where ``transform_bbox`` raises
+    right after.
     """
     cx = (bbox.minx + bbox.maxx) / 2.0
     cy = (bbox.miny + bbox.maxy) / 2.0
@@ -1167,16 +1092,11 @@ def _halo_bbox(
     src_res: tuple[float, float],
     reprojecting: bool,
 ) -> BBox:
-    """Widen a source-read bbox by the reach of the resampling kernel.
+    """Widen a source-read bbox by the resampling kernel's reach, per axis.
 
-    Sized to the output extent alone, the outermost pixels come out of a
-    truncated, renormalised kernel — a biased ring, and two adjacent AOIs
-    disagreeing along their shared edge. Per axis, because a kernel widened for
-    a 10x downsample in x is not wide enough for a 2x one in y. Reprojecting,
-    one pixel is the floor: nearest needs no kernel halo, but a cross-CRS
-    ``read_bbox`` is a densified envelope, so the slack absorbs any curvature
-    it under-states. In one CRS that pixel only reached into the neighbouring
-    tiles.
+    Without it the outermost pixels come from a truncated kernel, and two
+    adjacent AOIs disagree along their shared edge. Reprojecting, at least one
+    pixel, since the densified envelope can under-state the curvature.
     """
     floor = 1 if reprojecting else 0
     pad_x = max(floor, _kernel_halo(method, dst_res[0] / src_res[0])) * src_res[0]
@@ -1189,22 +1109,13 @@ def _halo_bbox(
 def _coerce_nodata(
     nodata: float | str | None, dtype: np.dtype[Any] | None
 ) -> int | float | None:
-    """Coerce nodata, a number or the GDAL_NODATA tag's text, to match the
-    raster dtype.
+    """Coerce nodata, a number or the GDAL_NODATA tag's text, to the dtype.
 
-    The text goes through ``int()`` before ``float()``: a float rounds past
-    2**53, so uint64's maximum, 2**64 - 1, would come back as 2**64 and out
-    of range.
-
-    Returns None when *dtype* cannot carry the value — NaN or a fraction on an
-    integer band, or an integer outside the dtype's range. All mean "this
-    raster has no representable sentinel": no pixel can ever equal it, which
-    is also how GDAL reads it. Carrying it anyway makes ``np.array(nodata,
-    dtype=...)`` inside ``resample`` raise ``OverflowError``, and truncating
-    3.7 to 3 masked every real 3. A VRT declaring
-    ``<NoDataValue>-9999</NoDataValue>`` over a uint16 source is the usual case
-    (GDAL clamps the value when it fills, so its masked copy is a no-op there
-    too).
+    The text goes through ``int()`` first: as a float, uint64's maximum rounds
+    up out of range. None when the dtype cannot carry the value (NaN or a
+    fraction on an integer band, or out of range), since no pixel can equal
+    it. The usual case is a VRT's ``<NoDataValue>-9999</NoDataValue>`` over
+    uint16.
     """
     if nodata is None or dtype is None:
         return None
@@ -1231,19 +1142,14 @@ def _same_nodata(resolved: int | float | None, declared: float | None) -> bool:
 
 
 class MetaOverrides(TypedDict, total=False):
-    """Header metadata overrides for ``open()``.
-
-    Values replace what the GeoTIFF reports, even when already set.
-    Useful when a TIFF is missing georeferencing that you know
-    out-of-band (e.g. a sidecar-less file known to be EPSG:3006).
+    """Header metadata overrides for ``open()``. Each replaces what the file
+    states, even when it states one.
 
     Fields:
-        crs: EPSG code (``int``) or ``pyproj.CRS`` declaring the
-            dataset's coordinate reference system. Always *replaces*
-            the file's reported CRS — there is no fallback semantics.
-            Only relabels the data; it does not reproject. The override
-            is what subsequent ``read()`` calls see as ``bbox_crs`` /
-            ``target_crs`` source.
+        crs: EPSG code or ``pyproj.CRS``, for a file whose CRS is wrong or has
+            no EPSG code. It relabels the pixels and does not reproject them.
+            A TIFF without any GeoTIFF keys still fails to open: async-geotiff
+            raises before the override applies.
     """
 
     crs: int | CRS
@@ -1271,17 +1177,9 @@ def _resolve_meta_overrides(
 
 
 def _validate_window(gt: _GeoTIFFLike, window: Window) -> None:
-    """Reject a window naming pixels the dataset does not have.
-
-    Checked in ``read`` ahead of the native/resampled split, because neither
-    branch sees it reliably on its own. The native path hands the window to
-    whatever backs ``_geotiff`` and inherits that backend's answer: a real file
-    raises async-geotiff's ``WindowError``, while a synthesized dataset pads
-    instead — DIMAP pre-fills nodata and ``_tile_decomposition`` simply omits
-    the tiles that do not exist. The resampled path converts the window to
-    world coordinates first, so nothing downstream ever sees it. One check here
-    means one answer for every dataset type.
-    """
+    """Reject a window naming pixels the dataset does not have. Here, for
+    every dataset type: a DIMAP would pad it, and a resampled read never sees
+    it as a window."""
     if (
         window.col_off < 0
         or window.row_off < 0
@@ -1293,6 +1191,16 @@ def _validate_window(gt: _GeoTIFFLike, window: Window) -> None:
             f"cols={window.col_off}:{window.col_off + window.width}, "
             f"rows={window.row_off}:{window.row_off + window.height}. "
             f"Image: {gt.width}x{gt.height}."
+        )
+
+
+def _require_overview_support(ds: AsyncGeoTIFF) -> None:
+    """Raise for a VRT or DIMAP rather than read it at full resolution when the
+    caller asked for overviews to save bandwidth."""
+    if ds._use_overviews_unsupported is not None:
+        raise NotImplementedError(
+            f"use_overviews is not supported on {ds._use_overviews_unsupported} "
+            f"datasets"
         )
 
 
@@ -1326,12 +1234,10 @@ def _cache_put(key: _CacheKey, gt: GeoTIFF) -> None:
 def _cache_key(uri: str) -> _CacheKey | None:
     """Where *uri*'s header is cached, or ``None`` when it cannot be.
 
-    A local file is keyed on its resolved path, modification and change times,
-    inode and size, so a file rewritten in place, or a relative path opened
-    again from another directory, misses. The change time catches a rewrite
-    that restores the modification time, as ``cp -p`` and ``tar -x`` do. A
-    remote URI is keyed as given: checking that would cost a request per open,
-    which is what the cache saves.
+    A local file is keyed on its resolved path, times, inode and size, so a
+    rewrite misses; the change time catches one that restores the modification
+    time, as ``cp -p`` does. A remote URI is keyed as given: checking it would
+    cost the request the cache saves.
     """
     path = _resolve_local_path(uri)
     if path is None:
@@ -1345,13 +1251,8 @@ def _cache_key(uri: str) -> _CacheKey | None:
 
 def _needs_own_store(uri: str) -> bool:
     """Whether *uri* in an ``open()`` list builds its own store rather than
-    sharing the list's.
-
-    A URL with a query is its own store root (see ``_parse_http_uri``), so two
-    presigned URLs on one host were refused as two buckets, with both
-    signatures in the error. And a local VRT or DIMAP, see
-    ``_is_local_descriptor``.
-    """
+    sharing the list's: a URL with a query, which is its own store root, and
+    a local VRT or DIMAP (see ``_is_local_descriptor``)."""
     return _is_local_descriptor(uri) or _parse_uri(uri).root == uri
 
 
@@ -1364,10 +1265,8 @@ def _source_store(
     """The store a VRT or DIMAP opens one of its sources with, shared per
     bucket across them (see ``_shared_store``).
 
-    ``None`` when the header is cached: the open then returns before it needs
-    one, and a warm descriptor open built none before stores were shared. And
-    ``None`` for a nested VRT or DIMAP, whose own URI is never in the header
-    cache: it shares stores among its sources itself, for the ones not cached.
+    ``None`` when the header is cached, as the open then needs none. And for a
+    nested VRT or DIMAP, which shares stores among its own sources.
     """
     if uri.lower().endswith((".vrt", ".xml")):
         return None

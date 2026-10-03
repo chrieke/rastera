@@ -269,6 +269,22 @@ class TestBuildIndex:
     @patch("rastera.index._build_obstore")
     @patch("rastera.index.AsyncGeoTIFF.open", new_callable=AsyncMock)
     @patch("rastera.index.obstore.get_range_async", new_callable=AsyncMock)
+    async def test_lets_go_of_the_headers_when_an_open_fails(
+        self, mock_get_range: Any, mock_open: Any, mock_build_obs: Any
+    ) -> None:
+        """The opens before the failure are in the reader's LRU all the same."""
+        mock_build_obs.return_value = MagicMock()
+        mock_get_range.return_value = b"\x00" * 100
+        mock_open.side_effect = [_make_mock_async_geotiff(), ValueError("bad")]
+
+        with pytest.raises(RuntimeError):
+            await build_index(["s3://bucket/a.tif", "s3://bucket/b.tif"])
+
+        assert mock_open.call_args.kwargs["store"]._cache == {}
+
+    @patch("rastera.index._build_obstore")
+    @patch("rastera.index.AsyncGeoTIFF.open", new_callable=AsyncMock)
+    @patch("rastera.index.obstore.get_range_async", new_callable=AsyncMock)
     async def test_a_failed_local_open_blames_the_file(
         self, mock_get_range: Any, mock_open: Any, mock_build_obs: Any, tmp_path: Any
     ) -> None:
@@ -295,7 +311,6 @@ class TestBuildIndex:
             await build_index(["s3://b/tiles/missing.tif"])
 
     async def test_concurrency_below_one_raises(self) -> None:
-        """asyncio.Semaphore(0) lets nothing through, so the call hung."""
         gdf = _make_index_gdf(
             [{"uri": "s3://b/a.tif", "minx": 0, "miny": 0, "maxx": 1, "maxy": 1}]
         )
@@ -573,6 +588,27 @@ class TestOpenFromIndex:
         store = mock_open.call_args.kwargs["store"]
         assert isinstance(store, HeaderCacheStore)
         assert store._cache == {}
+
+    @patch("rastera.index._build_obstore")
+    @patch("rastera.index.AsyncGeoTIFF.open", new_callable=AsyncMock)
+    @patch("rastera.index.get_cached_geotiff", return_value=None)
+    async def test_lets_go_of_the_headers_when_an_open_fails(
+        self, mock_cache: Any, mock_open: Any, mock_build_obs: Any
+    ) -> None:
+        """The opens before the failure are in the reader's LRU all the same."""
+        mock_build_obs.return_value = MagicMock()
+        mock_open.side_effect = [MagicMock(spec=AsyncGeoTIFF), ValueError("bad")]
+        gdf = _make_index_gdf(
+            [
+                {"uri": "s3://b/a.tif", "minx": 0, "miny": 0, "maxx": 1, "maxy": 1},
+                {"uri": "s3://b/b.tif", "minx": 1, "miny": 0, "maxx": 2, "maxy": 1},
+            ]
+        )
+
+        with pytest.raises(ValueError, match="bad"):
+            await open_from_index(gdf)
+
+        assert mock_open.call_args.kwargs["store"]._cache == {}
 
     async def test_cross_bucket_raises(self) -> None:
         """Mirrored buckets sharing a key path would collapse in the header

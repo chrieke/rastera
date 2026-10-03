@@ -207,6 +207,25 @@ def test_profile_is_reachable_on_synthesized_datasets(flavour: str) -> None:
     assert set(RasterProfile.__required_keys__) <= set(profile)
 
 
+@pytest.mark.parametrize("flavour", ["vrt", "processed", "dimap"])
+async def test_use_overviews_raises_on_synthesized_datasets(flavour: str) -> None:
+    """Their sources' pyramids need not match. merge() skipped read()'s check
+    and read a DIMAP at full resolution without saying so."""
+    ds = _synthesized_datasets()[flavour]
+    p = ds.profile
+    assert p["crs_epsg"] is not None
+    with pytest.raises(NotImplementedError, match="use_overviews"):
+        await ds.read(use_overviews=True)
+    with pytest.raises(NotImplementedError, match="use_overviews"):
+        await rastera.merge(
+            [ds],
+            bbox=p["bounds"],
+            bbox_crs=p["crs_epsg"],
+            target_resolution=p["res"][0] * 4,
+            use_overviews=True,
+        )
+
+
 # ── the public namespace ────────────────────────────────────────────────
 
 
@@ -349,6 +368,20 @@ class TestOpen:
         vrt, tif = str(tmp_path / "a.vrt"), str(tmp_path / "b.tif")
         stores = await self._stores_opened_with([vrt, tif])
         assert stores[vrt] is None and stores[tif] is not None
+
+    async def test_open_many_of_cached_headers_builds_no_store(self):
+        """Those opens never touch it, and building it blocked for 80-160 ms."""
+        uris = ["s3://b/a.tif", "s3://b/c.tif"]
+        clear_cache()
+        try:
+            for u in uris:
+                _geotiff_cache[u] = make_mock_geotiff()
+            with patch("rastera.reader._build_store") as build:
+                srcs = await rastera.open(uris)
+        finally:
+            clear_cache()
+        assert [s.uri for s in srcs] == uris
+        build.assert_not_called()
 
 
 # ── meta_overrides ──────────────────────────────────────────────────────
@@ -838,6 +871,34 @@ class TestOverviewChoice:
         )
         assert level.read.called is reads_level
         assert gt.read.called is not reads_level
+
+    async def test_a_reprojection_to_the_same_number_can_downsample(self):
+        """10 m in EPSG:3857 at 65N is 4 m on the ground, so a 10 m read into
+        EPSG:3006 spans 2.4 source pixels. Compared as numbers, 10 == 10 read
+        full resolution."""
+        x0, y0 = 2_000_000.0, 9_680_000.0
+        gt = make_mock_geotiff(
+            400, 400, 10.0, 1, crs_epsg=3857, origin_x=x0, origin_y=y0
+        )
+        level = make_mock_geotiff(
+            200, 200, 20.0, 1, crs_epsg=3857, origin_x=x0, origin_y=y0
+        )
+        gt.overviews = [level]
+        gt.read = AsyncMock(side_effect=slicing_read(gt, np.zeros((1, 400, 400))))
+        level.read = AsyncMock(side_effect=slicing_read(level, np.zeros((1, 200, 200))))
+        ds = AsyncGeoTIFF("s3://b/k.tif", gt)
+
+        cx, cy = Transformer.from_crs(3857, 3006, always_xy=True).transform(
+            x0 + 2000, y0 - 2000
+        )
+        await ds.read(
+            bbox=(cx - 500, cy - 500, cx + 500, cy + 500),
+            bbox_crs=3006,
+            target_crs=3006,
+            target_resolution=10.0,
+            use_overviews=True,
+        )
+        assert level.read.called and not gt.read.called
 
 
 # ── read: output grid is a pure function of the arguments ───────────────

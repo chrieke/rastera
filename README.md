@@ -5,7 +5,6 @@
 - `read` and `merge` (multi-file, cross-crs) with `target_crs`, `target_resolution`, `bbox`, `window`, `resampling`
 - Resampling: `nearest` (default), `bilinear`, `cubic` — GDAL-matching kernels with anti-aliasing on downsample and nodata renormalization. Nodata is the only thing that marks a pixel empty: an alpha band is read as a plain band, and resampling a file with an internal mask raises `NotImplementedError`
 - Optional persisted header cache (geoparquet) for ~6x faster opens
-- Built on [async-geotiff](https://github.com/developmentseed/async-geotiff) handling GeoTIFF parsing, async tile fetching, request coalescing, and Rust-native decompression
 - Limited VRT & DIMAP support — band-stack VRTs and LUTs work, anything more exotic raises `NotImplementedError` instead of returning wrong pixels (see `rastera/vrt.py`)
 
 **Note:** Only COGs & tiled GeoTIFFs are supported. Striped (non-tiled) TIFFs will not work.
@@ -95,7 +94,7 @@ gdf = await rastera.build_index(
 )
 gdf.to_parquet("index.parquet")
 
-# Open from index (reusable across sessions, ~5-6x faster opens)
+# Open from index, in this or a later session
 sources = await rastera.open_from_index(
     "index.parquet", bbox=(minx, miny, maxx, maxy), region="us-west-2"
 )
@@ -108,7 +107,7 @@ The index pins each file's header, so rebuild it when a file is rewritten in pla
 
 `rastera.open()` also keeps an in-memory LRU cache of parsed headers within the session (default 128 entries, configurable via `set_cache_size()`), so repeated opens of the same URI skip the network fetch even without an index. A local file rewritten in place is read again; a remote object is assumed unchanged until `clear_cache()`.
 
-By default the read path runs the *outer* fan-out across `merge` contributors, VRT sources, and DIMAP tiles sequentially — async-geotiff already parallelizes block range requests inside each source, so stacking outer concurrency on top tends to multiply the in-flight HTTP request count without adding throughput on a saturated link. Use `rastera.set_concurrency(merge=N, vrt=N, dimap=N)` to opt into outer fan-out per dispatcher; see the `set_concurrency` docstring for the per-knob trade-offs.
+`merge` contributors, VRT sources and DIMAP tiles are read one at a time by default, since async-geotiff already fetches the blocks of each file concurrently. `rastera.set_concurrency(merge=N, vrt=N, dimap=N)` raises that; see its docstring for the trade-offs.
 
 Cross-CRS bilinear/cubic downsampling matches gdalwarp by default. For downsamples beyond 2x, `rastera.set_warp_strategy("auto")` switches to a two-pass warp that runs 2-5x faster but is softer and depends on the bbox.
 

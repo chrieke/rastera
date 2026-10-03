@@ -78,13 +78,6 @@ AWS_URIS = [
         True,
     ),
     (
-        "https://bucket.s3.cn-north-1.amazonaws.com.cn/k.tif",
-        "s3://bucket",
-        "k.tif",
-        "cn-north-1",
-        True,
-    ),
-    (
         "https://bucket.s3.us-east-1.amazonaws.com/my%20key/a%2Bb.tif",
         "s3://bucket",
         "my key/a+b.tif",
@@ -185,6 +178,14 @@ class TestParseUriOther:
 
     def test_percent_decodes_generic_https(self):
         assert _extract_key("https://cdn.example.com/my%20key/a.tif") == "my key/a.tif"
+
+    def test_china_region_host_is_plain_http(self):
+        """obstore sent it to bucket.s3.cn-north-1.amazonaws.com, not .com.cn."""
+        parsed = _parse_uri("https://b.s3.cn-north-1.amazonaws.com.cn/k/a.tif")
+        assert (parsed.kind, parsed.root) == (
+            "http",
+            "https://b.s3.cn-north-1.amazonaws.com.cn",
+        )
 
     def test_non_aws_s3_compatible_host_is_plain_http(self):
         parsed = _parse_uri("https://b.s3.wasabisys.com/k/a.tif")
