@@ -194,7 +194,7 @@ def _resample_nearest(
 
     if transformer is None:
         # Same CRS: compose affines and use 1D index arrays (no meshgrid).
-        combined = ~src_transform * dst_transform
+        combined = ~src_transform @ dst_transform
         src_col_1d = _pixel_index(
             float(combined.a) * (np.arange(dst_width, dtype=np.float64) + 0.5)
             + float(combined.c)
@@ -291,7 +291,7 @@ def _resample_kernel(
     # per axis, and so do the weights: a 4K×4K cubic read would otherwise hold
     # (4, H, W) weight tensors, ~4 GB.
     if transformer is None:
-        combined = ~src_transform * dst_transform
+        combined = ~src_transform @ dst_transform
         src_col_f = float(combined.a) * (
             np.arange(dst_width, dtype=np.float64) + 0.5
         ) + float(combined.c)
