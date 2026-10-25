@@ -416,11 +416,7 @@ def _require_positive_int(parent: ET.Element, tag: str) -> int:
 
     A negative NCOLS/NROWS builds a layout whose bounds run backwards.
     """
-    text = _require_text(parent, tag)
-    try:
-        value = int(text)
-    except ValueError as e:
-        raise ValueError(f"DIMAP: non-integer <{tag}>: {e}") from e
+    value = _parse_count(_require_text(parent, tag), f"<{tag}>")
     if value < 1:
         raise ValueError(f"DIMAP: <{tag}> is {value}; expected a positive count")
     return value
@@ -434,13 +430,25 @@ def _require_positive_attr(el: ET.Element, attr: str) -> int:
     raw = el.attrib.get(attr)
     if raw is None:
         raise ValueError(f"DIMAP: <{el.tag}> missing {attr} attribute")
-    try:
-        value = int(raw)
-    except ValueError as e:
-        raise ValueError(f"DIMAP: non-integer <{el.tag}> {attr}={raw!r}: {e}") from e
+    value = _parse_count(raw, f"<{el.tag}> {attr}")
     if value < 1:
         raise ValueError(f"DIMAP: <{el.tag}> {attr}={value}; expected a positive count")
     return value
+
+
+def _parse_count(raw: str, what: str) -> int:
+    """A descriptor count as an int, accepting a whole-number float.
+
+    Some deliveries write ``<OVERLAP_ROW>0.0</OVERLAP_ROW>``. GDAL parses
+    these fields with ``atoi``, which reads ``0.0`` as 0.
+    """
+    try:
+        value = float(raw)
+    except ValueError as e:
+        raise ValueError(f"DIMAP: non-integer {what}: {raw!r}") from e
+    if not value.is_integer():
+        raise ValueError(f"DIMAP: non-integer {what}: {raw!r}")
+    return int(value)
 
 
 def _parse_regular_tiling(dims: ET.Element) -> tuple[int, int, int, int]:
@@ -463,8 +471,12 @@ def _parse_regular_tiling(dims: ET.Element) -> tuple[int, int, int, int]:
     count = _require(regular, "NTILES_COUNT")
     overlap = regular.find("NTILES_OVERLAP")
     if overlap is not None:
-        o_cols = int(overlap.attrib.get("ncols", "0"))
-        o_rows = int(overlap.attrib.get("nrows", "0"))
+        o_cols = _parse_count(
+            overlap.attrib.get("ncols", "0"), "<NTILES_OVERLAP> ncols"
+        )
+        o_rows = _parse_count(
+            overlap.attrib.get("nrows", "0"), "<NTILES_OVERLAP> nrows"
+        )
         if o_cols != 0 or o_rows != 0:
             raise NotImplementedError(
                 f"DIMAP NTILES_OVERLAP=({o_cols},{o_rows}); only zero-overlap "
@@ -475,10 +487,7 @@ def _parse_regular_tiling(dims: ET.Element) -> tuple[int, int, int, int]:
         text = regular.findtext(tag)
         if text is None:
             continue
-        try:
-            value = int(text)
-        except ValueError as e:
-            raise ValueError(f"DIMAP: non-integer <{tag}>: {e}") from e
+        value = _parse_count(text, f"<{tag}>")
         if value != 0:
             raise NotImplementedError(
                 f"DIMAP <{tag}> is {value}; only zero-overlap tilings are supported"
@@ -503,8 +512,8 @@ def _parse_band_groups(
         tile_paths: dict[tuple[int, int], str] = {}
         for df in df_group.findall("Data_File"):
             try:
-                r = int(df.attrib["tile_R"])
-                c = int(df.attrib["tile_C"])
+                r = _parse_count(df.attrib["tile_R"], "<Data_File> tile_R")
+                c = _parse_count(df.attrib["tile_C"], "<Data_File> tile_C")
             except KeyError as e:
                 raise ValueError(
                     f"DIMAP: <Data_File> missing {e.args[0]} attribute"
@@ -580,7 +589,7 @@ def _parse_transform(geoposition: ET.Element) -> Affine:
 
 def _parse_dtype(encoding: ET.Element) -> np.dtype:
     dt = _require_text(encoding, "DATA_TYPE")
-    nbits = int(_require_text(encoding, "NBITS"))
+    nbits = _parse_count(_require_text(encoding, "NBITS"), "<NBITS>")
     sign = encoding.findtext("SIGN", default="").strip().upper()
     if dt == "INTEGER":
         # SIGN is technically required by the Airbus DIMAP spec, but some
