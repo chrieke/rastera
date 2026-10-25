@@ -286,6 +286,7 @@ class TestParseDIMAP:
         for old, new in [
             (b"<NCOLS>800</NCOLS>", b"<NCOLS>800.0</NCOLS>"),
             (b"<NBANDS>6</NBANDS>", b"<NBANDS>6.0</NBANDS>"),
+            (b"<NBITS>16</NBITS>", b"<NBITS>16.0</NBITS>"),
             (
                 b'<NTILES_SIZE ncols="400" nrows="500" />',
                 b'<NTILES_SIZE ncols="400.0" nrows="500.0" />',

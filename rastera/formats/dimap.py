@@ -589,7 +589,7 @@ def _parse_transform(geoposition: ET.Element) -> Affine:
 
 def _parse_dtype(encoding: ET.Element) -> np.dtype:
     dt = _require_text(encoding, "DATA_TYPE")
-    nbits = int(_require_text(encoding, "NBITS"))
+    nbits = _parse_count(_require_text(encoding, "NBITS"), "<NBITS>")
     sign = encoding.findtext("SIGN", default="").strip().upper()
     if dt == "INTEGER":
         # SIGN is technically required by the Airbus DIMAP spec, but some
