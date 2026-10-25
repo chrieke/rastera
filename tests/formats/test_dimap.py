@@ -275,9 +275,33 @@ class TestParseDIMAP:
             _parse_dimap_xml(xml)
 
     def test_rejects_non_integer_dimension(self):
-        xml = _modified(PNEO_DIMAP, b"<NCOLS>800</NCOLS>", b"<NCOLS>8e2</NCOLS>")
+        xml = _modified(PNEO_DIMAP, b"<NCOLS>800</NCOLS>", b"<NCOLS>800.5</NCOLS>")
         with pytest.raises(ValueError, match="non-integer <NCOLS>"):
             _parse_dimap_xml(xml)
+
+    def test_whole_number_float_counts_accepted(self):
+        """A delivery that writes ``512.0`` for a count reads as 512, as it
+        does in GDAL."""
+        xml = PNEO_DIMAP
+        for old, new in [
+            (b"<NCOLS>800</NCOLS>", b"<NCOLS>800.0</NCOLS>"),
+            (b"<NBANDS>6</NBANDS>", b"<NBANDS>6.0</NBANDS>"),
+            (
+                b'<NTILES_SIZE ncols="400" nrows="500" />',
+                b'<NTILES_SIZE ncols="400.0" nrows="500.0" />',
+            ),
+            (
+                b'<NTILES_COUNT ntiles_C="2" ntiles_R="2" />',
+                b'<NTILES_COUNT ntiles_C="2.0" ntiles_R="2.0" />',
+            ),
+            (
+                b'<NTILES_OVERLAP ncols="0" nrows="0" />',
+                b'<NTILES_OVERLAP ncols="0.0" nrows="0.0" />',
+            ),
+            (b'tile_R="2" tile_C="2"', b'tile_R="2.0" tile_C="2.0"'),
+        ]:
+            xml = _modified(xml, old, new)
+        assert _parse_dimap_xml(xml) == _parse_dimap_xml(PNEO_DIMAP)
 
     @pytest.mark.parametrize(
         "attrs",
@@ -353,13 +377,24 @@ class TestParseDIMAP:
         with pytest.raises(NotImplementedError, match=tag):
             _parse_dimap_xml(xml)
 
-    def test_zero_phr_overlap_accepted(self):
+    @pytest.mark.parametrize("value", ["0", "0.0"])
+    def test_zero_phr_overlap_accepted(self, value: str):
+        """A Pleiades delivery writes ``0.0``, which ``int()`` rejected."""
         xml = _modified(
             PNEO_DIMAP,
             b'<NTILES_OVERLAP ncols="0" nrows="0" />',
-            b"<OVERLAP_ROW>0</OVERLAP_ROW><OVERLAP_COL>0</OVERLAP_COL>",
+            f"<OVERLAP_ROW>{value}</OVERLAP_ROW><OVERLAP_COL>{value}</OVERLAP_COL>".encode(),
         )
         _parse_dimap_xml(xml)
+
+    def test_rejects_fractional_phr_overlap(self):
+        xml = _modified(
+            PNEO_DIMAP,
+            b'<NTILES_OVERLAP ncols="0" nrows="0" />',
+            b"<OVERLAP_ROW>0.5</OVERLAP_ROW>",
+        )
+        with pytest.raises(ValueError, match="non-integer <OVERLAP_ROW>"):
+            _parse_dimap_xml(xml)
 
     def test_rejects_non_band_composite(self):
         xml = _modified(
